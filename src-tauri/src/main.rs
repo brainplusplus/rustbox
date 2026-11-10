@@ -748,6 +748,11 @@ fn main() {
                 });
                 let h = handle.clone();
                 main.on_window_event(move |e| {
+                    if tabs::trace_focus() {
+                        if let tauri::WindowEvent::Focused(focused) = e {
+                            tabs::trace_line(&format!("trace focus main focused={focused}"));
+                        }
+                    }
                     if matches!(e, tauri::WindowEvent::Moved(_))
                         || matches!(e, tauri::WindowEvent::Resized(_))
                     {

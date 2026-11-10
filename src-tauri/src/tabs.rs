@@ -383,7 +383,18 @@ fn watch_tab_navigation(
       if tabs(|m| !m.get(&app_id).is_some_and(|a| a.get(&tab_id).is_some())) {
         return;
       }
-      if let Ok(url) = win.url() {
+      let asked = std::time::Instant::now();
+      let got = win.url();
+      if trace_focus() {
+        // How long the main thread took to answer. A long wait here, while the
+        // user is switching apps, is the evidence this loop is the bottleneck.
+        shell_log(&format!(
+          "trace url tab={tab_id} waited_ms={} ok={}",
+          asked.elapsed().as_millis(),
+          got.is_ok()
+        ));
+      }
+      if let Ok(url) = got {
         let url = url.to_string();
         if url != last {
           last = url.clone();
@@ -1366,6 +1377,20 @@ fn shell_log(message: &str) {
   {
     let _ = writeln!(file, "{message}");
   }
+}
+
+/// Focus and navigation tracing for diagnosing a hang, off unless asked for.
+///
+/// Set `RB_TRACE_FOCUS=1` before launching. Read once, so the hot polling loop
+/// does not touch the environment on every tick.
+pub(crate) fn trace_focus() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| std::env::var("RB_TRACE_FOCUS").as_deref() == Ok("1"))
+}
+
+/// Write one trace line to `logs/shell.log`. Callers check `trace_focus()` first.
+pub(crate) fn trace_line(message: &str) {
+  shell_log(message);
 }
 
 /// Why a webview could not be created, when the cause is a WebView2 runtime swap.
