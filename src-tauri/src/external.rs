@@ -892,14 +892,29 @@ pub fn open_external(
         write_user_js(&dir, user_js)?;
     }
 
-    let mut cmd = std::process::Command::new(&plan.program);
-    cmd.args(&plan.args);
-    for (key, value) in &plan.env {
-        cmd.env(key, value);
+    // On macOS a Chromium-family browser has to be started as a new instance
+    // through `open -n`, or the request lands in the Chrome the user already has
+    // open and the profile flags are ignored. Firefox already carries
+    // `--new-instance`, so it keeps the direct launch.
+    if cfg!(target_os = "macos") && !family.is_gecko() {
+        let (program, args) = macos_launch_plan(&plan.program, &plan.args, &app.url);
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        for (key, value) in &plan.env {
+            cmd.env(key, value);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("failed to launch {}: {e}", plan.program.display()))?;
+    } else {
+        let mut cmd = std::process::Command::new(&plan.program);
+        cmd.args(&plan.args);
+        for (key, value) in &plan.env {
+            cmd.env(key, value);
+        }
+        cmd.arg(&app.url);
+        cmd.spawn()
+            .map_err(|e| format!("failed to launch {}: {e}", plan.program.display()))?;
     }
-    cmd.arg(&app.url);
-    cmd.spawn()
-        .map_err(|e| format!("failed to launch {}: {e}", plan.program.display()))?;
 
     Ok(LaunchReport {
         browser: plan
@@ -981,6 +996,38 @@ fn open_with_default(url: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The command that starts a Chromium-family browser on macOS as its own instance.
+///
+/// Running the binary inside the `.app` directly hands the request to a Chrome
+/// that is already open, and that Chrome ignores `--user-data-dir`. `open -n`
+/// forces a separate instance, and `--args` passes the flags through to it.
+///
+/// Pure, so the argument list can be checked on any host.
+pub(crate) fn macos_launch_plan(
+    binary: &Path,
+    flags: &[String],
+    url: &str,
+) -> (String, Vec<String>) {
+    // `.../Google Chrome.app/Contents/MacOS/Google Chrome` -> `.../Google Chrome.app`
+    let bundle = binary
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .unwrap_or(binary);
+    let mut args = vec![
+        "-n".to_string(),
+        "-a".to_string(),
+        bundle.display().to_string(),
+    ];
+    if !flags.is_empty() || !url.is_empty() {
+        args.push("--args".to_string());
+        args.extend(flags.iter().cloned());
+        if !url.is_empty() {
+            args.push(url.to_string());
+        }
+    }
+    ("open".to_string(), args)
 }
 
 /// Whether a URL uses a scheme we are willing to hand to the OS.
@@ -1224,6 +1271,30 @@ mod tests {
         // a Chromium one has `Local State`, and neither can read the other.
         assert_eq!(BrowserFamily::of(r"C:\x\camoufox.exe").dir_name(), "gecko");
         assert_eq!(BrowserFamily::of(r"C:\x\firefox.exe").dir_name(), "gecko");
+    }
+
+    #[test]
+    fn macos_chromium_is_launched_as_a_new_instance_through_open() {
+        // Launching the binary directly on a Mac sends the request to a Chrome
+        // that is already running, which ignores --user-data-dir. `open -n`
+        // forces a separate instance, and `--args` passes the flags through.
+        let plan = macos_launch_plan(
+            Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            &["--user-data-dir=/p/a".to_string()],
+            "https://example.com",
+        );
+        assert_eq!(plan.0, "open");
+        assert_eq!(
+            plan.1,
+            vec![
+                "-n".to_string(),
+                "-a".to_string(),
+                "/Applications/Google Chrome.app".to_string(),
+                "--args".to_string(),
+                "--user-data-dir=/p/a".to_string(),
+                "https://example.com".to_string(),
+            ]
+        );
     }
 
     #[test]
