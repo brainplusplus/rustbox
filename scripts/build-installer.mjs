@@ -19,7 +19,7 @@
 // to build one target per job.
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -116,15 +116,16 @@ const staging = join(srcTauri, "binaries");
 mkdirSync(staging, { recursive: true });
 const staged = join(staging, `rustbox-mcp-${triple}${exe}`);
 
+// Cargo writes to `target/release` when the triple is the host's and to
+// `target/<triple>/release` otherwise. Assuming the per-triple path for both
+// made the macOS job report a missing shim even though it had just built it.
+const cargoOutDir = (t) =>
+  t === hostTriple
+    ? join(srcTauri, "target", "release")
+    : join(srcTauri, "target", t, "release");
+
 if (universal) {
-  // Cargo writes to `target/release` when the triple is the host's and to
-  // `target/<triple>/release` otherwise. Assuming the per-triple path for both
-  // made the macOS job report a missing shim even though it had just built it.
-  const partPath = (t) =>
-    t === hostTriple
-      ? join(srcTauri, "target", "release", `rustbox-mcp${exe}`)
-      : join(srcTauri, "target", t, "release", `rustbox-mcp${exe}`);
-  const parts = shimTriples.map(partPath);
+  const parts = shimTriples.map((t) => join(cargoOutDir(t), `rustbox-mcp${exe}`));
   for (const part of parts) {
     if (!existsSync(part)) {
       console.error(`build-installer: shim missing for a universal build: ${part}`);
@@ -139,7 +140,7 @@ if (universal) {
   }
   console.log(`\nlipo'd ${staged} from ${parts.length} architectures`);
 } else {
-  const shim = join(srcTauri, "target", "release", `rustbox-mcp${exe}`);
+  const shim = join(cargoOutDir(triple), `rustbox-mcp${exe}`);
   if (!existsSync(shim)) {
     console.error(`build-installer: the MCP shim was not built: ${shim}`);
     process.exit(1);
@@ -149,6 +150,30 @@ if (universal) {
 }
 
 console.log(`\nstaged ${staged} (${statSync(staged).size} bytes)`);
+
+// 2b. A universal build also has to plant the shim in the bundler's *output*
+// directory, not just under `binaries/`.
+//
+// `src-tauri/Cargo.toml` declares `[[bin]] name = "rustbox-mcp"`, so the Tauri CLI
+// lists it as a secondary bundle binary and `copy_binaries_to_bundle()`
+// (tauri-bundler `bundle/macos/app.rs`) copies `settings.binary_path(bin)` --
+// literally `<out>/rustbox-mcp` -- into `Contents/MacOS/`. The CLI's lipo step
+// only merges the *main* binary, so on a universal target nothing ever writes
+// that path and the bundle aborts with "Failed to copy binary from
+// target/universal-apple-darwin/release/rustbox-mcp ... does not exist".
+// Native builds never hit this: plain `cargo build` already put the shim in
+// `target/release`, which is the same out dir.
+if (triple !== hostTriple) {
+  const outDir = cargoOutDir(triple);
+  mkdirSync(outDir, { recursive: true });
+  const outShim = join(outDir, `rustbox-mcp${exe}`);
+  copyFileSync(staged, outShim);
+  // The bundler copies this file into Contents/MacOS with `fs::copy`, which carries
+  // the mode over. A non-executable helper inside a signed .app is a broken bundle,
+  // so make the bit explicit rather than rely on what the copy happened to keep.
+  if (process.platform !== "win32") chmodSync(outShim, 0o755);
+  console.log(`seeded bundler out dir: ${outShim}`);
+}
 
 // 3. Build the app and the installer(s).
 //
