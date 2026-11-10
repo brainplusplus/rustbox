@@ -209,16 +209,16 @@ green.
 Every gate needs evidence. macOS gates need the user's Mac or a macOS CI runner;
 I cannot verify macOS from this Windows machine and will not claim to.
 
-| # | Work | Gate | Where |
-| --- | --- | --- | --- |
-| M0 | Spike outside RustBox: `cef` crate, one windowed browser, one page, message pump from a plain loop; then repeat next to a tao window | A or B decided; which distribution (`minimal` vs `standard`) is enough; startup cost measured | Mac |
-| M1 | `Surface` seam, `System` only, no behaviour change | `cargo test --release` + `check-ui` green; no config can select CEF | Windows |
-| M2 | `Surface::Chromium`: navigate, size, show/hide, close, title, URL | A CEF tab renders a page inside the RustBox window | Mac |
-| M3 | Per-app request context, proxy, user agent | Login survives a restart; proxy probe shows the request | Mac |
-| M4 | Link chooser (`OnBeforePopup`), link targets, downloads, devtools, CDP | All four chooser answers work; `tab_cdp` answers | Mac |
-| M5 | Windows port + the skew case no longer applies to CEF tabs | Same checks | Windows |
-| M6 | Linux port | Same checks | Linux |
-| M7 | Packaging: two dmgs, framework + helpers in bundle, signing, notarization, CI split, licence notices | A downloaded arm64 dmg opens on a Mac that never had RustBox | CI + Mac |
+| # | Work | Gate | Where | Status |
+| --- | --- | --- | --- | --- |
+| M0 | Spike outside RustBox: `cef` crate, one windowed browser, one page, message pump from a plain loop | A or B decided; which distribution (`minimal` vs `standard`) is enough; startup cost measured | Mac | Windows done (§11); macOS open |
+| M1 | `Surface` seam, `System` only, no behaviour change | `cargo test --release` + `check-ui` green; no config can select CEF | Windows | Done, `021af33` |
+| M2 | `Surface::Chromium`: navigate, size, show/hide, close, title, URL | A CEF tab renders a page inside the RustBox window | Mac | Blocked on M0 macOS |
+| M3 | Per-app request context, proxy, user agent | Login survives a restart; proxy probe shows the request | Mac | Not started |
+| M4 | Link chooser (`OnBeforePopup`), link targets, downloads, devtools, CDP | All four chooser answers work; `tab_cdp` answers | Mac | Not started |
+| M5 | Windows port + the skew case no longer applies to CEF tabs | Same checks | Windows | Not started |
+| M6 | Linux port | Same checks | Linux | Not started |
+| M7 | Packaging: two dmgs, framework + helpers in bundle, signing, notarization, CI split, licence notices | A downloaded arm64 dmg opens on a Mac that never had RustBox | CI + Mac | Not started |
 
 M0 and M1 are the cheap, de-risking steps. Neither adds a byte to a release
 artefact.
@@ -272,7 +272,7 @@ The spike is `tools/cef-spike`. Run on Windows, release build:
 | Question | Result |
 | --- | --- |
 | CEF compiles on this toolchain? | Yes, once `cmake` and `ninja` are on PATH (the crate's build script needs both). |
-| Host-pumped loop (`do_message_loop_work`) works? | **Yes.** Pumps climbed steadily, 24 → 5178 over 30 s, with no stall: the host loop was never blocked. |
+| Host-pumped loop (`do_message_loop_work`) works? | **Yes.** 120 heartbeat samples over the full 60 s, monotonic with no stall: 24 → 10538 pumps. The host loop was never blocked. |
 | Browser created and loaded a page? | **Yes.** `create_browser returned 1`, `after_created` reported a main frame, and the page's own title arrived: `title=Example Domain`. |
 | Distribution size | `target/release` is **371 MB** in 24 files; `libcef.dll` alone is **281.0 MB**. |
 | GPU process | Logged `GPU process exited unexpectedly` and fell back to software compositing. Expected on this headless session; must be re-checked with a visible window before M2. |
