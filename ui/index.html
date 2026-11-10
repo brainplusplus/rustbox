@@ -3135,6 +3135,12 @@ document.addEventListener('keydown', (e) => { if (e.key === 'F12') invoke('open_
     opt.dataset.family = family;
     sel.appendChild(opt);
   }
+  // The first option stays the empty value (saved as "no browser chosen", so the
+  // OS decides at launch). Its label names the browser the OS would use today, so
+  // the picker no longer says "OS default" without showing which one that is.
+  const sysDefault = await invoke('system_default_browser').catch(() => null);
+  const defaultOpt = sel.querySelector('option[value=""]');
+  if (defaultOpt && sysDefault) defaultOpt.textContent = `OS default (${sysDefault})`;
   apps = await invoke('list_apps').catch(() => []);
   // Restore which tab was open last. Kept in localStorage rather than the
   // config so it stays a UI detail: it changes on every click and has no

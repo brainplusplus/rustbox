@@ -663,6 +663,7 @@ fn main() {
             purge_app_data,
             app_data_size,
             external::detect_browsers,
+            external::system_default_browser,
             external::open_external,
             proxy_auth::start_proxy_auth_server,
             tabs::open_embedded_tab,

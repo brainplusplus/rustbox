@@ -297,23 +297,133 @@ fn escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The name of the browser the OS opens web links with, e.g. `Google Chrome`.
+///
+/// Returns `None` when the OS cannot say (no `xdg-settings`, an unreadable
+/// registry key), so the UI keeps its plain label rather than guessing.
+#[tauri::command]
+pub fn system_default_browser() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        // LaunchServices keeps the https handler as a bundle id. The bundle id
+        // is the only reliable key: the display name is localised.
+        let out = std::process::Command::new("defaults")
+            .args(["read", "com.apple.LaunchServices/com.apple.launchservices.secure", "LSHandlers"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let bundle = mac_https_handler(&text)?;
+        mac_app_name(&bundle)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+                "/v",
+                "ProgId",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        windows_prog_name(&text)
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let out = std::process::Command::new("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+            .ok()?;
+        let desktop = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        linux_desktop_name(&desktop)
+    }
+}
+
+/// Parse the `https` handler's bundle id out of `LSHandlers` plist text.
+///
+/// Pure so it can be tested on any host. The dump is a list of dictionaries in
+/// which `LSHandlerURLScheme = https;` sits next to `LSHandlerRoleAll = "..."`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn mac_https_handler(dump: &str) -> Option<String> {
+    for block in dump.split('{') {
+        if !block.contains("LSHandlerURLScheme = https;") {
+            continue;
+        }
+        for line in block.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("LSHandlerRoleAll = ") {
+                return Some(rest.trim_end_matches(';').trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Turn a bundle id into the app's name by reading its installed `Info.plist`.
+#[cfg(target_os = "macos")]
+fn mac_app_name(bundle_id: &str) -> Option<String> {
+    let query = format!("kMDItemCFBundleIdentifier == '{}'", bundle_id.replace('\'', ""));
+    let out = std::process::Command::new("mdfind").arg(query).output().ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).lines().next()?.to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let plist = format!("{path}/Contents/Info.plist");
+    let out = std::process::Command::new("defaults")
+        .args(["read", &plist, "CFBundleName"])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Pull the ProgId out of `reg query` output and make it readable.
+///
+/// The ProgId is a registry key such as `ChromeHTML` or `MSEdgeHTM`, so only a
+/// known prefix maps to a name. Anything else is shown as the raw ProgId.
+pub(crate) fn windows_prog_name(reg_output: &str) -> Option<String> {
+    let prog = reg_output
+        .lines()
+        .find(|l| l.contains("ProgId"))?
+        .split_whitespace()
+        .last()?
+        .to_string();
+    let name = match prog.as_str() {
+        p if p.starts_with("ChromeHTML") => "Google Chrome".to_string(),
+        p if p.starts_with("MSEdgeHTM") => "Microsoft Edge".to_string(),
+        p if p.starts_with("BraveHTML") => "Brave".to_string(),
+        p if p.starts_with("FirefoxURL") => "Firefox".to_string(),
+        p if p.starts_with("VivaldiHTM") => "Vivaldi".to_string(),
+        p if p.starts_with("OperaStable") => "Opera".to_string(),
+        p => p.to_string(),
+    };
+    Some(name)
+}
+
+/// Turn an XDG desktop file (`google-chrome.desktop`) into a readable name.
+#[cfg_attr(not(any(test, all(not(target_os = "macos"), not(target_os = "windows")))), allow(dead_code))]
+pub(crate) fn linux_desktop_name(desktop: &str) -> Option<String> {
+    let stem = desktop.strip_suffix(".desktop")?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
 /// Detect installed browsers on this machine.
 #[tauri::command]
 pub fn detect_browsers() -> Vec<DetectedBrowser> {
     let mut found: Vec<DetectedBrowser> = Vec::new();
-    for (name, rel) in KNOWN_BROWSERS {
-        for root in candidate_roots() {
-            let candidate = root.join(rel);
-            if candidate.exists() {
-                let path = candidate.to_string_lossy().into_owned();
-                found.push(DetectedBrowser {
-                    name: name.to_string(),
-                    family: family_label(&path).to_string(),
-                    path,
-                    source: String::new(),
-                });
-                break;
-            }
+    for (name, path) in known_browser_paths() {
+        if path.exists() {
+            let path = path.to_string_lossy().into_owned();
+            found.push(DetectedBrowser {
+                name: name.to_string(),
+                family: family_label(&path).to_string(),
+                path,
+                source: String::new(),
+            });
         }
     }
     // Anti-detect builds live in user-scoped caches rather than Program Files,
@@ -327,15 +437,102 @@ pub fn detect_browsers() -> Vec<DetectedBrowser> {
     found
 }
 
-/// Well-known browser executables we can detect on Windows.
-const KNOWN_BROWSERS: &[(&str, &str)] = &[
-    ("brave", r"BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ("chrome", r"Google\Chrome\Application\chrome.exe"),
-    ("edge", r"Microsoft\Edge\Application\msedge.exe"),
-    ("firefox", r"Mozilla Firefox\firefox.exe"),
-    ("vivaldi", r"Vivaldi\Application\vivaldi.exe"),
-    ("opera", r"Opera\opera.exe"),
-];
+/// Well-known browser executables for this platform, as `(name, path)` pairs.
+///
+/// The candidate list is the only per-OS part of detection. macOS installs
+/// browsers as `.app` bundles under `/Applications`, which is why a Windows-only
+/// list found nothing on a Mac: `LOCALAPPDATA` and `ProgramFiles` do not exist
+/// there, so Chrome was never a candidate at all.
+fn known_browser_paths() -> Vec<(&'static str, PathBuf)> {
+    known_browser_paths_for(std::env::consts::OS, &ProbeRoots::from_env())
+}
+
+/// Roots the platform lookup searches. Taken from the environment in production
+/// and supplied directly by tests, so the lookup can be checked on any host.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProbeRoots {
+    pub local_app_data: Option<PathBuf>,
+    pub program_files: Option<PathBuf>,
+    pub program_files_x86: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+}
+
+impl ProbeRoots {
+    fn from_env() -> Self {
+        let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        Self {
+            local_app_data: var("LOCALAPPDATA"),
+            program_files: var("ProgramFiles"),
+            program_files_x86: var("ProgramFiles(x86)"),
+            home: var("HOME").or_else(|| var("USERPROFILE")),
+        }
+    }
+}
+
+/// Pure candidate table: `os` is the `std::env::consts::OS` value, so a test can
+/// ask for the macOS or Linux answer while running on Windows.
+pub(crate) fn known_browser_paths_for(os: &str, roots: &ProbeRoots) -> Vec<(&'static str, PathBuf)> {
+    let mut out = Vec::new();
+    match os {
+        "windows" => {
+            let windows: [(&str, &str, Option<&PathBuf>); 6] = [
+                ("brave", r"BraveSoftware\Brave-Browser\Application\brave.exe", roots.local_app_data.as_ref()),
+                ("chrome", r"Google\Chrome\Application\chrome.exe", roots.program_files.as_ref()),
+                ("chrome", r"Google\Chrome\Application\chrome.exe", roots.program_files_x86.as_ref()),
+                ("edge", r"Microsoft\Edge\Application\msedge.exe", roots.program_files_x86.as_ref()),
+                ("firefox", r"Mozilla Firefox\firefox.exe", roots.program_files.as_ref()),
+                ("vivaldi", r"Vivaldi\Application\vivaldi.exe", roots.local_app_data.as_ref()),
+            ];
+            for (name, rel, root) in windows {
+                if let Some(root) = root {
+                    out.push((name, root.join(rel)));
+                }
+            }
+        }
+        "macos" => {
+            // Bundles, not bare executables: the binary inside is what the OS
+            // launches, and the `.app` is what Finder and LaunchServices list.
+            const APPS: [(&str, &str); 6] = [
+                ("chrome", "Google Chrome.app/Contents/MacOS/Google Chrome"),
+                ("brave", "Brave Browser.app/Contents/MacOS/Brave Browser"),
+                ("edge", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                ("firefox", "Firefox.app/Contents/MacOS/firefox"),
+                ("vivaldi", "Vivaldi.app/Contents/MacOS/Vivaldi"),
+                ("opera", "Opera.app/Contents/MacOS/Opera"),
+            ];
+            let mut dirs = vec![PathBuf::from("/Applications")];
+            if let Some(home) = &roots.home {
+                dirs.push(home.join("Applications"));
+            }
+            for dir in &dirs {
+                for (name, rel) in APPS {
+                    out.push((name, dir.join(rel)));
+                }
+            }
+        }
+        _ => {
+            // Linux: distro packages, Snap and Flatpak exports, and the names
+            // `update-alternatives` usually links from.
+            const BINS: [(&str, &str); 9] = [
+                ("chrome", "google-chrome"),
+                ("chrome", "google-chrome-stable"),
+                ("chrome", "chromium"),
+                ("chrome", "chromium-browser"),
+                ("brave", "brave-browser"),
+                ("edge", "microsoft-edge"),
+                ("firefox", "firefox"),
+                ("vivaldi", "vivaldi"),
+                ("opera", "opera"),
+            ];
+            for dir in ["/usr/bin", "/usr/local/bin", "/snap/bin", "/var/lib/flatpak/exports/bin"] {
+                for (name, bin) in BINS {
+                    out.push((name, PathBuf::from(dir).join(bin)));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Detected installed browser.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -349,17 +546,6 @@ pub struct DetectedBrowser {
     /// something to tell them apart. Empty for the ordinary browsers, whose
     /// name is already unique.
     pub source: String,
-}
-
-fn candidate_roots() -> Vec<PathBuf> {
-    [
-        std::env::var("LOCALAPPDATA").ok().map(PathBuf::from),
-        std::env::var("ProgramFiles").ok().map(PathBuf::from),
-        std::env::var("ProgramFiles(x86)").ok().map(PathBuf::from),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
 }
 
 /// Locate stealth browser builds in their user-level caches.
@@ -849,6 +1035,117 @@ mod tests {
             muted: false,
             notifications: true,
         }
+    }
+
+    fn names_for(os: &str, roots: &ProbeRoots) -> Vec<&'static str> {
+        known_browser_paths_for(os, roots)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    #[test]
+    fn macos_finds_chrome_in_applications() {
+        let roots = ProbeRoots {
+            home: Some(PathBuf::from("/Users/alice")),
+            ..Default::default()
+        };
+        let paths: Vec<PathBuf> = known_browser_paths_for("macos", &roots)
+            .into_iter()
+            .filter(|(n, _)| *n == "chrome")
+            .map(|(_, p)| p)
+            .collect();
+        assert!(
+            paths.contains(&PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            "Chrome must be looked for under /Applications, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.starts_with("/Users/alice/Applications")),
+            "per-user Applications folder must be searched too"
+        );
+    }
+
+    #[test]
+    fn macos_never_uses_windows_roots() {
+        // The bug: on a Mac none of the Windows variables are set, so the old
+        // lookup produced an empty list and Chrome vanished from the picker.
+        let names = names_for("macos", &ProbeRoots::default());
+        assert!(names.contains(&"chrome"), "chrome missing on macOS: {names:?}");
+    }
+
+    #[test]
+    fn linux_finds_standard_binaries() {
+        let paths: Vec<PathBuf> = known_browser_paths_for("linux", &ProbeRoots::default())
+            .into_iter()
+            .filter(|(n, _)| *n == "chrome")
+            .map(|(_, p)| p)
+            .collect();
+        assert!(paths.contains(&PathBuf::from("/usr/bin/google-chrome")));
+        assert!(paths.contains(&PathBuf::from("/usr/bin/chromium")));
+    }
+
+    #[test]
+    fn windows_keeps_its_program_files_lookup() {
+        let roots = ProbeRoots {
+            program_files: Some(PathBuf::from(r"C:\Program Files")),
+            ..Default::default()
+        };
+        let paths: Vec<PathBuf> = known_browser_paths_for("windows", &roots)
+            .into_iter()
+            .filter(|(n, _)| *n == "chrome")
+            .map(|(_, p)| p)
+            .collect();
+        assert!(paths.contains(&PathBuf::from(
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        )));
+    }
+
+    #[test]
+    fn mac_https_handler_is_read_from_the_https_entry() {
+        // Shape of `defaults read ... LSHandlers`: several dictionaries, and the
+        // one for `https` is not the first. Reading the first role would pick
+        // the wrong app.
+        let dump = r#"(
+{
+    LSHandlerContentType = "public.html";
+    LSHandlerRoleAll = "com.apple.safari";
+},
+{
+    LSHandlerRoleAll = "com.google.chrome";
+    LSHandlerURLScheme = https;
+},
+{
+    LSHandlerRoleAll = "com.apple.mail";
+    LSHandlerURLScheme = mailto;
+}
+)"#;
+        assert_eq!(mac_https_handler(dump).as_deref(), Some("com.google.chrome"));
+    }
+
+    #[test]
+    fn mac_https_handler_is_none_without_an_https_entry() {
+        assert_eq!(mac_https_handler("( { LSHandlerURLScheme = mailto; } )"), None);
+    }
+
+    #[test]
+    fn windows_prog_id_maps_to_a_readable_name() {
+        let out = "\r\nHKEY_CURRENT_USER\\...\\UserChoice\r\n    ProgId    REG_SZ    ChromeHTML\r\n";
+        assert_eq!(windows_prog_name(out).as_deref(), Some("Google Chrome"));
+        let edge = "    ProgId    REG_SZ    MSEdgeHTM\r\n";
+        assert_eq!(windows_prog_name(edge).as_deref(), Some("Microsoft Edge"));
+        // Unknown ProgIds are shown raw rather than guessed.
+        let other = "    ProgId    REG_SZ    SomeNewHTML\r\n";
+        assert_eq!(windows_prog_name(other).as_deref(), Some("SomeNewHTML"));
+        assert_eq!(windows_prog_name("nothing here"), None);
+    }
+
+    #[test]
+    fn linux_default_desktop_file_becomes_a_name() {
+        assert_eq!(linux_desktop_name("google-chrome.desktop").as_deref(), Some("google-chrome"));
+        assert_eq!(linux_desktop_name(""), None);
+        assert_eq!(linux_desktop_name("no-suffix"), None);
     }
 
     #[test]
