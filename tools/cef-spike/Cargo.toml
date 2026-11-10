@@ -1,0 +1,16 @@
+[package]
+name = "cef-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Spike only. This crate exists to answer one question before any RustBox code
+# depends on the answer: can CEF open a window and render a page on this machine,
+# and does its message loop coexist with a host loop? See
+# docs/adr/0005-embedded-chromium-cef.md, milestone M0.
+#
+# It is deliberately not part of the workspace: it pulls a ~135 MB CEF
+# distribution and does not belong in an app build.
+
+[dependencies]
+cef = { version = "156", features = ["build-util"] }

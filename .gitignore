@@ -33,6 +33,10 @@ req*.json
 # Per-assistant context files: useful locally, noise in the repo.
 .opencode-context*.md
 
+# The CEF spike's own build tree and its bundle layout.
+/tools/cef-spike/target/
+/tools/cef-spike/build/
+
 # Tooling
 .vscode/
 .idea/
