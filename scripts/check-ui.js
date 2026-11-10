@@ -46,6 +46,22 @@ for (const file of ['settings.js', 'chat.js']) {
   }
 }
 
+// ---- the link chooser, which has an inline script of its own -----------
+// Missed until now: a syntax error there leaves a dialog that never appears,
+// and nothing else in the build would catch it.
+for (const file of ['link-choice.html']) {
+  const full = path.join(ui, file);
+  if (!fs.existsSync(full)) fail(`ui/${file} is missing`);
+  const source = fs.readFileSync(full, 'utf8');
+  const from = source.indexOf("'use strict';");
+  if (from < 0) fail(`ui/${file} has no inline script`);
+  try {
+    parses(source.slice(from, source.lastIndexOf('</script>')));
+  } catch (e) {
+    fail(`ui/${file} inline script does not parse: ${e.message}`);
+  }
+}
+
 // ---- the three surfaces are wired --------------------------------------
 // A missing one leaves a button that does nothing, which is worse than no
 // button at all.
