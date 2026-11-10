@@ -164,8 +164,23 @@ fn main() {
         .find(|a| a.starts_with("http"))
         .unwrap_or_else(|| "https://example.com".to_string());
 
+    // Not a preference: CEF's own header says multi_threaded_message_loop is
+    // "only supported on Windows and Linux". The flag is kept so the same command
+    // can be compared across platforms, but on macOS it is not a fallback the plan
+    // can lean on.
+    if multi_threaded && cfg!(target_os = "macos") {
+        println!(
+            "[spike] WARNING: --multi-threaded is documented as Windows/Linux only; \
+             on macOS this run proves nothing about the fallback"
+        );
+    }
+
+    // Decided from the raw argv, before any CEF call: on macOS the framework has
+    // to be loaded before CEF is touched, and where to load it from depends on
+    // whether this process is a helper.
+    let helper = is_helper_process(std::env::args());
     // macOS loads CEF from the bundle; the other platforms link it directly.
-    let _library = load_cef();
+    let _library = load_cef(helper);
 
     let args = cef::args::Args::new();
     let Some(cmd_line) = args.as_cmd_line() else {
@@ -273,17 +288,152 @@ fn create_browser(url: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn load_cef() -> library_loader::LibraryLoader {
-    let loader = library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), false);
+fn load_cef(helper: bool) -> library_loader::LibraryLoader {
+    let exe = std::env::current_exe().unwrap();
+    // The loader the crate installs derives the framework path from the executable
+    // and panics inside `canonicalize()` when it is wrong, which on a helper looks
+    // like a page that never loads. Checking first turns that into a sentence.
+    if find_framework(&exe).is_none() {
+        eprintln!("[spike] no CEF framework above {}", exe.display());
+        eprintln!("        expected a Contents/Frameworks/{FW_NAME}/");
+        eprintln!("        run tools/cef-spike/run-macos.sh, which builds the bundle");
+        std::process::exit(1);
+    }
+    // A helper runs two levels deeper (inside its own .app), so its framework is
+    // three levels up instead of one.
+    let loader = library_loader::LibraryLoader::new(&exe, helper);
     assert!(loader.load(), "failed to load the CEF framework");
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     loader
 }
 
+const FW_NAME: &str = "Chromium Embedded Framework.framework";
+const FW_BINARY: &str = "Chromium Embedded Framework";
+
+/// Find the CEF framework binary for an executable inside a macOS `.app` bundle.
+///
+/// The main binary and CEF's helpers live under the same `.app` at different
+/// depths: `Contents/MacOS/<bin>` versus
+/// `Contents/Frameworks/<name>.app/Contents/MacOS/<bin>`. Walking up and accepting
+/// the first directory that actually holds the framework covers both without
+/// hard-coding either depth.
+///
+/// Kept pure and free of `cfg` so the rule can be tested on any platform; only the
+/// actual framework load needs a Mac.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn find_framework(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    for dir in exe.ancestors().skip(1).take(6) {
+        // `dir/Frameworks/…` is the layout macOS code signing expects and the one
+        // run-macos.sh builds; the bare `dir/…` form covers a framework placed
+        // directly beside the executable.
+        for candidate in [dir.join("Frameworks").join(FW_NAME), dir.join(FW_NAME)] {
+            let binary = candidate.join(FW_BINARY);
+            if binary.is_file() {
+                return Some(binary);
+            }
+        }
+    }
+    None
+}
+
+/// Whether this process is one of CEF's sub-processes (renderer, GPU, utility).
+///
+/// CEF launches them with `--type=<kind>`; the browser process has no such switch.
+/// Kept pure and free of `cfg` so it can be tested anywhere, since the only thing
+/// checkable off a Mac is this decision, not the framework load that follows it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_helper_process<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == "--type" || a.starts_with("--type="))
+}
+
 #[cfg(not(target_os = "macos"))]
-fn load_cef() {
+fn load_cef(_helper: bool) {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     // Keep the type symmetrical with the macOS branch without pulling the
     // loader into a platform that links CEF directly.
     let _ = std::marker::PhantomData::<Arc<()>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_framework, is_helper_process};
+
+    #[test]
+    fn the_browser_process_has_no_type_switch() {
+        assert!(!is_helper_process(["--multi-threaded".to_string()]));
+        assert!(!is_helper_process(Vec::new()));
+    }
+
+    #[test]
+    fn a_sub_process_is_recognised_by_its_type_switch() {
+        // The forms CEF actually uses when it spawns the renderer and the GPU
+        // process. Getting this wrong on macOS loads the framework from the wrong
+        // place and the page load hangs with nothing in the log.
+        for kind in [
+            "--type=renderer",
+            "--type=gpu-process",
+            "--type=utility",
+            "--type",
+        ] {
+            assert!(
+                is_helper_process(["--no-sandbox".to_string(), kind.to_string()]),
+                "{kind} should be recognised"
+            );
+        }
+    }
+
+    /// The macOS binary and its helpers sit at different depths, and the framework
+    /// lookup is the one part of that path logic that can be checked off a Mac.
+    #[test]
+    fn the_framework_is_found_from_both_bundle_depths() {
+        let root = std::env::temp_dir().join(format!("cefspike-fw-{}", std::process::id()));
+        let app = root.join("RustBoxCefSpike.app");
+
+        let make_framework = |frameworks: &std::path::Path| {
+            let binary = frameworks
+                .join("Chromium Embedded Framework.framework")
+                .join("Chromium Embedded Framework");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(&binary, b"stub").unwrap();
+            binary
+        };
+
+        // Main binary: Contents/Frameworks, one level up from Contents/MacOS.
+        let main_dir = app.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        let expected = make_framework(&app.join("Contents").join("Frameworks"));
+
+        let main_exe = main_dir.join("RustBoxCefSpike");
+        std::fs::write(&main_exe, b"stub").unwrap();
+        assert_eq!(
+            find_framework(&main_exe).map(|p| p.canonicalize().unwrap()),
+            Some(expected.canonicalize().unwrap()),
+            "the main binary did not resolve the framework beside it"
+        );
+
+        // Helper binary: two levels deeper, under Frameworks/<name>.app.
+        let helper_dir = app
+            .join("Contents")
+            .join("Frameworks")
+            .join("RustBoxCefSpike Helper (Renderer).app")
+            .join("Contents")
+            .join("MacOS");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        let helper_exe = helper_dir.join("RustBoxCefSpike Helper (Renderer)");
+        std::fs::write(&helper_exe, b"stub").unwrap();
+        assert_eq!(
+            find_framework(&helper_exe).map(|p| p.canonicalize().unwrap()),
+            Some(expected.canonicalize().unwrap()),
+            "a helper did not find the app's framework from its nested .app"
+        );
+
+        // Nothing at all: the caller prints a sentence instead of panicking.
+        let bare = root.join("bare").join("elsewhere");
+        std::fs::create_dir_all(&bare).unwrap();
+        let bare_exe = bare.join("cef-spike");
+        std::fs::write(&bare_exe, b"stub").unwrap();
+        assert_eq!(find_framework(&bare_exe), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

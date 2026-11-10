@@ -12,28 +12,38 @@ This crate is not part of the app. It pulls a CEF distribution of about 135 MB
 
 ## macOS
 
-CEF on macOS must live inside an `.app` bundle with the framework in
-`Contents/Frameworks/`. Running the bare binary is what CEF's own documentation
-warns against, and it fails in ways that look like CEF being broken.
+CEF on macOS must live inside a signed `.app` bundle whose `Contents/Frameworks/`
+holds the framework **and five helper bundles** (`Helper`, `Helper (GPU)`,
+`Helper (Renderer)`, `Helper (Plugin)`, `Helper (Alerts)`). Running the bare
+binary fails in ways that look like CEF being broken, and a missing helper makes a
+page load hang with no error at all.
+
+Two details from the `cef` crate's own bundler (`src/build_util/mac.rs`) that are
+easy to get wrong:
+
+- on macOS the crate does **not** copy the CEF runtime beside the binary (it does
+  on Windows and Linux), so the framework comes from the build script's output
+  directory, not `target/release`;
+- a helper resolves the framework through a different relative path than the main
+  binary, which is why `main.rs` detects the helper case from `--type=`.
+
+`run-macos.sh` does the whole job: build, locate the distribution, assemble the
+bundle, sign it inside out with an ad-hoc identity, verify the signature, clear
+any quarantine flag, run.
 
 ```sh
-cargo build --release
-
-# Lay out the bundle CEF expects.
-APP=build/RustBoxCefSpike.app
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
-cp target/release/cef-spike "$APP/Contents/MacOS/"
-cp -R target/release/*.framework "$APP/Contents/Frameworks/" 2>/dev/null || true
-cp -R target/release/Chromium\ Embedded\ Framework.framework "$APP/Contents/Frameworks/" 2>/dev/null || true
-
-# Helper apps: CEF resolves its sub-processes through them.
-cp -R target/release/*\ Helper*.app "$APP/Contents/Frameworks/" 2>/dev/null || true
-
-"$APP/Contents/MacOS/cef-spike"
+./run-macos.sh                  # host-pumped loop (what RustBox needs)
+./run-macos.sh --multi-threaded # for comparison only; not supported on macOS
 ```
 
-`run-macos.sh` does exactly this and then runs it; prefer it over copying the
-commands by hand.
+`--multi-threaded` is kept so the same command exists on every platform, but
+CEF's own header says `multi_threaded_message_loop` is *"only supported on
+Windows and Linux"*. On macOS the flag prints a warning and proves nothing, which
+matters: it means a stalled host loop there has no same-thread fallback left.
+
+**No Apple Developer ID is needed** for this. An ad-hoc signature (`codesign -s -`)
+is enough to run locally; the limits of that for distribution are in
+[`SIGNING-WITHOUT-DEVELOPER-ID.md`](SIGNING-WITHOUT-DEVELOPER-ID.md).
 
 ## Windows
 
@@ -56,38 +66,43 @@ The spike prints a heartbeat every 500 ms:
 [spike] t=1000ms pumps=197 browser=true
 ```
 
+The heartbeat lines above are from the real Windows run.
+
 - **`pumps` keeps growing and a window shows the page** — the windowed design in
   the ADR is viable. This is the outcome that lets M2 proceed.
 - **`pumps` stops growing** — the host loop blocked. That is the failure the
-  spike exists to find; it means the off-screen design (Option B) or a separate
-  helper process, and it changes the plan before any code depends on it.
-- **`browser created: false`** — CEF refused to start. The INFO log says why;
-  usually a missing bundle or framework path on macOS.
+  spike exists to find. On Windows the fallback is `--multi-threaded`; on macOS
+  there is no such fallback (CEF documents `multi_threaded_message_loop` as
+  Windows/Linux only), so a stalled loop there means off-screen rendering.
+- **`create_browser returned 0`** — CEF refused to start. The severity-INFO log
+  says why; usually a missing bundle or framework path on macOS.
 - **Heartbeat grows, window stays blank** — the loop is fine and rendering is
-  not. Look for `[page]` console output to tell "page loaded but not painted"
-  from "page never loaded".
+  not. Look for `[page] title=…` to tell "page loaded but not painted" from "page
+  never loaded".
 
-The spike exits by itself after 60 s so it cannot be left running.
+The spike stops itself after 60 s so it cannot be left running.
 
-## Comparing the two loop modes
+## Windows result (measured 2026-11-10)
 
-```sh
-cargo run --release                      # host pumps (what RustBox needs)
-cargo run --release -- --multi-threaded  # CEF owns a thread (the fallback)
-```
+| Question | Result |
+| --- | --- |
+| Host-pumped loop works? | Yes, 120 samples, monotonic 24 → 10538, no stall |
+| Page loaded? | Yes: `create_browser returned 1`, `[page] title=Example Domain` |
+| Shutdown | Clean: `browser closing` then `clean shutdown`, exit 0 |
+| Signed? | Not needed on Windows |
+| Size | `target/release` 371 MB, `libcef.dll` 281 MB |
+| GPU | Process exited and fell back to software rendering (headless session) |
 
-If the first works, RustBox keeps one loop and no second thread owns the UI. If
-only the second works, the plan changes and the ADR records why.
+## Record the Mac result
 
-## Record the result
+Fill this in when it runs, and copy it into the ADR:
 
-Fill this in when it is run, and copy it into the ADR:
-
-| Question | Mac answer | Windows answer |
-| --- | --- | --- |
-| Host-pumped loop works? | | |
-| `--multi-threaded` works? | | |
-| Window renders a page? | | |
-| `minimal` distribution enough? | | |
+| Question | Mac answer |
+| --- | --- |
+| Host-pumped loop works? | |
+| `--multi-threaded` works? | |
+| Window renders a page? | |
+| `pumps` value when the page title appeared | |
+| Ad-hoc signature verified? (`== 5/6` step) | |
 | Startup to first paint (`t=` line) | | |
 | CPU while idle | | |

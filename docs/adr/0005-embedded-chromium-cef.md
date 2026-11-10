@@ -114,9 +114,30 @@ The hard part is the run loop. CEF owns a message loop, and Tauri owns one
    pinned to a second thread.
 2. `multi_threaded_message_loop = true`, CEF runs its loop on its own thread.
 
+**Correction, verified in CEF's own header** (`cef_settings_t`, in the
+`cef-dll-sys` bindings): `multi_threaded_message_loop` is documented as *"only
+supported on Windows and Linux"*. So on macOS option 2 does not exist, and the
+fallback there is either off-screen rendering (Option B) or a separate helper
+process. The earlier draft of this ADR listed option 2 as the general fallback;
+that was wrong for macOS, which is the platform the whole milestone exists for.
+
 On macOS, CEF additionally requires the host to be a real `.app` bundle with the
 framework in `Contents/Frameworks/` and its helper executables in place. That is
 a packaging requirement, not an optional nicety, and it affects `tauri dev` too.
+Verified against the `cef` crate's own bundler (`src/build_util/mac.rs`), which
+is what its `bundle-cef-app` tool and `tauri-cli` do:
+
+- the framework is copied from the CEF distribution, **not** from
+  `target/release` — on macOS the crate does not stage the runtime beside the
+  binary the way it does on Windows and Linux;
+- five helper bundles are required, named `<app> Helper`, `Helper (GPU)`,
+  `Helper (Renderer)`, `Helper (Plugin)`, `Helper (Alerts)`, each with
+  `LSUIElement = 1`;
+- the helper resolves the framework through a different relative path
+  (`../../..`) than the main binary (`../Frameworks`), which is a runtime
+  detail, not just layout;
+- a missing or misnamed helper makes a page load hang with no error, which is
+  the worst kind of failure to debug from a user report.
 
 ### Option B — windowless OSR (off-screen rendering)
 
@@ -236,6 +257,14 @@ artefact.
   today and Gatekeeper merely warns; an unsigned CEF build does not launch at
   all. A Developer ID is a prerequisite for M7 — this is a hard blocker, not a
   polish item.
+  - For local work (M0 through M6) it is not needed: an ad-hoc signature
+    (`codesign -s -`, no Apple account) satisfies the checks macOS applies when a
+    process loads a framework, and `tools/cef-spike/run-macos.sh` does it inside
+    out. See `tools/cef-spike/SIGNING-WITHOUT-DEVELOPER-ID.md`.
+  - What an ad-hoc signature cannot do is distribute: every new build is a new
+    unsigned binary, so the receiver must override Gatekeeper each time
+    (`xattr -dr com.apple.quarantine`, or right-click → Open). That recurring
+    support cost, not a technical limit, is what M7 is for.
 - Third-party licence notices (Chromium and its dependencies) must ship in the
   bundle.
 
@@ -286,6 +315,60 @@ Two consequences for the plan:
   distribution still ships a 281 MB `libcef.dll`, so "hundreds of MB" is the
   realistic download, not a worst case. Windows currently ships a 14 MB
   installer.
+
+### macOS M0 gate — not yet run
+
+Nothing on this page claims macOS behaviour. The gate needs one command on the
+user's Mac:
+
+```sh
+cd tools/cef-spike && ./run-macos.sh
+```
+
+It builds, assembles the bundle (framework + five helpers, per the crate's own
+bundler), signs it ad-hoc, verifies the signature, and runs. **No Developer ID is
+required for this**; see `tools/cef-spike/SIGNING-WITHOUT-DEVELOPER-ID.md`.
+
+What decides the milestone, in order:
+
+| Reading | Meaning | Next |
+| --- | --- | --- |
+| `pumps=` climbs and a window shows the page | Option A holds on macOS | Start M2 |
+| `pumps=` climbs but no title ever arrives | Loop fine, helpers or framework wrong | Fix the bundle, re-run; not an M2 blocker yet |
+| `pumps=` stalls, or the process stops pumping after the window appears | The host-pumped loop cannot coexist with tao on macOS | **Reopen the decision**: Option B (off-screen), since option 2 is Windows/Linux only |
+| `== 5/6` fails `codesign --verify` | Bundle assembly is wrong | Fix before interpreting anything else |
+
+Because `multi_threaded_message_loop` does not exist on macOS, a stalled loop
+there has exactly one remaining fallback, and it changes the design. That is why
+this gate is the blocker rather than a formality.
+
+### What was fixed before handing the script over
+
+The first version of `run-macos.sh` would have failed on the Mac for three
+reasons, all found by reading the crate's own bundler rather than by running it:
+
+1. It copied the framework from `target/release`, where the crate never puts it
+   on macOS.
+2. It copied helper `.app` bundles that do not exist until something creates
+   them; the crate's bundler creates all five by reusing one binary.
+3. It assumed the helper and the main binary resolve the framework the same way.
+   They do not, and a wrong resolver panics inside `canonicalize()`.
+
+All three are fixed, and the framework search now falls back to a `find` under
+`target/`, so an unexpected build layout produces a run instead of a dead end.
+
+The script was verified by a dry run on Windows with stub `cargo`, `codesign`,
+`ditto` and `xattr` that log their arguments: bundle layout (framework + five
+helper apps + plists), signing order (framework dylibs → framework → helpers →
+main binary → outer bundle), argument passthrough, and the fallback framework
+search all behave as intended. **What a dry run cannot prove is that macOS
+accepts the result.** `codesign --verify` at step 5 and the run itself are the
+only real evidence, and both need the Mac.
+
+New unit tests cover the two macOS-path decisions that are pure logic:
+`is_helper_process` (the `--type=` switch that decides which framework path to
+use) and `find_framework` (both bundle depths, plus the no-framework case).
+These run on Windows; the load they feed does not.
 
 ## Consequences
 
