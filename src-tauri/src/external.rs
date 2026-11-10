@@ -345,19 +345,38 @@ pub fn system_default_browser() -> Option<String> {
 /// Pure so it can be tested on any host. The dump is a list of dictionaries in
 /// which `LSHandlerURLScheme = https;` sits next to `LSHandlerRoleAll = "..."`.
 #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+///
+/// Each entry also holds a nested `LSHandlerPreferredVersions = { LSHandlerRoleAll
+/// = "-"; }`. Only the entry's own `LSHandlerRoleAll` counts, i.e. the one at the
+/// entry's indentation, and a `-` value is not a bundle id.
 pub(crate) fn mac_https_handler(dump: &str) -> Option<String> {
     for block in dump.split('{') {
         if !block.contains("LSHandlerURLScheme = https;") {
             continue;
         }
+        // The entry's own keys sit at the depth of its `LSHandlerURLScheme`.
+        let own_depth = block
+            .lines()
+            .find(|l| l.trim() == "LSHandlerURLScheme = https;")
+            .map(indent)?;
         for line in block.lines() {
+            if indent(line) != own_depth {
+                continue;
+            }
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("LSHandlerRoleAll = ") {
-                return Some(rest.trim_end_matches(';').trim_matches('"').to_string());
+                let id = rest.trim_end_matches(';').trim_matches('"');
+                if id != "-" && !id.is_empty() {
+                    return Some(id.to_string());
+                }
             }
         }
     }
     None
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
 }
 
 /// Turn a bundle id into the app's name by reading its installed `Info.plist`.
@@ -1166,6 +1185,33 @@ mod tests {
 {
     LSHandlerRoleAll = "com.apple.mail";
     LSHandlerURLScheme = mailto;
+}
+)"#;
+        assert_eq!(mac_https_handler(dump).as_deref(), Some("com.google.chrome"));
+    }
+
+    #[test]
+    fn mac_https_handler_ignores_the_nested_preferred_versions_role() {
+        // Shape captured from a real Mac. Each entry has a nested
+        // `LSHandlerPreferredVersions = { LSHandlerRoleAll = "-"; }` before its
+        // own `LSHandlerRoleAll`. Reading the first `LSHandlerRoleAll` line
+        // returned "-", which is not a bundle id, so the name was never found.
+        let dump = r#"(
+{
+    LSHandlerPreferredVersions =
+    {
+        LSHandlerRoleAll = "-";
+    };
+    LSHandlerRoleAll = "com.google.chrome";
+    LSHandlerURLScheme = https;
+},
+{
+    LSHandlerPreferredVersions =
+    {
+        LSHandlerRoleAll = "-";
+    };
+    LSHandlerRoleAll = "com.apple.safari";
+    LSHandlerURLScheme = http;
 }
 )"#;
         assert_eq!(mac_https_handler(dump).as_deref(), Some("com.google.chrome"));
