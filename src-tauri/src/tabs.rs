@@ -17,11 +17,77 @@ use webview2_com::{
 /// them share the app's profile, so a login in one is a login in all of them —
 /// which is the point of keeping them under the same app instead of adding
 /// another workspace entry for the same site.
+/// One tab's rendering surface, whichever backend owns it.
+///
+/// Every tab is a Tauri webview today, and `System` is that case. A tab rendered
+/// by bundled Chromium (see `docs/adr/0005-embedded-chromium-cef.md`) lives in
+/// the same window but behind a different API, so callers hold a `Surface` and
+/// ask it to show, hide, move or close itself instead of holding a window.
+///
+/// An enum rather than a trait object, deliberately: the WebView2-only paths
+/// that genuinely need the real window (`with_webview`, the CDP client) call
+/// `as_window()` and therefore state that requirement where it applies, instead
+/// of having it disappear behind a trait that another backend could not honour.
+#[derive(Clone)]
+enum Surface {
+  System(WebviewWindow),
+}
+
+impl Surface {
+  fn system(window: WebviewWindow) -> Self {
+    Surface::System(window)
+  }
+
+  /// The underlying Tauri window, for the WebView2-only paths.
+  fn as_window(&self) -> Option<&WebviewWindow> {
+    match self {
+      Surface::System(window) => Some(window),
+    }
+  }
+
+  fn show(&self) {
+    if let Some(w) = self.as_window() {
+      let _ = w.show();
+    }
+  }
+
+  fn hide(&self) {
+    if let Some(w) = self.as_window() {
+      let _ = w.hide();
+    }
+  }
+
+  fn set_focus(&self) {
+    if let Some(w) = self.as_window() {
+      let _ = w.set_focus();
+    }
+  }
+
+  /// Stretch the surface over a content rectangle.
+  ///
+  /// Position and size travel together because a tab overlay is always placed at
+  /// one rect; a backend that composites rather than owns a window has a single
+  /// bounds update to perform, not two.
+  fn set_bounds(&self, position: PhysicalPosition<i32>, size: PhysicalSize<u32>) {
+    if let Some(w) = self.as_window() {
+      let _ = w.set_position(position);
+      let _ = w.set_size(size);
+    }
+  }
+
+  fn is_visible(&self) -> bool {
+    self
+      .as_window()
+      .and_then(|w| w.is_visible().ok())
+      .unwrap_or(false)
+  }
+}
+
 struct SubTab {
   /// Stable within the app: `main` for the pinned first tab, then `t2`, `t3`…
   id: String,
   label: String,
-  window: WebviewWindow,
+  surface: Surface,
   /// The app's first tab. Cannot be closed: closing it would leave the app with
   /// no surface at all while its sidebar entry still claims it is open.
   pinned: bool,
@@ -414,7 +480,7 @@ fn watch_tab_navigation(
 /// popup the user dragged somewhere is theirs, and switching tabs is not a
 /// request to move or hide it.
 fn show_only(handle: &tauri::AppHandle, app_id: &str, tab_id: &str) {
-  let all: Vec<(String, String, bool, WebviewWindow)> = tabs(|m| {
+  let all: Vec<(String, String, bool, Surface)> = tabs(|m| {
     m.iter()
       .flat_map(|(id, a)| {
         a.tabs.iter().map(move |t| {
@@ -422,29 +488,29 @@ fn show_only(handle: &tauri::AppHandle, app_id: &str, tab_id: &str) {
             id.clone(),
             t.id.clone(),
             t.detached,
-            t.window.clone(),
+            t.surface.clone(),
           )
         })
       })
       .collect()
   });
-  for (id, tid, detached, window) in all {
+  for (id, tid, detached, surface) in all {
     if detached {
       // A popup belongs to its app: it stays put while that app's tabs are
       // switched, and goes with the app when another app comes to the front.
       // Leaving it up would float one app's window over a different app's page.
       if id != app_id {
-        let _ = window.hide();
+        surface.hide();
       }
       continue;
     }
     if id == app_id && tid == tab_id {
-      let _ = window.show();
-      // Owned windows at the same rect keep creation z-order; show() alone
+      surface.show();
+      // Owned windows at the same rect keep creation z-order; showing alone
       // leaves the first-created tab covering the others. Raise the active one.
-      let _ = window.set_focus();
+      surface.set_focus();
     } else {
-      let _ = window.hide();
+      surface.hide();
     }
   }
   if let Ok(mut guard) = ACTIVE_APP.lock() {
@@ -471,16 +537,15 @@ pub fn sync_all_tabs(handle: &tauri::AppHandle) {
   let Ok((px, py, pw, ph)) = content_rect_physical(&main, x, y, width, height) else {
     return;
   };
-  let all: Vec<WebviewWindow> = tabs(|m| {
+  let all: Vec<Surface> = tabs(|m| {
     m.values()
       .flat_map(|a| a.tabs.iter())
       .filter(|t| !t.detached)
-      .map(|t| t.window.clone())
+      .map(|t| t.surface.clone())
       .collect()
   });
-  for window in all {
-    let _ = window.set_position(PhysicalPosition::new(px, py));
-    let _ = window.set_size(PhysicalSize::new(pw, ph));
+  for surface in all {
+    surface.set_bounds(PhysicalPosition::new(px, py), PhysicalSize::new(pw, ph));
   }
 }
 
@@ -996,7 +1061,7 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         a.tabs.push(SubTab {
           id: tab_id.clone(),
           label: label.clone(),
-          window: win.clone(),
+          surface: Surface::system(win.clone()),
           pinned: tab_id == "main",
           detached,
           url: target_url.clone(),
@@ -2427,14 +2492,14 @@ pub fn emit_ctx_action(
 /// Hide every open tab (HTML overlays like the add/edit modal must be reachable).
 #[tauri::command]
 pub fn hide_all_tabs() -> Result<(), String> {
-  let all: Vec<WebviewWindow> = tabs(|m| {
+  let all: Vec<Surface> = tabs(|m| {
     m.values()
       .flat_map(|a| a.tabs.iter())
-      .map(|t| t.window.clone())
+      .map(|t| t.surface.clone())
       .collect()
   });
-  for window in all {
-    let _ = window.hide();
+  for surface in all {
+    surface.hide();
   }
   // Nothing is on screen, so no tab is "the active one". Leaving the last value
   // in place would let an active-tab-scoped agent keep acting on a tab the user
@@ -2593,7 +2658,7 @@ pub fn enable_capture_for_open_tabs() {
   let windows: Vec<WebviewWindow> = tabs(|m| {
     m.values()
       .flat_map(|a| a.tabs.iter())
-      .map(|t| t.window.clone())
+      .filter_map(|t| t.surface.as_window().cloned())
       .collect()
   });
   for win in windows {
@@ -2619,7 +2684,7 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
     tabs: Vec<serde_json::Value>,
     console: (u64, usize),
     network: (u64, usize),
-    window: WebviewWindow,
+    surface: Surface,
   }
   let rows: Vec<Row> = tabs(|m| {
     m.iter()
@@ -2659,7 +2724,7 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
           tabs,
           console: logs.console.lock().map(|b| (b.cursor(), b.len())).unwrap_or((0, 0)),
           network: logs.network.lock().map(|b| (b.cursor(), b.len())).unwrap_or((0, 0)),
-          window: shown.window.clone(),
+          surface: shown.surface.clone(),
         }
       })
       .collect()
@@ -2670,7 +2735,7 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
       // `visible` is a cheap window flag, not a webview round trip, so it is
       // safe to read here; the URL and title come from the cache for the reason
       // documented on `SubTab`.
-      let visible = row.window.is_visible().unwrap_or(false);
+      let visible = row.surface.is_visible();
       serde_json::json!({
         "appId": row.app_id,
         // The active sub-tab: what the user is looking at, and what every call
