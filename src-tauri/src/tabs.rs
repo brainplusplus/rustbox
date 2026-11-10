@@ -1366,7 +1366,7 @@ pub fn dismiss_link_choice(id: Option<u64>, app_handle: tauri::AppHandle) -> Res
 /// Release builds are `windows_subsystem = "windows"`, so `eprintln!` goes
 /// nowhere and a swallowed failure stays invisible. Anything the user can
 /// interpret as "the app stopped working" needs a line here instead.
-fn shell_log(message: &str) {
+pub(crate) fn shell_log(message: &str) {
   use std::io::Write as _;
   let dir = crate::paths::root().join("logs");
   let _ = std::fs::create_dir_all(&dir);

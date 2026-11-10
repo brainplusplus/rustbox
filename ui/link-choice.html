@@ -276,6 +276,19 @@ async function open() {
 
   renderUrl(params.get('url') || '');
 
+  // Name the browser the OS would actually use. An embedded app never shows it
+  // anywhere else: the Settings picker is disabled for embedded, because an
+  // embedded tab renders in RustBox's own webview and launches no browser. The
+  // plain "Default browser" label left the user guessing which one that was.
+  invoke('system_default_browser').then(name => {
+    if (!name) return;
+    const opt = OPTIONS.find(o => o.id === 'external');
+    if (!opt) return;
+    opt.name = `Default browser (${name})`;
+    const row = list.querySelector('.lc-opt[data-id="external"] .name');
+    if (row) row.textContent = opt.name;
+  }).catch(() => {});
+
   // The app's name, so the dialog says whose tab it is about without the user
   // having to look behind it.
   invoke('list_apps').then(apps => {
@@ -285,6 +298,22 @@ async function open() {
     document.getElementById('lc-app').textContent = appName;
     document.getElementById('lc-remember-label').textContent =
       `Always do this in ${appName}`;
+  }).catch(() => {});
+
+  // Naming the browser the OS would actually use. In an embedded app nothing
+  // else ever shows it: the Settings picker is disabled there, because an
+  // embedded tab renders in RustBox's own webview and never launches a browser.
+  // "Default browser" alone left the user guessing which one would open.
+  invoke('system_default_browser').then(name => {
+    if (!name) return;
+    const opt = OPTIONS.find(o => o.id === 'external');
+    if (!opt) return;
+    opt.name = `Default browser (${name})`;
+    opt.desc = `Hand it to ${name}, the browser outside RustBox. Not signed in there.`;
+    const el = list.querySelector('.lc-opt[data-id="external"] .name');
+    if (el) el.textContent = opt.name;
+    const desc = list.querySelector('.lc-opt[data-id="external"] .desc');
+    if (desc) desc.textContent = opt.desc;
   }).catch(() => {});
 
   select('new-tab', false);

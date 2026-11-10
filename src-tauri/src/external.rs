@@ -988,12 +988,47 @@ fn first_chromium_browser() -> Option<String> {
     None
 }
 
+/// Quote a URL so `cmd.exe` treats it as one argument.
+///
+/// `cmd /C start "" <url>` re-parses the command line itself, and Rust only
+/// quotes an argument when it contains a space. A URL with `&` therefore ended
+/// at the `&`, and `start` opened a truncated address while the rest of the URL
+/// ran as a second command. Wrapping the URL in quotes keeps `&` literal; a
+/// quote or a control character inside the URL would break out of that, so it is
+/// refused instead.
+pub(crate) fn windows_start_url(url: &str) -> Result<String, String> {
+    if url.contains('"') || url.chars().any(char::is_control) {
+        return Err(format!(
+            "refusing to hand a URL with a quote or control character to the shell: {url}"
+        ));
+    }
+    Ok(format!("\"{url}\""))
+}
+
 fn open_with_default(url: &str) -> Result<(), String> {
+    // An outside browser is the one launch whose result is invisible: RustBox
+    // starts a hand-off process and never hears which browser the OS picked.
+    // Record the hand-off so "it opened Safari" can be told apart from "RustBox
+    // picked a browser itself", which would be a different code path.
+    // Host only: a URL can carry a session token, and a log is not the place
+    // for one.
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    crate::tabs::shell_log(&format!(
+        "hand-off to the OS default browser ({}): {host}",
+        system_default_browser().unwrap_or_else(|| "unknown".to_string())
+    ));
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        let quoted = windows_start_url(url)?;
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", &quoted])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn()
             .map_err(|e| e.to_string())?;
@@ -1340,6 +1375,41 @@ mod tests {
                 "--user-data-dir=/p/a".to_string(),
                 "https://example.com".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_url_with_an_ampersand_is_quoted_for_cmd() {
+        // `&` is a command separator in `cmd.exe`, and Rust does not quote an
+        // argument that has no space in it. Unquoted, `cmd /C start "" <url>`
+        // opened `https://example.com/?a=1` and then ran `b=2` as a command.
+        assert_eq!(
+            windows_start_url("https://example.com/?a=1&b=2").as_deref(),
+            Ok("\"https://example.com/?a=1&b=2\"")
+        );
+    }
+
+    #[test]
+    fn a_url_that_would_break_out_of_the_quotes_is_refused() {
+        assert!(windows_start_url("https://x/?a=\"b\"").is_err());
+        assert!(windows_start_url("https://x/\r\ncalc").is_err());
+    }
+
+    /// Runs `cmd` for real: the quoting is only correct if `cmd.exe` agrees.
+    /// `echo` stands in for `start` so no browser window opens during a test.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cmd_keeps_a_quoted_url_in_one_piece() {
+        let url = "https://example.com/?a=1&b=2";
+        let quoted = windows_start_url(url).expect("quoted");
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "echo", "", &quoted])
+            .output()
+            .expect("cmd runs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("a=1&b=2"),
+            "cmd split the URL instead of passing it through: {text:?}"
         );
     }
 
