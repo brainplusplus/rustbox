@@ -340,7 +340,11 @@ What decides the milestone, in order:
 
 Because `multi_threaded_message_loop` does not exist on macOS, a stalled loop
 there has exactly one remaining fallback, and it changes the design. That is why
-this gate is the blocker rather than a formality.
+this gate is the blocker rather than a formality. The spike therefore **refuses**
+`--multi-threaded` on macOS (exit 2) instead of attempting it: an attempt there
+produces a process that never paints, which would be filed as "the host-pumped
+loop failed too" and would corrupt the one measurement this milestone exists to
+take.
 
 ### What was fixed before handing the script over
 
@@ -365,9 +369,10 @@ search all behave as intended. **What a dry run cannot prove is that macOS
 accepts the result.** `codesign --verify` at step 5 and the run itself are the
 only real evidence, and both need the Mac.
 
-New unit tests cover the two macOS-path decisions that are pure logic:
+New unit tests cover the three macOS-path decisions that are pure logic:
 `is_helper_process` (the `--type=` switch that decides which framework path to
-use) and `find_framework` (both bundle depths, plus the no-framework case).
+use), `find_framework` (both bundle depths, plus the no-framework case), and
+`multi_threaded_supported` (the flag is refused where CEF lacks the feature).
 These run on Windows; the load they feed does not.
 
 ## Consequences

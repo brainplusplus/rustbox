@@ -166,13 +166,16 @@ fn main() {
 
     // Not a preference: CEF's own header says multi_threaded_message_loop is
     // "only supported on Windows and Linux". The flag is kept so the same command
-    // can be compared across platforms, but on macOS it is not a fallback the plan
-    // can lean on.
-    if multi_threaded && cfg!(target_os = "macos") {
-        println!(
-            "[spike] WARNING: --multi-threaded is documented as Windows/Linux only; \
-             on macOS this run proves nothing about the fallback"
-        );
+    // can be compared across platforms, but on macOS it is refused rather than
+    // attempted, because attempting it produces a run that hangs and reads exactly
+    // like "the host-pumped loop failed too".
+    if multi_threaded && !multi_threaded_supported(cfg!(target_os = "macos")) {
+        eprintln!("[spike] --multi-threaded is not usable on macOS.");
+        eprintln!("        CEF documents multi_threaded_message_loop as Windows/Linux");
+        eprintln!("        only; here it does not give a working loop, it gives a");
+        eprintln!("        process that never paints. That would look like a loop");
+        eprintln!("        failure and must not be filed as one. Re-run without it.");
+        std::process::exit(2);
     }
 
     // Decided from the raw argv, before any CEF call: on macOS the framework has
@@ -346,6 +349,16 @@ fn is_helper_process<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().any(|a| a == "--type" || a.starts_with("--type="))
 }
 
+/// Whether `--multi-threaded` can work on a given platform.
+///
+/// CEF's `cef_settings_t` doc comment says `multi_threaded_message_loop` is *"only
+/// supported on Windows and Linux"*. Pure and separated from `cfg!` so the rule is
+/// testable on every platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn multi_threaded_supported(is_macos: bool) -> bool {
+    !is_macos
+}
+
 #[cfg(not(target_os = "macos"))]
 fn load_cef(_helper: bool) {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
@@ -356,12 +369,21 @@ fn load_cef(_helper: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_framework, is_helper_process};
+    use super::{find_framework, is_helper_process, multi_threaded_supported};
 
     #[test]
     fn the_browser_process_has_no_type_switch() {
         assert!(!is_helper_process(["--multi-threaded".to_string()]));
         assert!(!is_helper_process(Vec::new()));
+    }
+
+    /// The spike refuses this flag on macOS instead of trying it. Attempting it
+    /// there yields a process that never paints, which would be filed as "the
+    /// host-pumped loop failed" when the cause is the unsupported flag.
+    #[test]
+    fn multi_threaded_is_refused_where_cef_does_not_support_it() {
+        assert!(!multi_threaded_supported(true), "macOS must refuse it");
+        assert!(multi_threaded_supported(false), "Windows/Linux keep it");
     }
 
     #[test]

@@ -36,10 +36,12 @@ any quarantine flag, run.
 ./run-macos.sh --multi-threaded # for comparison only; not supported on macOS
 ```
 
-`--multi-threaded` is kept so the same command exists on every platform, but
-CEF's own header says `multi_threaded_message_loop` is *"only supported on
-Windows and Linux"*. On macOS the flag prints a warning and proves nothing, which
-matters: it means a stalled host loop there has no same-thread fallback left.
+`--multi-threaded` is kept so the same command exists on every platform, but CEF's
+own header says `multi_threaded_message_loop` is *"only supported on Windows and
+Linux"*. On macOS the flag is **refused** (exit 2) rather than attempted, because
+attempting it produces a process that never paints — which reads exactly like
+"the host-pumped loop failed too". That matters for what M0 can conclude: a stalled
+host loop on macOS has no same-thread fallback left.
 
 **No Apple Developer ID is needed** for this. An ad-hoc signature (`codesign -s -`)
 is enough to run locally; the limits of that for distribution are in
@@ -100,9 +102,12 @@ Fill this in when it runs, and copy it into the ADR:
 | Question | Mac answer |
 | --- | --- |
 | Host-pumped loop works? | |
-| `--multi-threaded` works? | |
 | Window renders a page? | |
 | `pumps` value when the page title appeared | |
 | Ad-hoc signature verified? (`== 5/6` step) | |
-| Startup to first paint (`t=` line) | | |
-| CPU while idle | | |
+| Startup to first paint (`t=` line) | |
+| CPU while idle | |
+
+`--multi-threaded` is not in that table on purpose: on macOS the spike exits 2
+instead of running it, because CEF does not support that loop there. There is
+nothing to record beyond "refused", which is what the ADR now says. |
