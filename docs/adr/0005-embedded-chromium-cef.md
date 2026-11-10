@@ -265,6 +265,28 @@ artefact.
    M5 evidence exists.)
 5. Developer ID availability, since M7 cannot ship without it.
 
+## 11. M0 results (Windows, measured 2026-11-10)
+
+The spike is `tools/cef-spike`. Run on Windows, release build:
+
+| Question | Result |
+| --- | --- |
+| CEF compiles on this toolchain? | Yes, once `cmake` and `ninja` are on PATH (the crate's build script needs both). |
+| Host-pumped loop (`do_message_loop_work`) works? | **Yes.** Pumps climbed steadily, 24 → 5178 over 30 s, with no stall: the host loop was never blocked. |
+| Browser created and loaded a page? | **Yes.** `create_browser returned 1`, `after_created` reported a main frame, and the page's own title arrived: `title=Example Domain`. |
+| Distribution size | `target/release` is **371 MB** in 24 files; `libcef.dll` alone is **281.0 MB**. |
+| GPU process | Logged `GPU process exited unexpectedly` and fell back to software compositing. Expected on this headless session; must be re-checked with a visible window before M2. |
+
+Two consequences for the plan:
+
+- The run-loop risk that made Option A uncertain is retired **on Windows**. It
+  stays open on macOS, where CEF also requires the bundle layout, so M0 must be
+  repeated there with `run-macos.sh` before M2.
+- **371 MB is much more than the ADR's earlier estimate.** The `minimal`
+  distribution still ships a 281 MB `libcef.dll`, so "hundreds of MB" is the
+  realistic download, not a worst case. Windows currently ships a 14 MB
+  installer.
+
 ## Consequences
 
 - A RustBox tab can be Chromium on macOS for the first time, and on Windows can
