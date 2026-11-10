@@ -117,9 +117,14 @@ mkdirSync(staging, { recursive: true });
 const staged = join(staging, `rustbox-mcp-${triple}${exe}`);
 
 if (universal) {
-  const parts = shimTriples.map((t) =>
-    join(srcTauri, "target", t, "release", `rustbox-mcp${exe}`),
-  );
+  // Cargo writes to `target/release` when the triple is the host's and to
+  // `target/<triple>/release` otherwise. Assuming the per-triple path for both
+  // made the macOS job report a missing shim even though it had just built it.
+  const partPath = (t) =>
+    t === hostTriple
+      ? join(srcTauri, "target", "release", `rustbox-mcp${exe}`)
+      : join(srcTauri, "target", t, "release", `rustbox-mcp${exe}`);
+  const parts = shimTriples.map(partPath);
   for (const part of parts) {
     if (!existsSync(part)) {
       console.error(`build-installer: shim missing for a universal build: ${part}`);
