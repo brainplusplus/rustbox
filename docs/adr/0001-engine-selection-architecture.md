@@ -2,6 +2,11 @@
 
 **Status:** Accepted (2026-10-20, supersedes rev.1 — Servo dropped per user decision)
 
+> Planned amendment (see `docs/adr/0005-embedded-chromium-cef.md`): a third engine
+> value, `cef`, would render an embedded tab with bundled Chromium instead of the
+> OS webview, selectable per app. Nothing here is withdrawn; `os-webview` stays
+> the default and the only engine until that plan is accepted.
+
 ## Context
 Rambox-style multi-app workspace with selectable "engine" per app tab. Original plan included Servo via Verso; user dropped it (compat/maintenance burden).
 
