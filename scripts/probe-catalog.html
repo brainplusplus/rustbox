@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<!--
+  Headless probe for the catalog + modal flow.
+
+  The real ui/index.html is loaded into an iframe, but Tauri's globals are
+  installed on the iframe's window before index.html's own scripts run: the
+  probe navigates the iframe to a tiny bootstrap page that defines
+  `window.__TAURI__` and then document.writes index.html into itself. A plain
+  `frame.src = 'index.html'` cannot work because there is no hook that runs
+  before the child's inline script.
+
+  Everything checked here is behaviour the catalog work introduced:
+    - all 441 recipes reach the catalog (was 369, 105 were dropped)
+    - only recipes needing input get the "setup" tag
+    - a templated recipe asks for its missing part and substitutes it
+    - a self-hosted recipe accepts a bare host and adds a scheme
+    - a template cannot be saved while a part is missing
+    - the proxy scheme reaches the saved payload
+
+  Results land in <pre id="probe"> for --dump-dom to read.
+-->
+<html>
+<head><meta charset="utf-8"><title>probe</title></head>
+<body style="margin:0;background:#111">
+<pre id="probe" style="color:#0f0;font:12px monospace">pending</pre>
+<iframe id="frame" style="width:1500px;height:900px;border:0"></iframe>
+<script>
+const results = [];
+const log = (name, ok, detail) => results.push({ name, ok: !!ok, detail: detail === undefined ? '' : String(detail) });
+const saved = [];
+
+const BOOTSTRAP = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
+const saved = [];
+window.__savedApps = saved;
+window.__TAURI__ = {
+  core: {
+    invoke: async (cmd, args) => {
+      switch (cmd) {
+        case 'list_apps': return [];
+        case 'detect_browsers': return [
+          { name: 'chrome', path: 'C:\\\\x\\\\chrome.exe', family: 'chromium' },
+          { name: 'camoufox', path: 'C:\\\\x\\\\camoufox.exe', family: 'camoufox' }
+        ];
+        case 'platform_info': return { light_profiles: true, named_data_stores: true, tab_mute: true };
+        case 'get_catalog_state': return { favorites: [], usage: {} };
+        case 'save_apps': saved.push(JSON.parse(JSON.stringify(args.apps))); return null;
+        case 'fetch_favicon': throw new Error('offline');
+        default: return null;
+      }
+    }
+  },
+  event: { listen: async () => () => {} }
+};
+document.write(window.__RUSTBOX_BOOT || '');
+<\\/script></body></html>`;
+
+// index.html is fetched once and handed to the bootstrap as a string, so the
+// stub is installed before any of the app's own script runs.
+(async () => {
+  try {
+    const src = await (await fetch('index.html')).text();
+    // Strip the doctype/html/head wrappers: document.write into an existing
+    // document would nest them, and only the body + scripts matter here.
+    const bodyStart = src.indexOf('<body');
+    const body = src.slice(bodyStart >= 0 ? bodyStart : 0);
+
+    const frame = document.getElementById('frame');
+    const win = frame.contentWindow;
+    const doc = frame.contentDocument;
+    doc.open();
+    doc.write(BOOTSTRAP.replace('document.write(window.__RUSTBOX_BOOT || \\'\\');',
+      'document.write(window.__RUSTBOX_BOOT || \\'\\');'));
+    doc.close();
+
+    // Now write the app itself into the bootstrap document.
+    doc.open();
+    doc.write(body);
+    doc.close();
+
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    const until = async (fn, ms = 6000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        try { if (fn()) return true; } catch (_) {}
+        await wait(40);
+      }
+      return false;
+    };
+
+    const rendered = await until(() => doc.querySelectorAll('.catalog-item').length > 100, 9000);
+    const tiles = doc.querySelectorAll('.catalog-item').length;
+    log('catalog rendered', rendered, tiles + ' tiles');
+    log('all recipes reach the catalog', tiles >= 441, tiles);
+
+    const setupTags = doc.querySelectorAll('.setup-tag').length;
+    log('setup tag only on recipes needing input', setupTags === 72, setupTags + ' (expect 43 templated + 29 self-hosted)');
+
+    const byName = n => [...doc.querySelectorAll('.catalog-item')].find(t => t.dataset.name === n);
+    const open = async (n) => {
+      const t = byName(n);
+      if (!t) return false;
+      t.click();
+      return until(() => doc.querySelector('#modal-backdrop').classList.contains('open'));
+    };
+    const close = async () => {
+      doc.querySelector('#btn-cancel').click();
+      await until(() => !doc.querySelector('#modal-backdrop').classList.contains('open'));
+    };
+
+    // --- plain recipe -----------------------------------------------------
+    await open('Gmail');
+    const plainUrl = doc.querySelector('#f-url').value;
+    const tplHidden = doc.querySelector('#f-template').classList.contains('hidden');
+    log('plain recipe keeps its URL', plainUrl === 'https://mail.google.com', plainUrl);
+    log('plain recipe shows no setup block', tplHidden);
+    await close();
+
+    // --- templated recipe -------------------------------------------------
+    await open('Slack');
+    const shown = !doc.querySelector('#f-template').classList.contains('hidden');
+    const label = doc.querySelector('.tpl-field > span')?.textContent || '';
+    const urlEmpty = doc.querySelector('#f-url').value;
+    log('templated recipe asks for its missing part', shown, label);
+    log('raw template never reaches the URL field', urlEmpty === '', JSON.stringify(urlEmpty));
+
+    doc.querySelector('#btn-save').click();
+    await wait(300);
+    const refused = doc.querySelector('#modal-backdrop').classList.contains('open');
+    const msg = doc.querySelector('#modal-sub').textContent;
+    log('cannot save while a part is missing', refused && /required/i.test(msg), msg);
+
+    const input = doc.querySelector('.tpl-input');
+    input.value = 'acme';
+    input.dispatchEvent(new win.Event('input', { bubbles: true }));
+    const filled = doc.querySelector('#f-url').value;
+    log('value is substituted into the template', filled === 'https://acme.slack.com', filled);
+    const preview = doc.querySelector('#tpl-preview')?.textContent || '';
+    log('live preview shows the resolved URL', preview.includes('https://acme.slack.com'), preview);
+
+    doc.querySelector('#btn-save').click();
+    await until(() => !doc.querySelector('#modal-backdrop').classList.contains('open'), 4000);
+    const slack = (saved[saved.length - 1] || []).find(a => (a.name || '').startsWith('Slack'));
+    log('templated recipe saves the resolved URL', slack && slack.url === 'https://acme.slack.com', slack && slack.url);
+
+    // --- self-hosted recipe ----------------------------------------------
+    await open('Mattermost');
+    const shLabel = doc.querySelector('.tpl-field > span')?.textContent || '';
+    log('self-hosted recipe asks for an address', shLabel === 'Server address', shLabel);
+    const sh = doc.querySelector('.tpl-input');
+    sh.value = 'chat.example.com';
+    sh.dispatchEvent(new win.Event('input', { bubbles: true }));
+    const shUrl = doc.querySelector('#f-url').value;
+    log('a bare host gets a scheme', shUrl === 'https://chat.example.com', shUrl);
+    await close();
+
+    // --- proxy scheme -----------------------------------------------------
+    await open('Gmail');
+    const host = doc.querySelector('#f-proxy-host');
+    host.value = '127.0.0.1';
+    host.dispatchEvent(new win.Event('input', { bubbles: true }));
+    doc.querySelector('#f-proxy-port').value = '1080';
+    doc.querySelector('#f-proxy-scheme').value = 'socks5';
+    const hint = doc.querySelector('#proxy-hint').textContent;
+    log('proxy hint explains embedded scope', /this tab only/i.test(hint), hint);
+    doc.querySelector('#btn-save').click();
+    await until(() => !doc.querySelector('#modal-backdrop').classList.contains('open'), 4000);
+    const proxied = (saved[saved.length - 1] || []).find(a => a.proxy);
+    log('socks5 survives the save', proxied && proxied.proxy.scheme === 'socks5' && proxied.proxy.port === 1080,
+      proxied && JSON.stringify(proxied.proxy));
+
+    // --- Light + proxy is called out --------------------------------------
+    await open('Gmail');
+    doc.querySelector('#f-profile-mode').value = 'light';
+    doc.querySelector('#f-profile-mode').dispatchEvent(new win.Event('change', { bubbles: true }));
+    const lightHint = doc.querySelector('#proxy-hint').textContent;
+    log('Light mode warns the proxy cannot apply', /cannot be applied/i.test(lightHint), lightHint);
+  } catch (e) {
+    log('probe threw', false, e && (e.message || e));
+  }
+  document.getElementById('probe').textContent = JSON.stringify(results);
+})();
+</script>
+</body>
+</html>

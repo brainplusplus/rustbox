@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RustBox app icon.
+
+  A globe on the app's dark plate. The accent green is a route running across
+  open water, and a window chip in the shape of one of the app's panels sits
+  on top of the globe.
+
+  The landmasses are the hard part. A smooth closed curve with one inflection
+  reads as a bubble at every size, so each mass here is built from straight
+  runs joined by tight corners: a long axis, a bend, a taper, and at least one
+  sharp change of direction. That is what separates "land" from "blob" once
+  the drawing is reduced to 32px.
+
+  Geometry, all in a 1024 viewBox:
+    plate   rounded square, full bleed, lighter at the top
+    disc    centred at (512,512), radius 332
+    route   a 56px band tilted -15 degrees, plus a thinner parallel, both
+            clipped to the disc. The band crosses the whole disc because a
+            route that stops short reads as a stripe painted on.
+    chip    250x200, centred, so it survives the 32px taskbar size
+
+  Every shipped size is this one drawing rasterised. No fonts, no images.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="disc">
+      <circle cx="512" cy="512" r="332"/>
+    </clipPath>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#141C2E"/>
+      <stop offset="1" stop-color="#090F1A"/>
+    </linearGradient>
+    <linearGradient id="ocean" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#226094"/>
+      <stop offset="0.5" stop-color="#17466E"/>
+      <stop offset="1" stop-color="#0E2942"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.5" cy="0.28" r="0.7">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#plate)"/>
+
+  <g clip-path="url(#disc)">
+    <circle cx="512" cy="512" r="332" fill="url(#ocean)"/>
+
+    <g fill="#E7EEF6">
+      <!-- North-west: wide at the top, a shoulder, then a long taper south. -->
+      <path d="M150 248 L258 206 L348 236 L372 292 L324 334 L250 360 L206 392
+               L170 370 L146 318 Z"/>
+      <!-- West: a thin vertical mass, kinked once. -->
+      <path d="M156 430 L196 418 L212 458 L196 520 L214 566 L188 596 L160 572
+               L148 512 Z"/>
+      <!-- North-east: a long sweep, broad in the middle, pointed at both ends. -->
+      <path d="M600 210 L720 188 L836 240 L874 304 L848 354 L760 380 L684 352
+               L630 304 Z"/>
+      <!-- East: a hooked mass running down the right edge. -->
+      <path d="M760 470 L832 452 L876 496 L864 566 L812 602 L770 574 L752 520 Z"/>
+      <!-- South: a wide mass, flat along the top so the route clears it. -->
+      <path d="M250 640 L360 612 L470 626 L548 668 L566 726 L512 778 L390 800
+               L300 768 L244 706 Z"/>
+      <!-- South-west: a small peninsula reaching toward the west edge. -->
+      <path d="M178 600 L230 584 L248 618 L224 652 L180 646 Z"/>
+    </g>
+
+    <!-- Route. Open water all the way: the band sits between the northern
+         masses and the southern ones, so no land is sliced by it. -->
+    <g transform="rotate(-15 512 512)">
+      <rect x="150" y="470" width="724" height="58" rx="6" fill="#22C55E"/>
+      <rect x="150" y="578" width="724" height="16" rx="4" fill="#15803D"/>
+    </g>
+
+    <circle cx="512" cy="512" r="332" fill="url(#sheen)"/>
+  </g>
+
+  <!-- Window chip. Drawn after the clip so its corners stay crisp where they
+       cross the rim, and so it reads as sitting on the globe. -->
+  <g>
+    <rect x="386" y="348" width="252" height="204" rx="30" fill="#F8FAFC"/>
+    <rect x="412" y="396" width="200" height="128" rx="16" fill="#0E1726"/>
+    <circle cx="452" cy="371" r="10" fill="#22C55E"/>
+  </g>
+
+  <circle cx="512" cy="512" r="332" fill="none" stroke="#9DB4CC" stroke-opacity="0.45" stroke-width="6"/>
+</svg>

@@ -1,0 +1,39 @@
+# Build output
+/target
+/src-tauri/target/
+# Staged sidecar: produced by scripts/build-installer.mjs from a compiled binary.
+/src-tauri/binaries/
+
+# Dependencies
+node_modules/
+
+# Local scratch and probe output.
+#
+# This tree accumulated a lot of one-off artifacts during development: build logs,
+# captured console output, probe transcripts and screenshots. None of it belongs in
+# a release, and several files hold machine-local paths. Listing them by pattern
+# rather than filename keeps the next scratch file out too.
+*.log
+*.txt
+chk*.js
+d.log
+dbg.html
+fix-claude.js
+gen.js
+gen.ps1
+req*.json
+
+# Screenshots and session state
+/shots/
+*.png
+# ...except the app icons, which are source assets, not captures.
+!/src-tauri/icons/*.png
+!/scripts/*.png
+
+# Per-assistant context files: useful locally, noise in the repo.
+.opencode-context*.md
+
+# Tooling
+.vscode/
+.idea/
+.DS_Store

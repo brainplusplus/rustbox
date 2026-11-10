@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RustBox Menu</title>
+<style>
+  :root {
+    --surface: #0E1526;
+    --row-hover: #1A2337;
+    --row-active: #22304A;
+    --border: #26314A;
+    --hairline: #1D2740;
+    --text: #E6EDF7;
+    --text-dim: #8A99B0;
+    --accent: #34D399;
+    --danger: #F87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+    color: var(--text);
+    user-select: none;
+    font-family: 'Segoe UI Variable Text', 'Segoe UI', Inter, system-ui, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { cursor: default; border: none; background: none; color: inherit; font: inherit; }
+
+  #menu {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 5px 5px 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .55), 0 2px 6px rgba(0, 0, 0, .35);
+  }
+
+  .ctx-header {
+    display: flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 9px;
+    margin-bottom: 3px;
+    border-bottom: 1px solid var(--hairline);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #CBD5E1;
+    letter-spacing: .01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    height: 30px;
+    padding: 0 8px 0 9px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--text);
+    text-align: left;
+    white-space: nowrap;
+    outline: none;
+  }
+  .ctx-item:hover,
+  .ctx-item:focus-visible { background: var(--row-hover); }
+  .ctx-item:active { background: var(--row-active); }
+  .ctx-item svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+    color: var(--text-dim);
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .ctx-item .label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+
+  .ctx-switch {
+    position: relative;
+    flex: 0 0 26px;
+    width: 26px;
+    height: 14px;
+    border-radius: 7px;
+    background: #2A3549;
+    transition: background .14s ease;
+  }
+  .ctx-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #8A99B0;
+    transition: transform .14s ease, background .14s ease;
+  }
+  .ctx-switch.on { background: rgba(52, 211, 153, .28); }
+  .ctx-switch.on::after { transform: translateX(12px); background: var(--accent); }
+
+  .ctx-sep { height: 1px; margin: 5px 6px; background: var(--hairline); }
+
+  /* A section label, not a control: it names the group of rows below it. */
+  .ctx-group {
+    padding: 6px 9px 3px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  /* Radio rows carry a check instead of a switch: the options are exclusive,
+     and a switch would read as five independent on/off settings. */
+  .ctx-item .ctx-check {
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    color: var(--accent);
+    opacity: 0;
+  }
+  .ctx-item[aria-checked="true"] .ctx-check { opacity: 1; }
+  .ctx-item[aria-checked="true"] .label { color: #F1F5F9; font-weight: 600; }
+
+  .ctx-item.danger { color: var(--danger); }
+  .ctx-item.danger svg { color: #D97070; }
+  .ctx-item.danger:hover,
+  .ctx-item.danger:focus-visible { background: rgba(248, 113, 113, .12); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ctx-switch, .ctx-switch::after { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div id="menu" role="menu" aria-label="Tab actions"></div>
+<script>
+'use strict';
+const { invoke } = window.__TAURI__.core;
+const params = new URLSearchParams(location.search);
+const appId = params.get('app') || '';
+// Set only when the menu was opened from a sub-tab chip, which is what makes
+// the tab-scoped rows meaningful.
+const tabId = params.get('tab') || '';
+let busy = false;
+
+const ICONS = {
+  check: '<circle cx="8" cy="8" r="6.2"/><path d="M5.5 8.2l1.8 1.8 3.2-3.6"/>',
+  speaker: '<path d="M3 6.4h2.1L8.5 3.9v8.2L5.1 9.6H3z"/><path d="M11.1 6.1a2.7 2.7 0 010 3.8"/>',
+  bell: '<path d="M8 2.2A3.3 3.3 0 004.7 5.5c0 2.5-.8 3.5-1.3 4-.2.2 0 .6.3.6h8.6c.3 0 .5-.4.3-.6-.5-.5-1.3-1.5-1.3-4A3.3 3.3 0 008 2.2z"/><path d="M6.5 12.3a1.6 1.6 0 003 0"/>',
+  sliders: '<path d="M2.5 5.2h5.9M11.6 5.2h1.9M2.5 10.8h2.1M7.8 10.8h5.7"/><circle cx="10.2" cy="5.2" r="1.4"/><circle cx="6.4" cy="10.8" r="1.4"/>',
+  reset: '<path d="M13.2 8a5.2 5.2 0 11-1.6-3.7"/><path d="M13.4 2.6v3.1h-3.1"/>',
+  reload: '<path d="M2.6 8a5.4 5.4 0 019.2-3.8"/><path d="M13.4 2.6v3.1h-3.1"/><path d="M13.4 8a5.4 5.4 0 01-9.2 3.8"/><path d="M2.6 13.4v-3.1h3.1"/>',
+  close: '<path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/>',
+  tick: '<path d="M3.2 8.4l3.1 3.1 6.5-7"/>',
+  ask: '<circle cx="8" cy="8" r="6.2"/><path d="M6.2 6.2a1.9 1.9 0 013.7.6c0 1.3-1.9 1.5-1.9 2.8"/><path d="M8 11.9v.1"/>',
+  tab: '<rect x="2.6" y="3.4" width="10.8" height="9.2" rx="1.6"/><path d="M2.6 6.4h10.8"/>',
+  // Used by the two reorder rows below.
+  up: '<path d="M8 12.6V3.6"/><path d="M4.4 7.2L8 3.6l3.6 3.6"/>',
+  down: '<path d="M8 3.4v9"/><path d="M4.4 8.8L8 12.4l3.6-3.6"/>',
+  popup: '<rect x="2.4" y="2.6" width="8.6" height="7.4" rx="1.4"/><path d="M7.2 12.2h5a1.4 1.4 0 001.4-1.4v-4"/>',
+  browser: '<circle cx="8" cy="8" r="6.1"/><path d="M2.1 8h11.8M8 1.9c1.7 1.8 2.5 3.9 2.5 6.1S9.7 12.3 8 14.1C6.3 12.3 5.5 10.2 5.5 8S6.3 3.7 8 1.9z"/>',
+};
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function icon(name) {
+  return `<svg viewBox="0 0 16 16" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+async function close() {
+  await invoke('ctx_menu_close').catch(() => {});
+}
+
+async function run(action) {
+  if (busy) return;
+  busy = true;
+  await invoke('emit_ctx_action', { appId, action, tabId: tabId || null }).catch(() => {});
+  await close();
+}
+
+(async function init() {
+  const apps = await invoke('list_apps').catch(() => []);
+  const app = (apps || []).find(a => a.id === appId);
+  if (!app) { close(); return; }
+
+  const enabled = app.enabled !== false;
+  const muted = !!app.muted;
+  const notif = app.notifications !== false;
+  // Mirrors LinkTarget in settings.rs. The wire values are what the backend
+  // parses, so they are used verbatim as the action suffix.
+  const LINK_TARGETS = [
+    ['ask', 'Ask me each time', 'ask'],
+    ['same', 'Open in this tab', 'tab'],
+    ['new-tab', 'Open in a new tab', 'tab'],
+    ['popup', 'Open as a pop-up', 'popup'],
+    ['external', 'Open in the default browser', 'browser'],
+  ];
+  const linkTarget = app.link_target || 'ask';
+
+  const toggle = (label, iconName, on, action) =>
+    `<button class="ctx-item" role="menuitemcheckbox" aria-checked="${on}" tabindex="-1" data-action="${action}">` +
+      icon(iconName) +
+      `<span class="label">${esc(label)}</span>` +
+      `<span class="ctx-switch ${on ? 'on' : ''}" aria-hidden="true"></span>` +
+    `</button>`;
+  const plain = (label, iconName, action, danger) =>
+    `<button class="ctx-item${danger ? ' danger' : ''}" role="menuitem" tabindex="-1" data-action="${action}">` +
+      icon(iconName) +
+      `<span class="label">${esc(label)}</span>` +
+    `</button>`;
+  // One exclusive option in the "when a link wants a new window" group.
+  const radio = (value, label, iconName) =>
+    `<button class="ctx-item" role="menuitemradio" aria-checked="${linkTarget === value}"` +
+      ` tabindex="-1" data-action="link-target:${value}">` +
+      `<svg class="ctx-check" viewBox="0 0 16 16" aria-hidden="true">${ICONS.tick}</svg>` +
+      `<span class="label">${esc(label)}</span>` +
+    `</button>`;
+
+  // Where this app sits in the sidebar, so the move rows can disappear at the
+  // ends instead of offering a click that does nothing.
+  const idx = apps.findIndex(a => a.id === appId);
+  const movable = { up: idx > 0, down: idx >= 0 && idx < apps.length - 1 };
+
+  const menu = document.getElementById('menu');
+  menu.innerHTML =
+    `<div class="ctx-header">${esc(app.name)}</div>` +
+    toggle('Enabled', 'check', enabled, 'toggle-enabled') +
+    toggle('Mute audio', 'speaker', muted, 'toggle-muted') +
+    toggle('Notifications', 'bell', notif, 'toggle-notifications') +
+    `<div class="ctx-sep"></div>` +
+    // Reordering without a drag. Dragging works, but it is a gesture that needs
+    // a steady hand and a target that is 44px tall; two rows here make the same
+    // change available to anyone, and they are the only way to reorder when the
+    // window is too small to drag comfortably.
+    (movable.up ? plain('Move up', 'up', 'move-app-up', false) : '') +
+    (movable.down ? plain('Move down', 'down', 'move-app-down', false) : '') +
+    (movable.up || movable.down ? `<div class="ctx-sep"></div>` : '') +
+    // The way back from "Always do this" in the link chooser. Without this the
+    // checkbox in that dialog was a one-way door: it silently rewrote the app's
+    // setting and nothing in the UI showed where to undo it.
+    `<div class="ctx-group">Links that open a window</div>` +
+    LINK_TARGETS.map(([value, label, iconName]) => radio(value, label, iconName)).join('') +
+    `<div class="ctx-sep"></div>` +
+    // A tab that went stale while it was hidden (a dropped socket, a page that
+    // stopped updating) is one click from fixed here. Before this the only
+    // recovery was disabling and re-enabling the app, which tears the whole
+    // profile's window down to reload one page.
+    plain('Reload this tab', 'reload', 'reload-tab', false) +
+    plain('Settings...', 'sliders', 'open-settings', false) +
+    // Clears this app's isolated profile (cookies, storage, cache) so the next
+    // open starts logged out. Embedded only: an external browser is a separate
+    // process rustbox cannot close, so its profile folder stays locked and the
+    // delete would fail halfway. Removing the app cleans that up instead.
+    (app.engine === 'os-webview' ? plain('Reset session', 'reset', 'reset-session', false) : '') +
+    plain('Remove', 'close', 'remove-app', true);
+
+  const items = Array.from(menu.querySelectorAll('.ctx-item'));
+  // Act on `mousedown`, not `click`.
+  //
+  // This popup is its own window, so Windows can move activation away from it
+  // between the press and the release — another app grabbing the foreground, or
+  // the shell raising itself. When that happens the `click` never arrives and
+  // the menu just disappears, which reads as "the menu does nothing". The press
+  // is the part that is always delivered to the window under the cursor, so the
+  // row acts there and the release is irrelevant.
+  items.forEach(el => {
+    el.addEventListener('mousedown', (e) => {
+      // Left button only; a right-click on a row should not activate it.
+      if (e.button !== 0) return;
+      // Keeps focus where it is, so the press cannot blur this window first.
+      e.preventDefault();
+      run(el.dataset.action);
+    });
+    el.addEventListener('mousemove', () => el.focus({ preventScroll: true }));
+  });
+
+  // The popup is created at a fixed generous size, because the number of rows
+  // depends on the app (an embedded tab has "Reset session", an external one
+  // does not). Measure what was actually built and let Rust size the window to
+  // it; without this the last row is clipped by whatever constant Rust guessed.
+  //
+  // Measured synchronously: reading the rect forces layout, so the number is
+  // already final here and no frame has been painted at the wrong size. Every
+  // row is a fixed 30px, so a late webfont cannot change it either.
+  const fit = (() => {
+    let sent = 0;
+    return () => {
+      const h = Math.ceil(menu.getBoundingClientRect().height);
+      // Skip the second call when nothing moved: a resize would reposition the
+      // window and make it flicker for no reason.
+      if (h > 0 && h !== sent) {
+        sent = h;
+        invoke('ctx_menu_fit', { height: h }).catch(() => {});
+      }
+    };
+  })();
+  fit();
+  // Belt and braces: if a font swap or a late icon changes the box anyway, the
+  // window follows instead of clipping.
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(fit).catch(() => {});
+  }
+
+  // Dismissal is pointer-driven: a press anywhere that is not a row closes the
+  // menu. That is the only reliable signal here, because this is a separate
+  // top-level window and a press outside it lands in another process.
+  document.addEventListener('mousedown', (e) => {
+    if (!e.target.closest('.ctx-item')) close();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+    const i = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      items[(i + 1 + items.length) % items.length].focus({ preventScroll: true });
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      items[(i <= 0 ? items.length - 1 : i - 1)].focus({ preventScroll: true });
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      if (i >= 0) { e.preventDefault(); run(items[i].dataset.action); }
+    }
+  });
+  // Losing focus still dismisses the menu — the user clicked somewhere else and
+  // expects it gone — but not instantly. A foreground fight between two windows
+  // can steal activation for a few milliseconds and hand it straight back, and
+  // tearing the menu down in that gap is exactly the "it closed by itself"
+  // complaint. Re-check focus on the next tick and stay open if it came back.
+  window.addEventListener('blur', () => {
+    if (busy) return;
+    setTimeout(() => {
+      if (!busy && !document.hasFocus()) close();
+    }, 120);
+  });
+})();
+</script>
+</body>
+</html>

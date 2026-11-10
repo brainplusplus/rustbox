@@ -1,0 +1,3211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RustBox</title>
+<style>
+  :root {
+    --bg: #020617;
+    --surface: #0F172A;
+    --surface-2: #1E293B;
+    --border: #334155;
+    --text: #F8FAFC;
+    --text-dim: #94A3B8;
+    --accent: #22C55E;
+    --accent-hover: #16A34A;
+    --danger: #EF4444;
+    --radius: 10px;
+    /* Hairline for resting surfaces: visible enough to define a square, quiet
+       enough that 16 rows of them don't turn into a table. */
+    --tile-edge: rgba(148,163,184,.13);
+    /* Sidebar icon sockets. An unselected app needs a container or a dark
+       favicon disappears into the sidebar and the rail reads as empty gaps. Both
+       values sit between the sidebar (`--surface`) and the selected socket
+       (`--surface-2`), so an idle box is visible without competing with the open
+       app. Hover only lifts partway for the same reason: a hovered idle icon must
+       never look more selected than the app that is actually open. */
+    --icon-socket: #172033;
+    --icon-socket-hover: #1B2437;
+    --sidebar-w: 68px;
+    --toolbar-h: 48px;
+    /* Sub-tab strip. Slim on purpose: it is a switcher, not a second toolbar,
+       and every pixel here is a pixel the page does not get. */
+    --strip-h: 36px;
+    /* Catalog tiles: every app is one square socket, so 335 different brands
+       read at the same optical weight. Icons are ink-normalised at build time. */
+    --tile-size: 104px;
+    --icon-well: 48px;
+    --tile-label-h: 30px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Inter, system-ui, sans-serif; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
+  button { cursor: pointer; border: none; background: none; color: inherit; }
+  input, select { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  #layout { display: flex; height: 100vh; }
+
+  .app-icon-btn.disabled { opacity: .35; }
+  .app-icon-btn.disabled img, .app-icon-btn.disabled .fallback { filter: grayscale(1); }
+
+  /* ---------- Sidebar ---------- */
+  #sidebar { width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 6px; }
+  #sidebar .logo { width: 36px; height: 36px; margin-bottom: 8px; }
+  /* Many tabs (e.g. 4x Gmail + 2x WhatsApp + customs) must scroll, not overflow. */
+  #app-list { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  #app-list::-webkit-scrollbar { width: 6px; }
+  #app-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  #app-list::-webkit-scrollbar-track { background: transparent; }
+  /* Every app gets a socket, selected or not. An unfilled button on this rail is
+     indistinguishable from the gaps between icons, so a dark favicon (Discord,
+     a monochrome glyph) reads as a missing app rather than a closed one. The
+     resting fill is one step below `--surface-2`, which is what the selected
+     socket uses, so "idle" and "open" stay legible as different states. */
+  .app-icon-btn { position: relative; flex: 0 0 auto; width: 44px; height: 44px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; background: var(--icon-socket); box-shadow: inset 0 0 0 1px var(--tile-edge); transition: background .15s, box-shadow .15s, transform .1s; -webkit-user-drag: element; user-select: none; }
+  .app-icon-btn:hover { background: var(--icon-socket-hover); box-shadow: inset 0 0 0 1px var(--border); }
+  .app-icon-btn:active { transform: scale(.92); }
+  .app-icon-btn.active { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border); }
+  .app-icon-btn.active::before { content: ''; position: absolute; left: -12px; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--accent); }
+  .app-icon-btn img { width: 26px; height: 26px; border-radius: 6px; object-fit: contain; }
+  .app-icon-btn .fallback { font-size: 18px; font-weight: 600; color: var(--text-dim); }
+  /* Drag-to-reorder. The marker is drawn as an inset bar on the side the icon
+     will land, so the target reads as "insert here" rather than "select me". */
+  .app-icon-btn.dragging { opacity: .4; }
+  .app-icon-btn.drop-before::after,
+  .app-icon-btn.drop-after::after {
+    content: ''; position: absolute; left: 4px; right: 4px; height: 2px;
+    border-radius: 1px; background: var(--accent); pointer-events: none;
+  }
+  .app-icon-btn.drop-before::after { top: -4px; }
+  .app-icon-btn.drop-after::after { bottom: -4px; }
+  .badge { position: absolute; top: 2px; right: 2px; min-width: 16px; height: 16px; padding: 0 4px; background: var(--danger); color: #fff; font-size: 10px; font-weight: 700; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+  #sidebar-spacer { flex: 1; }
+  #add-app-btn { width: 44px; height: 44px; border-radius: var(--radius); font-size: 22px; color: var(--text-dim); display: flex; align-items: center; justify-content: center; transition: background .15s, color .15s; }
+  #add-app-btn:hover { background: var(--surface-2); color: var(--accent); }
+
+  /* Settings. Below Add, because that is where the eye goes after adding
+     something: the app list grows upward, the way out of it sits at the bottom. */
+  #settings-btn { width: 44px; height: 44px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; color: var(--text-dim); transition: background .15s, color .15s; }
+  #settings-btn:hover { background: var(--surface-2); color: var(--text); }
+  #settings-btn svg { width: 19px; height: 19px; fill: currentColor; }
+  #settings-btn.on { color: var(--accent); }
+
+  /* Chat. Same socket as the other sidebar controls, but it is the one that
+     opens a surface rather than switching what the tab area shows. */
+  #chat-btn { width: 44px; height: 44px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; color: var(--text-dim); transition: background .15s, color .15s; }
+  #chat-btn:hover { background: var(--surface-2); color: var(--text); }
+  #chat-btn svg { width: 19px; height: 19px; fill: currentColor; }
+  #chat-btn.on { color: var(--accent); }
+
+  /* ---------- Main column ---------- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+
+  /* ---------- Toolbar ----------
+     One bar, two identities. It used to be a browser toolbar and a launcher
+     toolbar stacked together, so the catalog screen showed four nav buttons it
+     could never use (no tab is open) and two search fields asking the same
+     question. The mode is derived from state in updateToolbar(), so a control
+     that cannot act is never rendered:
+       mode-tab     -> history, tab title, address field
+       mode-catalog -> wordmark, search, create
+     The address row also lives here instead of in its own 38px band, which is
+     what every browser does and what the old chrome was spending on one input. */
+  #toolbar { height: var(--toolbar-h); display: flex; align-items: center; gap: 8px; padding: 0 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .tb-btn { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--text-dim); transition: background .15s, color .15s; flex: 0 0 auto; }
+  .tb-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+  .tb-btn:disabled { opacity: .3; cursor: default; }
+  .tb-btn svg { width: 16px; height: 16px; fill: currentColor; }
+  /* A reload that swaps one identical frame for another is invisible; the spin
+     is the only evidence the click did something. Colour as well as motion, so
+     it still reads with reduced motion enabled. */
+  .tb-btn.loading { color: var(--accent); }
+  .tb-btn.loading svg { animation: tb-spin .9s linear infinite; }
+  @keyframes tb-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .tb-btn.loading svg { animation: none; } }
+  .tb-history { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+  #tab-title { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; flex: 0 1 auto; }
+  /* The wordmark anchors launcher mode: it says where you are without a title
+     bar, and it is the only place the product names itself. The square is the
+     same accent used for the active-tab marker, so the two read as one system. */
+  .tb-brand { display: flex; align-items: center; gap: 9px; font-size: 11.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); flex: 0 0 auto; }
+  .tb-brand::before { content: ''; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); }
+  #addr-input { flex: 1 1 auto; min-width: 0; padding: 7px 14px; border-radius: 999px; font-size: 12.5px; background: var(--surface-2); }
+  #search { flex: 1 1 auto; min-width: 0; max-width: 460px; margin-left: auto; padding: 7px 14px; border-radius: 999px; font-size: 12.5px; background: var(--surface-2); }
+  #search:focus, #addr-input:focus { border-color: var(--accent); }
+  #catalog-search-count { font-size: 11px; color: var(--text-dim); white-space: nowrap; flex: 0 0 auto; }
+  .tb-create { flex: 0 0 auto; padding: 7px 13px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text); font-size: 12px; font-weight: 600; white-space: nowrap; transition: border-color .15s, background .15s, color .15s; }
+  .tb-create:hover { border-color: var(--accent); color: var(--accent); }
+  /* "All apps" is the way back to the launcher from a tab. Without it the only
+     route was the + in the sidebar, which reads as "add", not "browse". */
+  .tb-switch { margin-left: 2px; }
+  #toolbar.mode-tab .tb-brand,
+  #toolbar.mode-tab #search,
+  #toolbar.mode-tab #catalog-search-count,
+  #toolbar.mode-tab .tb-create { display: none; }
+  #toolbar.mode-catalog .tb-history,
+  #toolbar.mode-catalog #tab-title,
+  #toolbar.mode-catalog #addr-input,
+  #toolbar.mode-catalog .tb-switch { display: none; }
+
+  /* ---------- Sub-tab strip ----------
+     Browser-style tabs for the app that is open. It sits in normal flow between
+     the toolbar and #content, so the tab webviews (positioned from #content's
+     rect) move down with it instead of being covered by it. */
+  #tab-strip { display: none; height: 34px; align-items: stretch; gap: 2px; padding: 0 8px; background: var(--surface); border-bottom: 1px solid var(--border); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  #tab-strip.on { display: flex; }
+  #tab-strip::-webkit-scrollbar { height: 0; }
+  /* A chip, not a trapezoid: the whole shell is built from 7-10px radii, and a
+     slanted tab would be the only diagonal on screen. */
+  .sub-tab { position: relative; display: flex; align-items: center; gap: 7px; flex: 0 1 auto; min-width: 84px; max-width: 186px; margin: 5px 0; padding: 0 6px 0 9px; border-radius: 7px; font-size: 12px; color: var(--text-dim); transition: background .12s, color .12s; }
+  .sub-tab:hover { background: var(--surface-2); color: var(--text); }
+  /* Only the tab you are looking at carries the accent, so "where am I" is
+     answerable without reading. */
+  .sub-tab.active { background: var(--surface-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+  .sub-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* The app's own mark on its first tab: that tab is the app, not one of its
+     pages, and the icon is the only thing that says so. */
+  .sub-tab .st-pin { flex: 0 0 13px; width: 13px; height: 13px; display: flex; align-items: center; justify-content: center; }
+  .sub-tab .st-pin .st-icon { width: 13px; height: 13px; border-radius: 3px; object-fit: contain; }
+  .sub-tab .st-pin .fallback { font-size: 11px; font-weight: 700; color: var(--text-dim); line-height: 1; }
+  .sub-tab .st-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+  .sub-tab .st-close { flex: 0 0 16px; width: 16px; height: 16px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1; color: var(--text-dim); opacity: 0; transition: opacity .12s, background .12s, color .12s; }
+  .sub-tab:hover .st-close, .sub-tab.active .st-close { opacity: .7; }
+  .sub-tab .st-close:hover { opacity: 1; background: rgba(239,68,68,.16); color: #FCA5A5; }
+  .sub-tab .st-close:focus-visible { opacity: 1; outline: 1px solid var(--accent); }
+  /* The first tab is the app: it has no close affordance at all rather than a
+     disabled one, because a button whose only job is to refuse is a lie. */
+  .sub-tab.pinned .st-close { display: none; }
+  /* Drag-to-reorder. A chip being dragged dims so the gap it leaves reads as
+     "this is moving", and the target shows a bar on the side it will land on —
+     the same language the sidebar uses, because it is the same gesture. */
+  .sub-tab.dragging { opacity: .45; }
+  .sub-tab.drop-before::before,
+  .sub-tab.drop-after::after {
+    content: ''; position: absolute; top: 2px; bottom: 2px; width: 2px;
+    border-radius: 1px; background: var(--accent); pointer-events: none;
+  }
+  .sub-tab.drop-before::before { left: -3px; }
+  .sub-tab.drop-after::after { right: -3px; }
+  /* The app's own tab is the anchor of the strip: it cannot be dragged, so it
+     must not advertise that it can. */
+  .sub-tab.pinned { cursor: default; }
+  #tab-add { flex: 0 0 26px; width: 26px; margin: 5px 0; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 17px; line-height: 1; color: var(--text-dim); transition: background .12s, color .12s; }
+  #tab-add:hover { background: var(--surface-2); color: var(--accent); }
+  #tab-add:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+  @media (prefers-reduced-motion: reduce) {
+    .sub-tab, .sub-tab .st-close, #tab-add { transition: none; }
+  }
+
+  /* ---------- Tab error / notice strip ---------- */
+  /* Sits between the toolbar and the webview area, so it can never be covered
+     by the embedded tab windows the way a toast inside #content would be. */
+  #tab-error { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; background: rgba(239,68,68,.12); border-bottom: 1px solid rgba(239,68,68,.35); color: #FCA5A5; font-size: 12px; line-height: 1.5; }
+  #tab-error.hidden { display: none; }
+  /* Same strip, softer tone: something the user should know, not a failure. */
+  #tab-error.warn { background: rgba(245,158,11,.12); border-bottom-color: rgba(245,158,11,.35); color: #FCD34D; }
+  /* A confirmation, not a problem: the accent tone keeps "links now ask you
+     again" from reading as a fault. */
+  #tab-error.info { background: rgba(52,211,153,.10); border-bottom-color: rgba(52,211,153,.32); color: #6EE7B7; }
+  #tab-error-text { flex: 1; word-break: break-word; }
+  /* A prompt, not just a notice: the strip asks before anything disruptive
+     happens, so the answers live here rather than in a modal that would hide
+     the tabs the user is working in. */
+  #tab-error-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+  #tab-error-actions.hidden { display: none; }
+  #tab-error-actions button { font-size: 11px; padding: 3px 9px; border-radius: 5px; border: 1px solid currentColor; color: inherit; background: transparent; opacity: .85; white-space: nowrap; }
+  #tab-error-actions button:hover { opacity: 1; background: rgba(255,255,255,.07); }
+  /* The action that resolves the problem, as opposed to the one that postpones
+     it: same size, more weight, so the choice is readable at a glance. */
+  #tab-error-actions button.primary { font-weight: 600; }
+  #tab-error-close { flex: 0 0 auto; font-size: 16px; line-height: 1; padding: 0 4px; color: inherit; opacity: .75; }
+  #tab-error-close:hover { opacity: 1; }
+
+  /* ---------- Context menu ---------- */
+  #ctx-menu { position: fixed; z-index: 200; min-width: 190px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 6px; box-shadow: 0 8px 30px rgba(0,0,0,.5); display: none; }
+  #ctx-menu.open { display: block; }
+  .ctx-header { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); padding: 6px 10px 4px; }
+  .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding: 7px 10px; border-radius: 6px; font-size: 13px; color: var(--text); text-align: left; }
+  .ctx-item:hover { background: var(--surface-2); }
+  .ctx-item .state { font-size: 11px; color: var(--text-dim); }
+  .ctx-item .state.on { color: var(--accent); }
+  .ctx-item.danger { color: var(--danger); }
+  .ctx-item.danger:hover { background: rgba(239,68,68,.1); }
+  .ctx-sep { height: 1px; background: var(--border); margin: 5px 4px; }
+
+  /* ---------- Content ---------- */
+  #content { flex: 1; position: relative; background: var(--bg); }
+  /* Hollow window: native webview is mounted here by Rust at this rect. */
+  #content-spacer { position: absolute; inset: 0; }
+  /* Both overlays are opaque: they are siblings inside #content, and a
+     transparent one would let a button from the panel behind it bleed through
+     the gaps between tiles. */
+  #empty-state { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: var(--text-dim); background: var(--bg); }
+  #empty-state h2 { color: var(--text); font-size: 18px; font-weight: 600; }
+  #empty-state p { font-size: 13px; max-width: 380px; text-align: center; line-height: 1.6; }
+  #empty-state .cta { background: var(--accent); color: #052e16; font-weight: 700; padding: 10px 20px; border-radius: 8px; font-size: 13px; transition: background .15s; }
+  #empty-state .cta:hover { background: var(--accent-hover); }
+  /* Opaque on purpose: the catalog and the empty state are both absolute
+     overlays in #content, and a transparent catalog lets the empty state's
+     green CTA bleed through the gaps between tiles. */
+  #catalog { position: absolute; inset: 0; overflow-y: auto; padding: 24px; background: var(--bg); }
+  #catalog h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin: 24px 0 12px; }
+  #catalog h3:first-child { margin-top: 0; }
+  /* Every app is the same square, so the grid reads as a lattice instead of a
+     ragged wall of cards. Columns never shrink below one tile; leftover width
+     is shared evenly and each cell centres its tile inside the column. */
+  .catalog-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--tile-size), 1fr)); gap: 10px; }
+  .catalog-cell { position: relative; width: var(--tile-size); max-width: 100%; margin-inline: auto; }
+  .catalog-item { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; width: 100%; aspect-ratio: 1; padding: 8px; border-radius: 12px; background: var(--surface); border: 1px solid var(--tile-edge); transition: border-color .15s, background .15s, transform .1s; }
+  /* Hover is a quiet lift; accent stays reserved for state (starred, focus, pinned). */
+  .catalog-item:hover { border-color: var(--border); background: var(--surface-2); }
+  .catalog-item:active { transform: scale(.97); }
+  .catalog-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* The well is the only thing that gives an icon its size, so the count badge
+     can be anchored to the mark itself instead of the tile's moving edges. */
+  .tile-well { position: relative; display: flex; align-items: center; justify-content: center; width: var(--icon-well); height: var(--icon-well); flex: 0 0 auto; }
+  .catalog-item img { width: var(--icon-well); height: var(--icon-well); border-radius: 9px; object-fit: contain; }
+  /* Fixed two-line label box: names never change a tile's height, so rows stay
+     on rhythm. The clamped text is centred inside that box, otherwise one-line
+     names float above the empty second line and tiles look bottom-heavy.
+     Words wrap at spaces first, so two-line names break the same way every time. */
+  .tile-label { display: flex; align-items: center; justify-content: center; width: 100%; min-height: var(--tile-label-h); font-size: 11px; line-height: 1.32; color: var(--text-dim); text-align: center; }
+  .tile-label > span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: break-word; word-break: normal; text-wrap: balance; }
+  .catalog-item:hover .tile-label { color: var(--text); }
+  /* Duplicates are allowed: the badge is a count, not a lock. */
+  .added-tag { position: absolute; top: -5px; left: -5px; min-width: 16px; height: 16px; padding: 0 4px; display: flex; align-items: center; justify-content: center; border-radius: 999px; background: var(--accent); color: #052e16; font-style: normal; font-size: 9px; font-weight: 800; }
+  /* A recipe that cannot be opened as-is (a {workspace} template, or a
+     self-hosted app with no address) says so on the tile. Without this the tile
+     looks identical to a one-click app and the form's extra field is a surprise. */
+  .setup-tag { position: absolute; bottom: -4px; left: 50%; transform: translateX(-50%); padding: 1px 5px; border-radius: 999px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border); color: var(--text-dim); font-style: normal; font-size: 8px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  /* Favorite star sits outside the tile so clicking a tile never toggles it. */
+  .fav-btn { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; border-radius: 999px; font-size: 12px; line-height: 1; color: var(--text-dim); opacity: 0; transition: opacity .12s, color .12s, background .12s; }
+  .catalog-cell:hover .fav-btn, .fav-btn.on, .fav-btn:focus-visible { opacity: 1; }
+  .fav-btn:hover { background: var(--surface-2); color: var(--accent); }
+  .fav-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .fav-btn.on { color: var(--accent); }
+  /* Fallback for an app with no readable favicon: a neutral "?" chip. It reads
+     as "unknown icon" instead of a fake initial, and never looks like a brand. */
+  .tile-fallback { display: flex; align-items: center; justify-content: center; width: var(--icon-well); height: var(--icon-well); border-radius: 9px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--tile-edge); font-size: 19px; font-weight: 600; color: var(--text-dim); }
+  @media (prefers-reduced-motion: reduce) {
+    .catalog-item, .fav-btn, .tb-create, .app-icon-btn { transition: none; }
+    .catalog-item:active, .app-icon-btn:active { transform: none; }
+  }
+  .catalog-empty { margin-top: 18px; font-size: 13px; color: var(--text-dim); }
+  #catalog h3.pinned { color: var(--accent); }
+  /* The catalog body no longer carries its own search field or create button:
+     both moved into the toolbar, which is the one place the user already looks.
+     Rendering them here as well is what made the screen ask the same question
+     twice in two different shapes. What is left is a single orientation line. */
+  .catalog-hint { font-size: 12px; color: var(--text-dim); margin-bottom: 18px; }
+
+  /* ---------- Disabled app state ---------- */
+  #disabled-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .ds-card { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 330px; text-align: center; }
+  .ds-ring { position: relative; display: flex; align-items: center; justify-content: center; width: 76px; height: 76px; border-radius: 22px; border: 1px dashed var(--border); background: radial-gradient(circle at 50% 40%, rgba(148,163,184,.10), transparent 70%); }
+  .ds-ring img { width: 40px; height: 40px; border-radius: 10px; object-fit: contain; filter: grayscale(1); opacity: .5; }
+  .ds-ring .fallback { font-size: 26px; font-weight: 700; color: var(--text-dim); opacity: .6; }
+  .ds-pill { margin-top: 16px; padding: 3px 9px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: var(--text-dim); }
+  .ds-name { margin-top: 10px; font-size: 16px; font-weight: 600; color: var(--text); word-break: break-word; }
+  .ds-hint { margin-top: 6px; font-size: 12.5px; line-height: 1.6; color: var(--text-dim); }
+  .ds-enable { margin-top: 20px; width: 100%; padding: 10px 18px; border-radius: 9px; background: var(--accent); color: #052e16; font-size: 13px; font-weight: 700; transition: background .15s, transform .1s; }
+  .ds-enable:hover { background: var(--accent-hover); }
+  .ds-enable:active { transform: scale(.985); }
+  .ds-enable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ds-settings { margin-top: 8px; padding: 8px 12px; border-radius: 8px; font-size: 12px; color: var(--text-dim); transition: background .15s, color .15s; }
+  .ds-settings:hover { background: var(--surface-2); color: var(--text); }
+  .ds-note { margin-top: 14px; font-size: 11px; line-height: 1.6; color: #64748B; }
+  .ds-note kbd { padding: 1px 5px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); font: inherit; font-size: 10.5px; color: var(--text-dim); }
+
+  /* ---------- Modal ---------- */
+  #modal-backdrop { position: fixed; inset: 0; background: rgba(2,6,23,.7); display: none; align-items: center; justify-content: center; z-index: 100; }
+  #modal-backdrop.open { display: flex; }
+  #modal { width: 440px; max-height: 85vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+  #modal h2 { font-size: 16px; margin-bottom: 14px; }
+  #modal-sub { margin: -8px 0 14px; font-size: 12px; line-height: 1.55; color: var(--text-dim); }
+  #modal-sub.error { color: var(--danger); }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .field input, .field select { width: 100%; }
+  /* Icon row: preview chip + URL field + the "read it from the site" action. */
+  .icon-row { display: flex; align-items: center; gap: 8px; }
+  .icon-row input { flex: 1; min-width: 0; }
+  .icon-preview { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--tile-edge); font-size: 14px; font-weight: 700; color: var(--text-dim); cursor: pointer; }
+  .icon-preview img { width: 22px; height: 22px; object-fit: contain; }
+  .icon-preview:hover { box-shadow: inset 0 0 0 1px var(--border); }
+  .icon-fetch { flex: 0 0 auto; padding: 7px 10px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--tile-edge); color: var(--text-dim); font-size: 11.5px; font-weight: 600; white-space: nowrap; transition: border-color .15s, color .15s; }
+  .icon-fetch:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  .icon-fetch:disabled { opacity: .5; cursor: default; }
+  .field-hint { margin-top: 5px; font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+  .field-hint.error { color: var(--danger); }
+  .field-hint.ok { color: var(--accent); }
+  /* Placeholder inputs for a templated recipe. The URL field above stays the
+     single source of truth: these write into it, so a save needs no special
+     case and an empty answer simply leaves the URL empty. */
+  .template-block { margin-top: 8px; padding: 10px 11px; border-radius: 9px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--tile-edge); display: flex; flex-direction: column; gap: 9px; }
+  .tpl-field { display: flex; flex-direction: column; gap: 4px; }
+  .tpl-field > span { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); }
+  .tpl-field input { width: 100%; background: var(--bg); }
+  .tpl-preview { font-size: 11px; color: var(--text-dim); word-break: break-all; font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; }
+  .tpl-preview:empty { display: none; }
+  .row { display: flex; gap: 10px; }
+  .row .field { flex: 1; }
+  .hidden { display: none !important; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  .btn { padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; transition: background .15s, opacity .15s; }
+  .btn-primary { background: var(--accent); color: #052e16; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-ghost { color: var(--text-dim); }
+  .btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+  .btn-danger { color: var(--danger); }
+  .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,.1); }
+  /* Filled variant for the one destructive button that confirms a removal. */
+  .btn-danger-solid { background: var(--danger); color: #450a0a; }
+  .btn-danger-solid:hover:not(:disabled) { background: #DC2626; }
+  /* A save in flight: the action reads as taken, and nothing invites a second click. */
+  .btn:disabled { opacity: .55; cursor: default; }
+  #modal-backdrop.busy { cursor: progress; }
+
+  /* Three-way proxy choice. Segmented radios rather than a select: the options
+     are a decision the fields below depend on, and seeing "Direct" next to "Use
+     global" is the whole point of asking. */
+  .seg { display: flex; gap: 6px; }
+  .seg label { flex: 1; margin: 0; position: relative; }
+  .seg input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .seg span {
+    display: block; text-align: center; padding: 7px 6px; border-radius: 7px;
+    background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--tile-edge);
+    color: var(--text-dim); font-size: 11.5px; font-weight: 600;
+    text-transform: none; letter-spacing: 0; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    transition: color .15s, box-shadow .15s, background .15s;
+  }
+  .seg label:hover span { color: var(--text); }
+  .seg input:checked + span { color: var(--accent); background: rgba(34,197,94,.1); box-shadow: inset 0 0 0 1px var(--accent); }
+  .seg input:focus-visible + span { box-shadow: inset 0 0 0 1px var(--accent); }
+  /* A choice the current configuration cannot honour stays visible but inert:
+     the option is real, it just belongs to another Storage mode. Hiding it would
+     leave the user wondering where the proxy setting went. */
+  .seg input:disabled + span { opacity: .45; cursor: default; }
+  .seg label:hover input:disabled + span { color: var(--text-dim); }
+  /* Fields the chosen mode does not use are dimmed and inert, not hidden: hiding
+     them would shift everything below, and a Custom proxy typed earlier has to
+     still be there when the user switches back to Custom. */
+  .proxy-fields.off { opacity: .5; }
+  .proxy-fields.off input, .proxy-fields.off select { pointer-events: none; }
+  #proxy-mode-hint { margin-top: 6px; }
+  .field input:disabled, .field select:disabled { color: var(--text-dim); cursor: default; }
+
+  /* ---------- Confirm dialog ---------- */
+  #confirm-backdrop { position: fixed; inset: 0; z-index: 150; display: none; align-items: center; justify-content: center; background: rgba(2,6,23,.72); }
+  #confirm-backdrop.open { display: flex; }
+  #confirm { width: 340px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+  #confirm h2 { font-size: 15px; margin-bottom: 8px; }
+  #confirm p { font-size: 12.5px; line-height: 1.6; color: var(--text-dim); }
+  #confirm .modal-actions { margin-top: 18px; }
+</style>
+<!-- Theme tokens, then the two feature surfaces. Loaded after the base styles
+     so a light-theme override wins without !important. -->
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="chat.css">
+<script>
+  // Apply the remembered theme before the first paint. Inline and synchronous on
+  // purpose: settings.js has not loaded yet, and a light-theme user would
+  // otherwise see the whole window flash dark on every launch.
+  (function () {
+    var theme = 'dark';
+    try { theme = localStorage.getItem('rustbox.theme') || 'dark'; } catch (_) {}
+    var light = theme === 'light'
+      || (theme === 'system' && window.matchMedia('(prefers-color-scheme: light)').matches);
+    document.documentElement.dataset.theme = light ? 'light' : 'dark';
+    document.documentElement.dataset.themeSource = theme;
+  })();
+</script>
+</head>
+<body>
+<div id="layout">
+  <nav id="sidebar">
+    <img class="logo" src="icon.png" alt="RustBox">
+    <div id="app-list"></div>
+    <div id="sidebar-spacer"></div>
+    <button id="chat-btn" title="Chat with AI agent" aria-label="Chat with AI agent">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v10h2v2.2L8.8 16H20V6z"/><path d="M11 8h2v2.5h2.5v2H13V15h-2v-2.5H8.5v-2H11z"/></svg>
+    </button>
+    <button id="add-app-btn" title="Add custom app">+</button>
+    <!-- Settings sits below "+" because that is where the eye goes after adding
+         something: the list of apps grows upward, the way out of the list sits
+         at the bottom. -->
+    <button id="settings-btn" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 6a2 2 0 1 1 0-4 2 2 0 0 1 0 4z"/><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.5-2-3.5-2.4 1a7.5 7.5 0 0 0-1.7-1L15 3H9l-.3 2.6c-.6.3-1.2.6-1.7 1l-2.4-1-2 3.5L4.6 11a7.6 7.6 0 0 0 0 2l-2 1.5 2 3.5 2.4-1c.5.4 1.1.7 1.7 1L9 21h6l.3-2.6c.6-.3 1.2-.6 1.7-1l2.4 1 2-3.5zM17.3 16l-.6.6a5.6 5.6 0 0 1-2 1.2l-.8.3-.2 2h-3.4l-.2-2-.8-.3a5.6 5.6 0 0 1-2-1.2l-.6-.6-1.9.8-1.7-3 1.6-1.2-.1-.9v-1l.1-.9L4.1 8.4l1.7-3 1.9.8.6-.6a5.6 5.6 0 0 1 2-1.2l.8-.3.2-2h3.4l.2 2 .8.3c.7.3 1.4.7 2 1.2l.6.6 1.9-.8 1.7 3-1.6 1.2.1.9v1l-.1.9 1.6 1.2-1.7 3z"/></svg>
+    </button>
+  </nav>
+
+  <div id="main">
+    <!-- One bar, two identities.
+         Previously this was a browser toolbar AND a launcher toolbar rendered at
+         the same time, plus a third band underneath holding the address field.
+         The result on the catalog screen was four greyed-out nav buttons that
+         could not do anything, an empty title, a dead address row, and two
+         search fields asking the same question in two different shapes.
+         The bar now shows only what can act in the current state, and the mode
+         is derived in updateToolbar() from the same value that decides which
+         panel is visible, so it cannot drift out of sync:
+           mode-tab     -> history, tab title, address field, switch-app
+           mode-catalog -> wordmark, search, result count, create -->
+    <div id="toolbar" class="mode-catalog">
+      <div class="tb-history">
+        <button class="tb-btn" id="nav-back" title="Back"><svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg></button>
+        <button class="tb-btn" id="nav-fwd" title="Forward"><svg viewBox="0 0 24 24"><path d="M8.6 16.6 10 18l6-6-6-6-1.4 1.4 4.6 4.6z"/></svg></button>
+        <button class="tb-btn" id="nav-reload" title="Reload"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08a6 6 0 1 1-1.42-6.23L13 11h7V4z"/></svg></button>
+        <button class="tb-btn" id="nav-home" title="Back to this app's start page"><svg viewBox="0 0 24 24"><path d="m12 3 9 8h-3v9h-5v-6h-2v6H6v-9H3z"/></svg></button>
+      </div>
+      <span id="tab-title"></span>
+      <span class="tb-brand">RustBox</span>
+      <input id="addr-input" type="text" spellcheck="false" placeholder="Enter URL and press Enter">
+      <input id="search" type="search" placeholder="Search apps by name or URL" spellcheck="false" autocomplete="off">
+      <span id="catalog-search-count"></span>
+      <button class="tb-btn tb-switch" id="tb-switch" title="Switch app (Ctrl+K)"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zm9 0h7v7h-7zM4 13h7v7H4zm9 0h7v7h-7z"/></svg></button>
+      <button class="tb-create" id="catalog-custom">+ Create Custom App</button>
+    </div>
+
+    <!-- Sub-tabs of the current app. In normal flow, not overlaid: the tab
+         webviews are separate OS windows placed at #content's rect, so a strip
+         that floated above it would be covered by the page it belongs to. -->
+    <div id="tab-strip" role="tablist" aria-label="Tabs"></div>
+
+    <!-- A tab that failed to open used to fail silently: the backend emitted an
+         event nobody listened for, and release builds have no console. This
+         strip is the only place the user can learn why nothing happened. -->
+    <div id="tab-error" class="hidden" role="alert">
+      <span id="tab-error-text"></span>
+      <div id="tab-error-actions" class="hidden"></div>
+      <button id="tab-error-close" title="Dismiss">&times;</button>
+    </div>
+
+
+    <div id="content">
+      <div id="content-spacer"></div>
+      <div id="empty-state">
+        <h2>Welcome to RustBox</h2>
+        <p>Pick an app from the catalog below to open it right here, or add your own custom app from the sidebar.</p>
+        <button class="cta" id="empty-add">Add your first app</button>
+      </div>
+      <div id="disabled-state" class="hidden">
+        <div class="ds-card">
+          <div class="ds-ring" id="ds-icon"></div>
+          <span class="ds-pill">Disabled</span>
+          <h2 class="ds-name" id="ds-name"></h2>
+          <p class="ds-hint">This app is turned off, so it is not loading. Enable it to open the page again.</p>
+          <button class="ds-enable" id="ds-enable">Enable app</button>
+          <button class="ds-settings" id="ds-settings">App settings</button>
+          <p class="ds-note">Or right-click the tab in the sidebar to enable it.</p>
+        </div>
+      </div>
+      <div id="catalog" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- Chat with AI agent.
+       A right-hand column rather than an overlay: the agent reads the page it is
+       talking about, so covering that page would defeat the point. Opening the
+       panel shrinks #content, and the tab windows follow it (resize_tabs is the
+       same mechanism the toolbar already uses). -->
+  <aside id="chat-panel" aria-label="Chat with AI agent">
+    <div class="ch-head">
+      <span class="ch-title" id="ch-title">Chat with AI</span>
+      <button class="ch-icon" id="ch-history-btn" title="Conversations">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3a9 9 0 1 0 8.9 10.5h-2.1A7 7 0 1 1 13 5v4l5-4.5L13 0z"/><path d="M12 8h1.5v5.2l3.6 2.1-.8 1.3-4.3-2.5z"/></svg>
+      </button>
+      <button class="ch-icon" id="ch-new" title="New conversation">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
+      </button>
+      <button class="ch-icon" id="ch-close" title="Close (Esc)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6 10.6 12 5 6.4z"/></svg>
+      </button>
+    </div>
+    <div class="ch-modelbar" id="ch-modelbar"></div>
+    <div class="ch-history" id="ch-history">
+      <div class="ch-h-head">
+        <h3>Conversations</h3>
+        <button class="sp-btn sm" id="ch-h-new">New</button>
+        <button class="ch-icon" id="ch-h-close" title="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6 10.6 12 5 6.4z"/></svg>
+        </button>
+      </div>
+      <div class="ch-h-list" id="ch-h-list"></div>
+    </div>
+    <div class="ch-log" id="ch-log"></div>
+    <div class="ch-notice hidden" id="ch-notice"></div>
+    <div class="ch-attach" id="ch-attach"></div>
+    <div class="ch-compose">
+      <div class="ch-input-wrap">
+        <textarea class="ch-input" id="ch-input" rows="1" placeholder="Ask anything about this page"></textarea>
+        <button class="ch-send" id="ch-send" title="Send (Enter)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg>
+        </button>
+      </div>
+      <div class="ch-bar">
+        <button class="ch-icon" id="ch-attach-btn" title="Attach a file or image">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.5 6v11a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v11a1.5 1.5 0 0 1-3 0V6H9v10a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v12a6 6 0 0 0 12 0V6z"/></svg>
+        </button>
+        <input type="file" id="ch-file" multiple hidden>
+        <span class="ch-hint">Enter to send · Shift+Enter for a new line</span>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- Settings. A full-height surface, not a modal: six sections with lists
+     inside them do not belong in a dialog, and "add one app" already owns the
+     modal vocabulary. It starts at the sidebar edge so the app list stays
+     visible and usable while a setting is being changed. -->
+<div id="settings-page" class="hidden" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="sp-head">
+    <h1>Settings</h1>
+    <span class="sp-flash" id="sp-flash"></span>
+    <span class="sp-spacer"></span>
+    <button class="sp-btn primary" id="sp-save">Save changes</button>
+    <button class="sp-close" id="sp-close" title="Close settings (Esc)">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6 10.6 12 5 6.4z"/></svg>
+    </button>
+  </div>
+  <div class="sp-body">
+    <nav class="sp-rail" id="sp-rail"></nav>
+    <div class="sp-pane" id="sp-pane"></div>
+  </div>
+</div>
+
+<div id="ctx-menu"></div>
+
+<div id="modal-backdrop">
+  <div id="modal">
+    <h2 id="modal-title">Add App</h2>
+    <p id="modal-sub" class="hidden"></p>
+    <div class="field">
+      <label>Name</label>
+      <input id="f-name" placeholder="My App">
+    </div>
+    <div class="field">
+      <label>URL</label>
+      <input id="f-url" placeholder="https://example.com">
+      <!-- Recipes whose upstream URL is a template ("https://{teamId}.slack.com")
+           arrive here with the parts that still have to be filled in. Hidden for
+           every ordinary app, so the form does not grow a section nobody needs. -->
+      <div id="f-template" class="template-block hidden"></div>
+    </div>
+    <div class="field">
+      <label>Icon</label>
+      <div class="icon-row">
+        <span class="icon-preview" id="icon-preview" title="Click to clear"></span>
+        <input id="f-icon" placeholder="https://example.com/icon.png">
+        <button class="icon-fetch" id="btn-fetch-icon" type="button">Read from site</button>
+      </div>
+      <p class="field-hint" id="icon-hint">Leave empty to read the icon the site declares.</p>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>Engine</label>
+        <select id="f-engine">
+          <option value="os-webview">Embedded (in RustBox)</option>
+          <option value="external">External browser</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Browser (external)</label>
+        <select id="f-browser"><option value="">OS default</option></select>
+      </div>
+    </div>
+    <p class="field-hint" id="browser-hint">Only used by external-browser apps. Embedded apps render inside RustBox's own webview.</p>
+    <div class="field">
+      <label>Storage</label>
+      <!-- Light first, because it is the default for a new app and the cheaper
+           of the two. The option only exists on Windows: `syncProfileModeHint`
+           removes it where WebView2 has no named-profile equivalent, rather than
+           leaving a row that looks available and does nothing. -->
+      <select id="f-profile-mode">
+        <option value="light">Light — shared runtime, separate data</option>
+        <option value="isolated">Isolated — own browser instance</option>
+      </select>
+      <p class="field-hint" id="profile-mode-hint">Both keep cookies and logins separate per app.</p>
+    </div>
+    <!-- Proxy mode first, then the fields it governs. The order matters: the
+         fields below are meaningless until this is answered, and a form that
+         asks for a host before asking whether a host is wanted invites the user
+         to type one into a setting that will be ignored. -->
+    <div class="field">
+      <label>Proxy</label>
+      <div class="seg" id="f-proxy-mode">
+        <label><input type="radio" name="proxy-mode" value="inherit"><span>Use global</span></label>
+        <label><input type="radio" name="proxy-mode" value="none"><span>Direct</span></label>
+        <label><input type="radio" name="proxy-mode" value="custom"><span>Custom</span></label>
+      </div>
+      <p class="field-hint" id="proxy-mode-hint">Follows whatever Settings → Global proxy says.</p>
+    </div>
+    <div class="proxy-fields" id="proxy-fields">
+      <div class="row">
+        <div class="field">
+          <label>Proxy scheme</label>
+          <select id="f-proxy-scheme">
+            <option value="http">HTTP / HTTPS</option>
+            <option value="socks5">SOCKS5</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Proxy host</label>
+          <input id="f-proxy-host" placeholder="e.g. 127.0.0.1">
+        </div>
+        <div class="field" style="max-width:90px">
+          <label>Port</label>
+          <input id="f-proxy-port" type="number" placeholder="8080">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Proxy user</label>
+          <input id="f-proxy-user" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Proxy pass</label>
+          <input id="f-proxy-pass" type="password" autocomplete="off">
+        </div>
+      </div>
+      <p class="field-hint" id="proxy-hint">Leave the host empty for a direct connection. A proxy applies to embedded tabs only when storage is Isolated.</p>
+    </div>
+    <div class="field">
+      <label>User agent (optional)</label>
+      <input id="f-ua" placeholder="Custom user-agent string">
+    </div>
+    <!-- Links that ask for a new window. The default used to be "nothing
+         happens", because WebView2 drops an unanswered new-window request; this
+         field is what replaces that silence with a decision. The default is now
+         to ask, because every other answer guesses on the user's behalf and one
+         of them (replacing the page) cannot be undone. -->
+    <div class="field">
+      <label>Links that open a new window</label>
+      <div class="seg" id="f-link-target">
+        <label><input type="radio" name="link-target" value="ask"><span>Ask me</span></label>
+        <label><input type="radio" name="link-target" value="same"><span>This tab</span></label>
+        <label><input type="radio" name="link-target" value="new-tab"><span>New tab</span></label>
+        <label><input type="radio" name="link-target" value="popup"><span>Pop-up</span></label>
+        <label><input type="radio" name="link-target" value="external"><span>Browser</span></label>
+      </div>
+      <p class="field-hint" id="link-target-hint"></p>
+    </div>
+    <!-- Anti-detect identity. Only stealth browsers act on a seed; for anything
+         else the launcher says so instead of pretending it applied. -->
+    <div class="field">
+      <label>Fingerprint seed (anti-detect browsers)</label>
+      <div class="icon-row">
+        <input id="f-seed" placeholder="e.g. 12345 — leave empty for a fresh identity">
+        <button class="icon-fetch" id="btn-random-seed" type="button">Random</button>
+      </div>
+      <p class="field-hint" id="seed-hint">Same seed means the same identity on every launch.</p>
+    </div>
+    <div class="field">
+      <label>Extra browser arguments (optional)</label>
+      <input id="f-args" placeholder="--lang=en-US --disable-gpu">
+      <p class="field-hint">One or more flags, space separated. Added last, so they override the ones above.</p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-danger hidden" id="btn-delete">Delete</button>
+      <button class="btn btn-ghost" id="btn-cancel">Cancel</button>
+      <button class="btn btn-primary" id="btn-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirmation for destructive actions started outside the form (right-click
+     Remove). Deliberately small and separate from #modal: it is a yes/no
+     question, not a form. -->
+<div id="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div id="confirm">
+    <h2 id="confirm-title">Remove app?</h2>
+    <p id="confirm-text"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="confirm-cancel">Cancel</button>
+      <button class="btn btn-danger-solid" id="confirm-ok">Remove</button>
+    </div>
+  </div>
+</div>
+
+<script src="catalog.js"></script>
+<!-- Loaded before the inline script so `window.RustBoxSettings`,
+     `window.RustBoxChat` and `window.RustBoxTheme` exist by the time the shell
+     wires its buttons. Both defer their own boot to DOMContentLoaded, so they
+     find their markup regardless of parse order. -->
+<script src="settings.js"></script>
+<script src="chat.js"></script>
+<script>
+'use strict';
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
+// The catalog is generated from the Ferdium recipe repository by
+// scripts/build-catalog.ps1 -> ui/catalog.js (441 apps, each with its own icon).
+// catalog.js loads before this script, so window.RUSTBOX_CATALOG is populated.
+const CATALOG = Array.isArray(window.RUSTBOX_CATALOG) ? window.RUSTBOX_CATALOG : [];
+// "Featured" repeats entries that also live in their own section, so it is
+// dropped here to keep every tile in exactly one place.
+//
+// Entries are kept whole rather than flattened to [name, url, icon]: a recipe
+// whose URL cannot be opened as-is carries the reason with it.
+//   ph  [{n, k}]  the URL has {placeholders}; `n` is the question to ask
+//                 ("Workspace name"), `k` is the token to substitute
+//   cu  true      self-hosted: the recipe has no URL at all, so the user has
+//                 to supply the address of their own instance
+const PRESETS = CATALOG.filter(g => g.section !== 'Featured')
+  .map(g => [g.section, g.apps.map(a => ({
+    n: a.n,
+    u: a.u,
+    i: a.i || '',
+    ph: Array.isArray(a.ph) ? a.ph : null,
+    cu: a.cu === true,
+  }))]);
+
+let apps = [];
+let browsers = [];
+// Catalog favorites (starred service URLs) and per-URL usage counters, both
+// persisted in config.json by the Rust side.
+let favorites = new Set();
+let usage = new Map();
+// Search text survives catalog re-renders (adding a favorite rebuilds the grid).
+let pendingCatalogQuery = '';
+// Live per-tab navigation state reported by the tab webviews (`tab-nav`):
+// the URL actually loaded plus whether history back/forward is available.
+// Keyed per (app, sub-tab): an app can have several pages open, and a
+// background tab navigating must not move the address bar of the one on screen.
+const tabUrls = new Map();
+const tabHistory = new Map();
+// URL we asked the tab to load but have not seen confirmed yet. Events that
+// still carry the OLD url keep arriving for a moment after `navigate_to_url`,
+// and they must not snap the address bar back.
+const pendingNav = new Map();
+const NAV_PENDING_MS = 3000;
+// Tabs whose webview reported a navigation in flight (`tab-loading`). A reload
+// is the reason this exists: it goes to the URL the tab already has, so nothing
+// else in the chrome changes and the button looked inert when it had worked.
+const tabLoading = new Set();
+// Sub-tab strip state, pushed by the backend as a whole snapshot on every
+// change (`tabs-changed`). A snapshot rather than incremental events: the strip
+// is a handful of rows, and a dropped "closed" event would leave a dead chip on
+// screen for the rest of the session.
+let subTabs = [];
+// The markup last written to #tab-strip. Re-rendering identical HTML would
+// reset the strip's scroll position on every toolbar refresh, which is the one
+// thing a horizontally overflowing tab bar cannot afford.
+let tabStripMarkup = '';
+
+// One key per (app, sub-tab) pair. `\u0000` cannot appear in an app id, so the
+// two parts can never be confused for one another.
+function tabKey(appId, tabId) {
+  return `${appId}\u0000${tabId || 'main'}`;
+}
+
+function appTabs(appId) {
+  return subTabs.find(g => g.appId === appId) || null;
+}
+
+// Which sub-tab of the app is on screen, as the backend last reported it.
+function activeTabIdOf(appId) {
+  return appTabs(appId)?.active || 'main';
+}
+
+// The sub-tab being dragged, if any. Kept beside the sidebar's own `dragId`
+// rather than shared: a sidebar drag must never look like a strip drag, or
+// dropping an app icon on a chip would try to reorder a tab.
+let subDragId = null;
+
+// Drop markers are one state, so they are cleared everywhere before one is set.
+function clearSubDropMarkers() {
+  document.querySelectorAll('.sub-tab.drop-before, .sub-tab.drop-after')
+    .forEach(el => el.classList.remove('drop-before', 'drop-after'));
+}
+
+// Drop every navigation fact about an app, all its sub-tabs included. Called
+// when the app's windows are gone: keeping the entries would let a reopened tab
+// show the URL it had before it was closed.
+function forgetTab(appId) {
+  const prefix = `${appId}\u0000`;
+  for (const map of [tabUrls, tabHistory, pendingNav]) {
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(prefix)) map.delete(key);
+    }
+  }
+}
+
+function normUrl(u) {
+  return String(u || '').replace(/\/+$/, '').toLowerCase();
+}
+
+let activeId = null;
+// The tab that was open when the window last closed, so a restart lands where
+// the user left off instead of always jumping to the first sidebar entry.
+let lastActiveId = null;
+// App id currently being dragged in the sidebar, or null.
+let dragId = null;
+let editingId = null; // null = new
+let firstRun = false;
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// Ids must stay unique even when several tabs are added in the same tick,
+// and a duplicated preset should not produce two identical sidebar labels.
+function newAppId() {
+  let id;
+  do { id = 'app-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7); }
+  while (apps.some(a => a.id === id));
+  return id;
+}
+function uniqueName(base) {
+  const name = (base || 'App').trim() || 'App';
+  if (!apps.some(a => a.name === name)) return name;
+  for (let n = 2; ; n++) {
+    const candidate = `${name} ${n}`;
+    if (!apps.some(a => a.name === candidate)) return candidate;
+  }
+}
+
+async function refreshContentRect() {
+  const el = document.getElementById('content');
+  const r = el.getBoundingClientRect();
+  await invoke('resize_tabs', { x: r.left, y: r.top, width: r.width, height: r.height });
+}
+
+// "?" is the honest placeholder for an app with no readable icon: a letter
+// would imply a brand mark that does not exist, and hides the fact that the
+// favicon could not be read.
+const ICON_UNKNOWN = '?';
+
+function iconHtml(app, cls) {
+  const fallback = `<span class="fallback">${ICON_UNKNOWN}</span>`;
+  if (!app.icon) return fallback;
+  // The inline handler needs the replacement markup quote-escaped, otherwise the
+  // double quotes inside it terminate the attribute and the raw tag leaks into
+  // the DOM as text.
+  const safe = fallback.replace(/"/g, '&quot;');
+  // `draggable="false"` matters: a bare <img> is natively draggable in Chromium,
+  // so without this a drag on a sidebar tile starts as an *image* drag. The
+  // button's handler still fires (dragstart bubbles), but the ghost is the raw
+  // icon and the drop effect is copy, which reads as "not a reorder".
+  return `<img src="${esc(app.icon)}" class="${cls}" draggable="false" onerror="this.outerHTML='${safe}'">`;
+}
+
+function renderSidebar() {
+  const list = $('#app-list');
+  list.innerHTML = apps.map((a, i) => `
+    <button class="app-icon-btn ${a.id === activeId ? 'active' : ''} ${a.enabled === false ? 'disabled' : ''}" data-id="${esc(a.id)}" data-index="${i}" draggable="true" title="${esc(a.name)}${a.enabled === false ? ' (disabled)' : ''}">
+      ${iconHtml(a, '')}
+    </button>`).join('');
+  list.querySelectorAll('.app-icon-btn').forEach(btn => {
+    btn.addEventListener('click', () => activate(btn.dataset.id));
+    btn.addEventListener('contextmenu', (e) => { e.preventDefault(); openCtxMenu(apps.find(a => a.id === btn.dataset.id), e.clientX, e.clientY); });
+  });
+  // Drag state lives on the element, so a re-render (which rebuilds the buttons)
+  // cannot leave a stale handler pointing at a removed node.
+  list.querySelectorAll('.app-icon-btn').forEach(btn => {
+    btn.draggable = true;
+    btn.addEventListener('dragstart', (e) => {
+      dragId = btn.dataset.id;
+      // The drag image is the button itself; without setting data the drop
+      // target cannot tell a reorder from a drag out of the window.
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', dragId); } catch (_) {}
+      btn.classList.add('dragging');
+    });
+    btn.addEventListener('dragend', () => {
+      dragId = null;
+      clearDropMarkers();
+      btn.classList.remove('dragging');
+    });
+    btn.addEventListener('dragover', (e) => {
+      if (!dragId || dragId === btn.dataset.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      // Which side of the target the pointer is on decides insert-before or
+      // insert-after, so dropping on the lower half moves the icon down.
+      const r = btn.getBoundingClientRect();
+      const after = e.clientY > r.top + r.height / 2;
+      clearDropMarkers();
+      btn.classList.add(after ? 'drop-after' : 'drop-before');
+    });
+    btn.addEventListener('dragleave', () => btn.classList.remove('drop-before', 'drop-after'));
+    btn.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      const from = dragId;
+      clearDropMarkers();
+      if (!from || from === btn.dataset.id) return;
+      const r = btn.getBoundingClientRect();
+      const after = e.clientY > r.top + r.height / 2;
+      await reorderApp(from, btn.dataset.id, after);
+    });
+  });
+}
+
+// Drop marker highlight is a single state, so it is cleared everywhere before
+// being applied to one button; otherwise two markers can stay lit.
+function clearDropMarkers() {
+  document.querySelectorAll('.app-icon-btn.drop-before, .app-icon-btn.drop-after')
+    .forEach(el => el.classList.remove('drop-before', 'drop-after'));
+}
+
+/// Move `fromId` next to `toId` and persist the new order.
+///
+/// The order in `apps` *is* the sidebar order and it is what `save_apps`
+/// writes, so reordering is a plain splice plus a save. No separate "order"
+/// field: two sources of truth for the same list is how they drift apart.
+async function reorderApp(fromId, toId, after) {
+  const from = apps.findIndex(a => a.id === fromId);
+  const to = apps.findIndex(a => a.id === toId);
+  if (from < 0 || to < 0 || from === to) return;
+
+  const [moved] = apps.splice(from, 1);
+  // Recompute the target index: removing the item shifts everything after it.
+  let insertAt = apps.findIndex(a => a.id === toId);
+  if (insertAt < 0) { apps.splice(from, 0, moved); return; }
+  if (after) insertAt += 1;
+  apps.splice(insertAt, 0, moved);
+
+  renderSidebar();
+  await persist();
+}
+
+/// Move an app one place up or down the sidebar, from the context menu.
+///
+/// Shares the persistence path with `reorderApp` rather than having its own:
+/// the sidebar order is `apps` order, so both are a splice plus a save, and a
+/// second implementation is how the two drift apart.
+async function moveApp(appId, delta) {
+  const from = apps.findIndex(a => a.id === appId);
+  if (from < 0) return;
+  const to = from + delta;
+  if (to < 0 || to >= apps.length) return;
+  const [moved] = apps.splice(from, 1);
+  apps.splice(to, 0, moved);
+  renderSidebar();
+  await persist();
+}
+
+// A catalog tile. `starred` toggles the favorite button; `count` shows how many
+// tabs of that URL are already open.
+//
+// `preset` is the whole catalog entry, not just its parts, because a recipe that
+// needs input has to say so on the tile itself: clicking it opens a form, and a
+// tile that silently demanded a workspace name would look broken.
+function catalogTile(preset, count, starred) {
+  const name = preset.n;
+  const url = preset.u;
+  const icon = preset.i;
+  const needsInput = !!(preset.ph && preset.ph.length) || preset.cu;
+  const title = needsInput
+    ? `${name} needs ${preset.cu ? 'a server address' : 'a ' + preset.ph.map(p => p.n.toLowerCase()).join(' and ')}`
+    : count
+      ? `${count} tab${count > 1 ? 's' : ''} added - click to add another`
+      : `Add ${name}`;
+  return `
+    <div class="catalog-cell">
+      <button class="catalog-item" data-name="${esc(name)}" data-url="${esc(url)}" data-icon="${esc(icon)}" data-key="${esc(presetKey(preset))}" title="${esc(title)}">
+        <span class="tile-well">
+          ${icon ? `<img src="${esc(icon)}" alt="" loading="lazy">` : `<span class="tile-fallback">${ICON_UNKNOWN}</span>`}
+          ${count ? `<em class="added-tag">${count}</em>` : ''}
+          ${needsInput ? `<em class="setup-tag" aria-hidden="true">setup</em>` : ''}
+        </span>
+        <span class="tile-label"><span>${esc(name)}</span></span>
+      </button>
+      <button class="fav-btn ${starred ? 'on' : ''}" data-key="${esc(presetKey(preset))}" data-name="${esc(name)}" title="${starred ? 'Remove from favorites' : 'Add to favorites'}" aria-pressed="${starred}">${starred ? '&#9733;' : '&#9734;'}</button>
+    </div>`;
+}
+
+// Stable identity for a preset. A templated URL is not a URL anyone can open,
+// so favorites and usage counters key on the template text, which is unique per
+// recipe and never changes for a given upstream release.
+//
+// Accepts both shapes it is called with: a catalog entry (`n`/`u`/`cu`) and the
+// normalised object openModal builds (`name`/`url`/`cu`).
+function presetKey(preset) {
+  if (preset.cu) return `self-hosted:${preset.n || preset.name}`;
+  return preset.u ?? preset.url ?? '';
+}
+
+function renderCatalog() {
+  const cat = $('#catalog');
+  // Count per URL instead of treating a preset as "used": any app can be added
+  // many times (4x Gmail, 2x WhatsApp, ...).
+  const counts = new Map();
+  for (const a of apps) counts.set(a.url, (counts.get(a.url) || 0) + 1);
+
+  // The search field and the create button live in the toolbar, which is the
+  // one place the user already looks for them. Rendering a second copy here
+  // made the catalog screen show two inputs that did the same thing.
+  let html = `<p class="catalog-hint">Pick an app to add it as a tab. Add as many copies as you like.</p>`;
+
+  // Favorites and "frequently used" are derived views: they render the same
+  // tiles, so the sections below stay the single source of truth.
+  const allApps = [];
+  for (const [, items] of PRESETS) for (const p of items) allApps.push(p);
+
+  const favApps = allApps.filter(p => favorites.has(presetKey(p)));
+  if (favApps.length) {
+    html += `<h3 class="pinned">Favorites</h3><div class="catalog-grid">` +
+      favApps.map(p => catalogTile(p, counts.get(p.u) || 0, true)).join('') + '</div>';
+  }
+
+  const frequent = allApps
+    .filter(p => (usage.get(presetKey(p)) || 0) >= 2)
+    .sort((a, b) => (usage.get(presetKey(b)) || 0) - (usage.get(presetKey(a)) || 0))
+    .slice(0, 12);
+  if (frequent.length) {
+    html += `<h3 class="pinned">Frequently used</h3><div class="catalog-grid">` +
+      frequent.map(p => catalogTile(p, counts.get(p.u) || 0, favorites.has(presetKey(p)))).join('') + '</div>';
+  }
+
+  for (const [section, items] of PRESETS) {
+    html += `<h3>${esc(section)}</h3><div class="catalog-grid">` +
+      items.map(p => catalogTile(p, counts.get(p.u) || 0, favorites.has(presetKey(p)))).join('') + '</div>';
+  }
+
+  cat.innerHTML = html;
+
+  cat.querySelectorAll('.catalog-item').forEach(b => b.addEventListener('click', () => {
+    // Presets open the same form as a custom app, pre-filled, so the name
+    // (label), proxy and user agent can be adjusted before the tab is created.
+    // A recipe that needs input arrives with its placeholder list, and the form
+    // asks for exactly that instead of leaving a `{teamId}` in the URL field.
+    const preset = findPreset(b.dataset.key);
+    openModal(null, preset || { name: b.dataset.name, url: b.dataset.url, icon: b.dataset.icon || null });
+  }));
+  cat.querySelectorAll('.fav-btn').forEach(b => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleFavorite(b.dataset.key);
+  }));
+
+  const search = $('#search');
+  if (pendingCatalogQuery && search.value !== pendingCatalogQuery) search.value = pendingCatalogQuery;
+  if (pendingCatalogQuery) filterCatalog(pendingCatalogQuery);
+}
+
+function findPreset(key) {
+  for (const [, items] of PRESETS) for (const p of items) {
+    if (presetKey(p) === key) return p;
+  }
+  return null;
+}
+
+// Favorites are keyed by preset identity (a URL, or a synthetic key for a
+// recipe that has no openable URL), not by the open tab's URL: starring a
+// preset should survive adding it under a different workspace name.
+async function toggleFavorite(key) {
+  if (favorites.has(key)) favorites.delete(key); else favorites.add(key);
+  try { await invoke('set_favorites', { favs: [...favorites] }); } catch (_) {}
+  renderCatalog();
+}
+
+// The toolbar shows one of two identities, decided by whether a tab is open.
+// Doing it here rather than at each call site means the bar can never disagree
+// with what is on screen: every path that changes the active tab already calls
+// this function.
+function updateToolbar() {
+  const app = apps.find(a => a.id === activeId);
+  const embedded = !!app && app.engine === 'os-webview' && app.enabled !== false;
+  $('#toolbar').classList.toggle('mode-tab', embedded);
+  $('#toolbar').classList.toggle('mode-catalog', !embedded);
+  // The strip belongs to the tab stage: on the catalog screen there is no app
+  // whose tabs it could be showing.
+  renderTabStrip();
+  $('#tab-title').textContent = app ? app.name : '';
+  // The address field is part of the toolbar now, so its value has to be
+  // refreshed here; there is no separate row to hide.
+  if (embedded) setAddressValue(currentTabUrl(app), true);
+  updateNavButtons();
+}
+
+// Only the back/forward/reload buttons; safe to call on every navigation event
+// without touching what the user is typing in the address bar.
+function updateNavButtons() {
+  const app = apps.find(a => a.id === activeId);
+  const embedded = !!app && app.engine === 'os-webview' && app.enabled !== false;
+  $('#nav-reload').disabled = !embedded;
+  // Home only means something when there is a start page to go back to.
+  $('#nav-home').disabled = !embedded;
+  // Back/forward mirror the real history of the visible sub-tab, like a browser.
+  const hist = embedded ? tabHistory.get(tabKey(app.id, activeTabIdOf(app.id))) : null;
+  $('#nav-back').disabled = !embedded || !hist?.canBack;
+  $('#nav-fwd').disabled = !embedded || !hist?.canForward;
+  syncLoadingIndicator();
+}
+
+function isDisabled(app) {
+  return !!app && app.engine === 'os-webview' && app.enabled === false;
+}
+
+function showDisabledState(app) {
+  $('#empty-state').classList.add('hidden');
+  $('#catalog').classList.add('hidden');
+  $('#disabled-state').classList.remove('hidden');
+  $('#ds-icon').innerHTML = iconHtml(app, '');
+  $('#ds-name').textContent = app.name || 'Untitled app';
+  $('#ds-enable').textContent = `Enable ${app.name || 'app'}`;
+}
+
+function hideDisabledState() {
+  $('#disabled-state').classList.add('hidden');
+}
+
+async function setAppEnabled(app, on) {
+  app.enabled = on;
+  await persist();
+  if (on) {
+    await activate(app.id);
+  } else {
+    await invoke('close_embedded_tab', { appId: app.id }).catch(() => {});
+    forgetTab(app.id);
+    if (activeId === app.id) {
+      showDisabledState(app);
+      updateToolbar();
+    }
+  }
+  renderSidebar();
+}
+
+async function activate(id) {
+  if (modalOpen) return; // don't show webviews over an open modal
+  // The settings page covers the tab area but leaves the sidebar visible on
+  // purpose. Clicking an app from there is a request to go back to it, so the
+  // overlay closes first. Its own close path asks about unsaved edits, and the
+  // answer may be "stay", in which case the click is not honoured.
+  if (window.RustBoxSettings && window.RustBoxSettings.isOpen()) {
+    await window.RustBoxSettings.close();
+    if (window.RustBoxSettings.isOpen()) return;
+  }
+  const app = apps.find(a => a.id === id);
+  if (!app) { renderSidebar(); return; }
+  if (isDisabled(app)) {
+    // Disabled apps get their own stage with an Enable button instead of a blank page.
+    activeId = id;
+    await invoke('hide_all_tabs').catch(() => {});
+    renderSidebar(); updateToolbar();
+    showDisabledState(app);
+    return;
+  }
+  activeId = id;
+  hideDisabledState();
+  renderSidebar(); updateToolbar();
+  // Tell the backend which tab is on screen. The MCP bridge enforces its
+  // "active tab only" scope against this, so it is a security-relevant fact, not
+  // a UI convenience: a page that could lie about it could lift the restriction.
+  invoke('set_active_tab', { appId: id }).catch(() => {});
+  // Remember the choice so the next launch reopens this tab. Best effort: a
+  // privacy-restricted webview can refuse localStorage, and losing the
+  // preference must not break activation.
+  try { localStorage.setItem('rustbox.lastActiveId', id); } catch (_) {}
+  lastActiveId = id;
+
+  if (app.engine === 'os-webview') {
+    $('#catalog').classList.add('hidden');
+    $('#empty-state').classList.add('hidden');
+    const r = document.getElementById('content').getBoundingClientRect();
+    const session = app.session || app.id;
+    try {
+      await invoke('open_embedded_tab', {
+        app: { ...app, session },
+        x: r.left, y: r.top, width: r.width, height: r.height,
+      });
+    } catch (e) {
+      // Surface backend errors visibly: title bar shows the reason
+      $('#tab-title').textContent = 'ERROR: ' + (e?.message || e);
+      console.error('open_embedded_tab', e);
+    }
+  } else {
+    // External: launch browser; shell shows catalog again
+    await invoke('hide_all_tabs').catch(() => {});
+    hideDisabledState();
+    $('#empty-state').classList.add('hidden');
+    $('#catalog').classList.remove('hidden');
+    try {
+      const report = await invoke('open_external', { app: { ...app, session: app.session || app.id } });
+      // Anything the browser could not honour is reported here. Swallowing this
+      // was how a seed silently did nothing for a year.
+      const notes = (report && report.notes) || [];
+      if (notes.length) showStrip(`${app.name}: ${notes.join(' ')}`, 'warn');
+    } catch (e) {
+      showStrip(`Could not launch ${app.name}: ${e?.message || e}`, 'error');
+    }
+  }
+}
+
+async function persist() {
+  await invoke('save_apps', { apps });
+}
+
+// Pick the tab the app should open on launch.
+//
+// Preference order is what a mail client does: the tab you had open last, then
+// the first enabled one. Disabled apps are skipped because activating one only
+// shows its "Enable app" card, which is a worse landing screen than a real tab.
+//
+// Embedded tabs only. An external-browser app opens a separate process and
+// leaves the shell on the catalog, so launching it automatically at startup
+// would both hide the UI's purpose and spawn a browser the user did not ask for
+// yet. If the only apps are external, the catalog is the honest screen.
+function startupTab() {
+  const usable = apps.filter(a => a.enabled !== false && a.engine !== 'external');
+  if (!usable.length) return null;
+  const remembered = usable.find(a => a.id === lastActiveId);
+  return remembered || usable[0];
+}
+
+async function openFirstTabOnStartup() {
+  const app = startupTab();
+  if (!app) {
+    // Nothing to open: keep the welcome/catalog screen, which is already shown.
+    $('#empty-state').classList.toggle('hidden', apps.length > 0);
+    $('#catalog').classList.toggle('hidden', apps.length === 0);
+    return;
+  }
+  await activate(app.id);
+  // Then build every other app, the way Rambox does. Without this only the tab
+  // that happens to be on screen is loaded, and every other app is a cold page
+  // load the moment it is clicked — which is also why a background app could not
+  // show a new-message count: it had no live page to count with.
+  //
+  // Not awaited: it is paced in the backend and must not hold up the tab the
+  // user is looking at. The backend skips the app that is already open and does
+  // nothing when the setting is off.
+  invoke('warm_start_apps', { exceptAppId: app.id }).catch(() => {});
+}
+
+// ---- Modal ----
+let modalOpen = false;
+// Save/delete are round trips (icon fetch + disk write), so a second click can
+// land while the first is still awaiting. This flag makes the whole form inert
+// until the operation settles, which is what stops a double-click from creating
+// the same app twice.
+let modalBusy = false;
+// Icon picked for the app being edited. A fetched favicon arrives as a data URI
+// (up to ~128 KB), which would swamp the URL field, so it lives here and the
+// input only ever holds a manually pasted URL.
+let modalIcon = null;
+// Catalog key of the recipe being added, when it is one that needs input. Usage
+// is counted against this instead of the resulting URL, so "Frequently used"
+// still recognises the recipe after the workspace name was filled in.
+let presetUsageKey = null;
+// Guards against an older fetch resolving after a newer one (typing fast in the
+// URL field fires several).
+let iconFetchSeq = 0;
+
+function iconPreviewSource() {
+  const typed = $('#f-icon').value.trim();
+  return typed || modalIcon || '';
+}
+
+function renderIconPreview() {
+  const box = $('#icon-preview');
+  const src = iconPreviewSource();
+  const letter = (($('#f-name').value.trim() || '?')[0] || '?').toUpperCase();
+  if (src) {
+    box.innerHTML = `<img src="${esc(src)}" alt="" onerror="this.parentNode.textContent='${esc(letter)}'">`;
+  } else {
+    box.textContent = letter;
+  }
+  box.title = src ? 'Click to clear the icon' : 'No icon yet';
+}
+
+function setIconHint(text, kind) {
+  const hint = $('#icon-hint');
+  hint.textContent = text;
+  hint.classList.toggle('error', kind === 'error');
+  hint.classList.toggle('ok', kind === 'ok');
+}
+
+// Per-app storage isolation. Both modes keep cookies, localStorage and
+// IndexedDB private to the app; they differ in how much machinery is
+// duplicated to achieve it.
+//
+// `Light` needs WebView2 multi-profile, so it exists on Windows only. The
+// backend reports that; the option is dropped from the list elsewhere so the
+// form never offers a mode the engine would have to ignore.
+let lightSupported = false;
+// True once `platform_info` has answered. The Light option is only removed after
+// that: dropping it on the strength of the initial `false` would delete it on
+// Windows too, if the modal happened to open first.
+let platformKnown = false;
+// macOS isolates through a named WKWebsiteDataStore, which needs macOS 14+.
+// Below that every app shares one store, so the hint must say so instead of
+// implying separation that is not happening.
+let namedStores = true;
+
+/** Read the platform capabilities once, and hand the same answer to everyone.
+ *
+ *  Two surfaces ask: the modal (which mode to offer) and the hint under it. Both
+ *  can run before `init` has heard back, and a second IPC call would only add a
+ *  window in which they disagree, so the promise is cached. */
+function loadPlatformInfo() {
+  if (!platformInfoRead) {
+    platformInfoRead = invoke('platform_info')
+      .catch(() => ({ light_profiles: false, named_data_stores: true }))
+      .then(platform => {
+        lightSupported = !!platform.light_profiles;
+        namedStores = platform.named_data_stores !== false;
+        platformKnown = true;
+        return platform;
+      });
+  }
+  return platformInfoRead;
+}
+let platformInfoRead = null;
+
+/** The storage mode a brand-new app starts on.
+ *
+ *  Light is the default where the engine can give it a named profile: it shares
+ *  one browser process with the other tabs, which is what most sites need, and
+ *  the isolation it gives up (crash/GPU domain) is not something a chat window
+ *  asks for. Everywhere else there is no Light to choose, so the answer is the
+ *  mode that exists.
+ *
+ *  One exception, and it is about the form being saveable: Light cannot carry a
+ *  proxy, so a proxy in force (global custom, or a pool) would make the save
+ *  refuse the mode the form chose for the user. In that case the default is the
+ *  mode that can honour the settings on screen. Picking Light by hand still
+ *  works — the user then gets told to set Proxy to Direct. */
+async function defaultProfileMode() {
+  if (!lightSupported) return 'isolated';
+  const g = await loadGlobalProxy();
+  return globalProxyIsEndpoint(g) ? 'isolated' : 'light';
+}
+
+function syncProfileModeHint() {
+  const select = $('#f-profile-mode');
+  const hint = $('#profile-mode-hint');
+  const embedded = $('#f-engine').value === 'os-webview';
+  hint.classList.toggle('error', embedded && !namedStores);
+  // A mode the engine cannot provide is not a question worth asking. Once the
+  // platform has answered, the Light option is dropped from the list on anything
+  // but Windows, so the form shows the one honest choice instead of a greyed row
+  // the user has to decode. A value left over from a config copied off Windows
+  // falls back to the mode that does exist.
+  if (platformKnown && !lightSupported) {
+    const lightOption = select.querySelector('option[value="light"]');
+    if (lightOption) lightOption.remove();
+    if (select.value === 'light') select.value = 'isolated';
+  }
+  // External-browser apps never touch the webview, so the choice is meaningless.
+  select.disabled = !embedded;
+  // The browser picker is the mirror image: an embedded app always renders in
+  // RustBox's own webview, so offering Camoufox/Chrome there would imply an
+  // engine choice that does not exist.
+  $('#f-browser').disabled = embedded;
+  if (!embedded) {
+    hint.textContent = 'External apps keep their own browser profile folder.';
+  } else if (!namedStores) {
+    hint.textContent = 'This macOS version shares one data store between apps. Isolating sessions needs macOS 14 or newer.';
+  } else if (select.value === 'light') {
+    hint.textContent = 'Shares one browser process with the other Light apps. Cookies and logins stay separate. A proxy needs Isolated — see below.';
+  } else {
+    hint.textContent = 'Runs its own browser process. Heaviest, but a crash or hang stays in this app.';
+  }
+  // Light and a proxy are mutually exclusive on this engine, so the proxy control
+  // says so instead of accepting a choice that would be discarded at launch.
+  syncProxyAvailability();
+}
+
+/** Move the form off a proxy choice that Light cannot honour.
+ *
+ *  A disabled radio that is still checked is a dead end: the user cannot uncheck
+ *  it, and the save then refuses. Switching to Direct keeps the form in a state
+ *  that can be submitted, and the endpoint fields go read-only with it. */
+function fallBackToDirectUnderLight() {
+  if (!lightBlocksProxy()) return;
+  if (currentProxyMode() !== 'custom') return;
+  const direct = document.querySelector('#f-proxy-mode input[value="none"]');
+  if (!direct) return;
+  direct.checked = true;
+  // `syncProxyMode` is async but only awaits for an inherited proxy; the direct
+  // branch it takes here is synchronous, so the fields are correct on return.
+  syncProxyMode();
+}
+
+/** Proxy choices a Light tab cannot honour.
+ *
+ *  WebView2 refuses a webview whose environment options differ from an
+ *  environment already in use for the same user data folder, and Light exists
+ *  precisely to share that folder with the shell. So the backend cannot apply a
+ *  proxy there — it reports the mismatch and opens the tab *direct*.
+ *
+ *  That is the dangerous part: a user who selected a proxy would be browsing
+ *  unprotected while the form says otherwise. Rather than let the selection stand
+ *  and be quietly ignored, the control is disabled and the save refuses it. */
+function lightBlocksProxy() {
+  return $('#f-engine').value === 'os-webview'
+    && $('#f-profile-mode').value === 'light';
+}
+
+/** Whether the proxy choice on screen would really be applied under Light.
+ *
+ *  Not every choice is a proxy. Direct never is, and Inherit only is when the
+ *  global proxy resolves to an endpoint. Refusing those too would reject a save
+ *  that changes nothing — and since Inherit is the default for a new app, that
+ *  would be the common path rather than an edge case. */
+async function lightProxyWouldApply() {
+  if (!lightBlocksProxy()) return false;
+  const mode = currentProxyMode();
+  if (mode === 'none') return false;
+  if (mode === 'custom') return !!$('#f-proxy-host').value.trim();
+  const g = await loadGlobalProxy();
+  // A settings read that failed is not evidence of a direct connection. Treating
+  // "unknown" as "no proxy" would let exactly the case this guard exists for —
+  // an inherited proxy discarded in favour of a silent direct connection — pass.
+  if (!g) return true;
+  return globalProxyIsEndpoint(g);
+}
+
+/** Whether the global proxy resolves to something a tab would connect through. */
+function globalProxyIsEndpoint(g) {
+  if (!g) return false;
+  if (g.mode === 'pool') return true;
+  return g.mode === 'custom' && !!(g.proxy && g.proxy.host);
+}
+
+function syncProxyAvailability() {
+  const blocked = lightBlocksProxy();
+  // Only a per-app endpoint is knowably unusable here. Whether Inherit carries a
+  // proxy depends on Settings, which the save checks; rendering stays
+  // synchronous so the form never waits on the backend to become usable.
+  document.querySelectorAll('#f-proxy-mode input').forEach(input => {
+    input.disabled = blocked && input.value === 'custom';
+  });
+  fallBackToDirectUnderLight();
+  // `#proxy-hint` owns the explanation of what the choice resolves to, so the
+  // mode description above the radios is left alone rather than overwritten.
+  syncProxyHint();
+}
+
+// A fingerprint seed is only meaningful for stealth Chromium builds. Everywhere
+// else the launcher ignores it, so the hint says that up front rather than
+// letting the field look like it works.
+function selectedBrowserFamily() {
+  const opt = $('#f-browser').selectedOptions[0];
+  return opt ? opt.dataset.family || 'chromium' : 'chromium';
+}
+
+function syncSeedHint() {
+  const hint = $('#seed-hint');
+  const external = $('#f-engine').value === 'external';
+  const family = selectedBrowserFamily();
+  const seedDisabled = !external;
+  $('#f-seed').disabled = seedDisabled;
+  $('#btn-random-seed').disabled = seedDisabled;
+  hint.classList.remove('error');
+  if (!external) {
+    hint.textContent = 'Only used by external anti-detect browsers.';
+  } else if (family === 'camoufox') {
+    // Camoufox builds its identity in its Python wrapper, not from a CLI flag,
+    // so launching the binary directly cannot pin one.
+    hint.textContent = 'Camoufox generates its own identity; a seed needs its Python wrapper, so it is ignored here.';
+    hint.classList.add('error');
+  } else if (family === 'firefox') {
+    hint.textContent = 'Firefox has no fingerprint seed. The profile is still isolated per app.';
+    hint.classList.add('error');
+  } else {
+    hint.textContent = 'Pinned identity per seed (stealth Chromium builds). Plain Chrome ignores it.';
+  }
+}
+
+const ICON_HINT_DEFAULT = 'Leave empty to read the icon the site declares.';
+
+// ---- Links that ask for a new window ----
+// WebView2 silently drops a new-window request when nothing answers it, which
+// made every `target="_blank"` link inside a tab look broken. The answer is a
+// per-app choice, because the honest options trade different things: staying in
+// the tab keeps the login but replaces the current page; a new tab or a popup
+// keeps the login and keeps the page; the system browser keeps RustBox out of
+// the way but arrives with no session at all.
+//
+// "Ask me" is the default. Every other value is a guess made once and applied
+// silently forever, and the worst of them (replacing the page) cannot be undone
+// from the toolbar. The chooser carries a "remember" box, so a user who wants
+// one answer permanently gives it once and stops being asked.
+
+function currentLinkTarget() {
+  const checked = document.querySelector('#f-link-target input:checked');
+  return checked ? checked.value : 'ask';
+}
+
+const LINK_TARGET_HINTS = {
+  ask: 'Shows a small chooser each time, with an option to remember your answer for this app. Nothing opens until you pick.',
+  same: 'Replaces the page you are on, keeping you signed in. Back returns to it.',
+  'new-tab': 'Opens a second tab in this app, signed in as you are now. The page you are on stays put.',
+  popup: 'Opens a small floating window on top of this page, for the links a site means as a popup (a composer, a preview, a login).',
+  external: 'Hands the link to your default browser. Fast and predictable, but that browser has no session for this app, so a link that needs your login will ask you to sign in again.',
+};
+
+function syncLinkTargetHint() {
+  const hint = $('#link-target-hint');
+  if (!hint) return;
+  hint.textContent = LINK_TARGET_HINTS[currentLinkTarget()] || LINK_TARGET_HINTS.ask;
+}
+
+// ---- Per-app proxy mode ----
+// "Use global" and "Direct" are different answers, and the form used to
+// conflate them by leaving the fields blank: once a global proxy existed, an app
+// the user thought was direct quietly started using the tunnel. The mode is now
+// an explicit choice, and the fields below it are only editable for Custom.
+
+function currentProxyMode() {
+  const checked = document.querySelector('#f-proxy-mode input:checked');
+  return checked ? checked.value : 'inherit';
+}
+
+/** What the global proxy currently is, read from the live settings.
+ *
+ *  Cached per modal open: the summary has to match the thing it summarises, so
+ *  it is read rather than restated, and re-read each time the form opens because
+ *  the user may have changed it in Settings in between. */
+let globalProxy = null;
+let globalProxyRead = false;
+// The custom endpoint the user last typed. Kept while another mode is on display
+// so switching Inherit → Custom restores it instead of asking for it again.
+let proxyStash = null;
+
+async function loadGlobalProxy() {
+  if (globalProxyRead) return globalProxy;
+  globalProxyRead = true;
+  try {
+    const view = await invoke('get_settings');
+    const g = view.global_proxy || {};
+    globalProxy = {
+      mode: g.mode || 'none',
+      proxy: g.custom && g.custom.host ? g.custom : null,
+      pool: (view.pools || []).find(p => p.id === g.pool_id) || null,
+    };
+  } catch (_) {
+    // Older backend or a failed read: say nothing rather than something wrong.
+    globalProxy = null;
+  }
+  return globalProxy;
+}
+
+function proxyUriOf(p) {
+  const scheme = (p.scheme || 'http').toLowerCase() === 'socks5' ? 'socks5' : 'http';
+  return `${scheme}://${p.host}:${p.port}`;
+}
+
+/** One sentence for what an inheriting app actually connects through. */
+function describeGlobalProxy(g) {
+  if (!g) return '';
+  if (g.mode === 'custom') {
+    return g.proxy ? proxyUriOf(g.proxy) : 'a custom proxy with no host yet';
+  }
+  if (g.mode === 'pool') {
+    if (!g.pool) return 'a pool that has not been chosen yet';
+    const usable = (g.pool.proxies || []).filter(p => p.host && p.port).length;
+    return usable
+      ? `pool "${g.pool.name}" (${usable} usable member${usable === 1 ? '' : 's'})`
+      : `pool "${g.pool.name}", which has no usable members`;
+  }
+  return 'a direct connection';
+}
+
+/** What an app's proxy resolves to, in one comparable string.
+ *
+ *  Used to decide whether a save needs a fresh webview. The proxy is fixed when
+ *  the tab is built, so editing it in place changes config.json and nothing
+ *  else — the tab keeps browsing through the old endpoint, or through none.
+ *  Comparing the resolved value (mode plus endpoint) instead of the raw fields
+ *  means re-saving an app with an untouched proxy does not tear the tab down.
+ *
+ *  A pool resolves per app index, so the mode alone is the right granularity
+ *  there: the members are edited in Settings, not in this form. */
+function proxySignature(app) {
+  if (!app) return '';
+  const mode = app.proxy_mode || 'inherit';
+  if (mode !== 'custom' || !app.proxy) return mode;
+  const p = app.proxy;
+  return [
+    'custom',
+    (p.scheme || 'http').toLowerCase(),
+    p.host || '',
+    p.port || '',
+    p.username || '',
+    p.password || '',
+  ].join('|');
+}
+
+function readProxyFields() {  return {
+    scheme: $('#f-proxy-scheme').value === 'socks5' ? 'socks5' : 'http',
+    host: $('#f-proxy-host').value.trim(),
+    port: $('#f-proxy-port').value,
+    user: $('#f-proxy-user').value.trim(),
+    pass: $('#f-proxy-pass').value,
+  };
+}
+
+function writeProxyFields(v) {
+  $('#f-proxy-scheme').value = v && v.scheme === 'socks5' ? 'socks5' : 'http';
+  $('#f-proxy-host').value = (v && v.host) || '';
+  $('#f-proxy-port').value = (v && v.port) || '';
+  $('#f-proxy-user').value = (v && v.user) || '';
+  $('#f-proxy-pass').value = (v && v.pass) || '';
+}
+
+/** Apply the chosen mode: highlight it, show what it resolves to, and leave the
+ *  endpoint fields editable only for Custom. */
+async function syncProxyMode() {
+  const mode = currentProxyMode();
+  document.querySelectorAll('#f-proxy-mode label').forEach(label => {
+    const input = label.querySelector('input');
+    label.classList.toggle('on', !!input && input.checked);
+  });
+
+  const hint = $('#proxy-mode-hint');
+  hint.classList.remove('error');
+  const editable = mode === 'custom';
+
+  if (!editable && proxyStash === null) {
+    // Leaving Custom: remember the typed endpoint before overwriting the fields
+    // with what the chosen mode will actually use.
+    proxyStash = readProxyFields();
+  }
+
+  if (editable) {
+    if (proxyStash !== null) {
+      writeProxyFields(proxyStash);
+      proxyStash = null;
+    }
+    hint.textContent = 'Used by this app only. It overrides the global proxy.';
+  } else if (mode === 'none') {
+    writeProxyFields(null);
+    hint.textContent = 'Always connects directly, even when a global proxy is set.';
+  } else {
+    const g = await loadGlobalProxy();
+    // Only a fixed endpoint can be previewed. A pool hands out one member by
+    // hash, so showing a particular member here would be a guess dressed up as
+    // a fact; the sentence below says what the pool is instead.
+    if (g && g.mode === 'custom' && g.proxy) {
+      writeProxyFields({
+        scheme: g.proxy.scheme || 'http',
+        host: g.proxy.host,
+        port: g.proxy.port,
+        user: g.proxy.username || '',
+        pass: g.proxy.password || '',
+      });
+    } else {
+      writeProxyFields(null);
+    }
+    const label = describeGlobalProxy(g);
+    hint.textContent = label
+      ? `Follows Settings → Global proxy, which is ${label}.`
+      : 'Follows Settings → Global proxy.';
+  }
+
+  $('#proxy-fields').classList.toggle('off', !editable);
+  ['#f-proxy-scheme', '#f-proxy-host', '#f-proxy-port', '#f-proxy-user', '#f-proxy-pass']
+    .forEach(sel => { $(sel).disabled = !editable; });
+  syncProxyHint();
+  syncProxyAvailability();
+}
+
+// The proxy hint states the real constraint instead of leaving the user to
+// discover it: an embedded tab in Light mode shares one WebView2 environment
+// with the shell, and WebView2 rejects a webview whose options differ from an
+// environment already in use, so the proxy cannot be applied there.
+function syncProxyHint() {
+  const hint = $('#proxy-hint');
+  const mode = currentProxyMode();
+  const light = $('#f-profile-mode').value === 'light';
+  const embedded = $('#f-engine').value === 'os-webview';
+  if (mode !== 'custom') {
+    hint.classList.remove('error');
+    if (mode === 'inherit') {
+      // Light cannot honour an inherited proxy either, so the sentence says so
+      // rather than implying the global setting is in force here.
+      hint.textContent = embedded && light
+        ? 'Shown from the global setting. Light always connects direct, so a global proxy is not applied to this tab.'
+        : 'Shown from the global setting. Choose Custom to override it for this tab.';
+    } else if (embedded && light) {
+      // The form moves a Custom choice to Direct as soon as Light is selected
+      // (see `fallBackToDirectUnderLight`), so this branch is what the user sees
+      // after that flip. Saying only "nothing is sent through a proxy" would
+      // hide the reason their endpoint just vanished.
+      hint.textContent = 'Light shares one browser environment with the shell, so a proxy cannot be applied. Switch to Isolated to use one.';
+    } else {
+      hint.textContent = 'Nothing is sent through a proxy for this tab.';
+    }
+    return;
+  }
+  const hasHost = !!$('#f-proxy-host').value.trim();
+  hint.classList.toggle('error', embedded && hasHost && light);
+  if (!hasHost) {
+    hint.textContent = 'Leave the host empty for a direct connection.';
+  } else if (embedded && light) {
+    hint.textContent = 'Light shares one browser environment with the shell, so a proxy cannot be applied. Switch to Isolated.';
+  } else if (embedded) {
+    hint.textContent = 'Applied to this tab only. SOCKS5 keeps DNS lookups on the proxy side.';
+  } else {
+    hint.textContent = 'Passed to the browser at launch. A seed and extra arguments are applied at the same time.';
+  }
+}
+
+/// Ask the site for its icon. `manual` is the button click: it reports failures
+/// loudly, while the automatic attempt stays quiet so typing a URL never nags.
+async function fetchSiteIcon({ manual = false } = {}) {
+  const url = $('#f-url').value.trim();
+  if (!url) {
+    if (manual) setIconHint('Enter a URL first.', 'error');
+    return;
+  }
+  const seq = ++iconFetchSeq;
+  const btn = $('#btn-fetch-icon');
+  btn.disabled = true;
+  setIconHint('Reading the icon from the site...');
+  try {
+    const icon = await invoke('fetch_favicon', { url });
+    if (seq !== iconFetchSeq) return;
+    modalIcon = icon;
+    $('#f-icon').value = '';
+    renderIconPreview();
+    setIconHint('Using the icon found on the site.', 'ok');
+  } catch (err) {
+    if (seq !== iconFetchSeq) return;
+    if (manual) setIconHint(String(err), 'error');
+    else setIconHint(ICON_HINT_DEFAULT);
+  } finally {
+    if (seq === iconFetchSeq) btn.disabled = false;
+  }
+}
+
+// Read the icon for an app that is already saved and usable. The form never
+// waits on this: a slow or unreachable site must not delay adding the app, and
+// the letter chip covers the gap in the meantime.
+async function backfillIcon(appId, url) {
+  let icon;
+  try {
+    icon = await invoke('fetch_favicon', { url });
+  } catch (_) {
+    return; // No icon is a normal outcome, not an error the user must see.
+  }
+  const app = apps.find(a => a.id === appId);
+  // Gone, or the user picked their own icon while this was in flight.
+  if (!app || app.icon) return;
+  app.icon = icon;
+  try {
+    await persist();
+  } catch (_) {
+    return; // Keep the in-memory icon; the next save writes it.
+  }
+  // Patch the two places the icon shows instead of re-rendering: a full
+  // renderCatalog() would throw away the catalog's scroll position while the
+  // user is reading it, for a detail arriving in the background.
+  const btn = document.querySelector(`.app-icon-btn[data-id="${CSS.escape(app.id)}"]`);
+  if (btn) btn.innerHTML = iconHtml(app, '');
+  const urlSel = CSS.escape(url);
+  document.querySelectorAll(`.catalog-item[data-url="${urlSel}"]`).forEach(cell => {
+    const chip = cell.querySelector('.tile-fallback');
+    if (!chip) return;
+    const img = document.createElement('img');
+    img.src = icon;
+    img.alt = '';
+    img.loading = 'lazy';
+    chip.replaceWith(img);
+    cell.dataset.icon = icon;
+  });
+}
+
+// Apps saved before favicon support (or added while a site was unreachable)
+// have no icon. Fill those in once at startup, one URL at a time, so the app
+// never opens with a row of letter chips. Runs after the UI is already usable.
+async function backfillMissingIcons() {
+  const seen = new Set();
+  const targets = [];
+  for (const app of apps) {
+    if (app.icon) continue;
+    if (!/^https?:/i.test(app.url || '')) continue;
+    if (seen.has(app.url)) continue;
+    seen.add(app.url);
+    targets.push(app);
+  }
+  for (const app of targets) {
+    let icon;
+    try {
+      icon = await invoke('fetch_favicon', { url: app.url });
+    } catch (_) {
+      continue; // No icon is a normal outcome.
+    }
+    const live = apps.find(a => a.id === app.id);
+    if (!live || live.icon) continue;
+    live.icon = icon;
+    const btn = document.querySelector(`.app-icon-btn[data-id="${CSS.escape(live.id)}"]`);
+    if (btn) btn.innerHTML = iconHtml(live, '');
+    try { await persist(); } catch (_) {}
+  }
+}
+
+// `preset` pre-fills the form for a catalog entry (same form as a custom app).
+//
+// A preset arrives in catalog shape (`n`/`u`/`i`, plus `ph`/`cu`), not app shape,
+// so it is normalised once here instead of every field guessing which it got.
+async function openModal(id, preset) {
+  // Never re-seed the form while a save owns it.
+  if (modalBusy) return;
+  modalOpen = true;
+  editingId = id;
+  // Hide embedded webviews so the native overlay doesn't cover the modal
+  await invoke('hide_all_tabs').catch(() => {});
+  // Which storage modes exist, and therefore which one is the default, is a
+  // platform fact. `init` normally has it already; awaiting the cached promise
+  // costs nothing and covers the one window where it does not.
+  await loadPlatformInfo();
+  const app = apps.find(a => a.id === id);
+  // Catalog presets are converted to the app shape the rest of this function
+  // reads, so the placeholder list is the only thing that behaves differently.
+  const fromCatalog = !app && preset && ('n' in preset || 'u' in preset);
+  const normalized = fromCatalog
+    ? {
+        name: preset.n,
+        url: preset.u || '',
+        icon: preset.i || null,
+        engine: 'os-webview',
+        ph: preset.ph || null,
+        cu: !!preset.cu,
+      }
+    : preset;
+  const seed = app || normalized || null;
+  const sub = $('#modal-sub');
+  if (app) {
+    $('#modal-title').textContent = 'Edit App';
+    sub.classList.add('hidden');
+  } else if (seed) {
+    $('#modal-title').textContent = `Add ${seed.name || 'App'}`;
+    // A recipe that cannot be opened as-is says what it needs up front, so the
+    // user is not surprised by an empty or templated URL field.
+    if (seed.cu) {
+      sub.textContent = `${seed.name} is self-hosted, so there is no default address. Enter the address of your own instance.`;
+      sub.classList.remove('hidden', 'error');
+    } else if (seed.ph && seed.ph.length) {
+      sub.textContent = `${seed.name} runs on your own account, so its address has a part only you know. Fill in the field below.`;
+      sub.classList.remove('hidden', 'error');
+    } else {
+      sub.textContent = 'Pre-filled from the catalog. Rename it, or set a proxy, before adding the tab. The same app can be added more than once (separate tabs).';
+      sub.classList.remove('hidden', 'error');
+    }
+  } else {
+    $('#modal-title').textContent = 'Add App';
+    sub.classList.add('hidden');
+  }
+  // A stored data-URI icon belongs in modalIcon, not in the URL field.
+  const seedIcon = seed?.icon || '';
+  modalIcon = seedIcon.startsWith('data:') ? seedIcon : null;
+  $('#f-name').value = seed ? (app ? seed.name : uniqueName(seed.name)) : '';
+  // A self-hosted recipe has no URL to show; the placeholder block builds it.
+  $('#f-url').value = seed?.cu ? '' : (seed?.url || '');
+  $('#f-icon').value = seedIcon.startsWith('data:') ? '' : seedIcon;
+  $('#f-engine').value = seed?.engine || 'os-webview';
+  // The global proxy may have been edited in Settings since the last time this
+  // form was open, so the cached description is dropped on every open — before
+  // anything below asks what it resolves to.
+  globalProxy = null;
+  globalProxyRead = false;
+  proxyStash = null;
+  // Storage defaults to Light, which is a platform capability rather than a
+  // constant, so the answer has to be in hand before the field is set. `init`
+  // already asked; awaiting the cached promise costs nothing when it did.
+  await loadPlatformInfo();
+  // A new app starts on Light wherever the engine can give it a named profile:
+  // it shares one browser process with the other tabs instead of standing up a
+  // second one, which is what most sites actually need. Isolated remains one
+  // click away, and is the default on platforms without Light. A config copied
+  // off Windows cannot leave the form on a mode this platform lacks.
+  const wantedMode = seed?.profile_mode || await defaultProfileMode();
+  $('#f-profile-mode').value = (wantedMode === 'light' && !lightSupported) ? 'isolated' : wantedMode;
+  syncProfileModeHint();
+  $('#f-browser').value = seed?.external_browser_path || '';
+  // A saved app without a mode is one from before modes existed: the v4 migration
+  // sets `custom` for apps that carried a proxy and `inherit` for the rest, so
+  // the default here matches what the backend would have written.
+  const proxyMode = seed?.proxy_mode || 'inherit';
+  document.querySelectorAll('#f-proxy-mode input').forEach(input => {
+    input.checked = input.value === proxyMode;
+  });
+  $('#f-proxy-scheme').value = seed?.proxy?.scheme === 'socks5' ? 'socks5' : 'http';
+  $('#f-proxy-host').value = seed?.proxy?.host || '';
+  $('#f-proxy-port').value = seed?.proxy?.port || '';
+  $('#f-proxy-user').value = seed?.proxy?.username || '';
+  $('#f-proxy-pass').value = seed?.proxy?.password || '';
+  $('#f-ua').value = seed?.user_agent || '';
+  // Apps saved before link handling existed have no field; they get the default
+  // the backend applies, which is now to ask.
+  const linkTarget = seed?.link_target || 'ask';
+  document.querySelectorAll('#f-link-target input').forEach(input => {
+    input.checked = input.value === linkTarget;
+  });
+  syncLinkTargetHint();
+  $('#f-seed').value = seed?.fingerprint || '';
+  $('#f-args').value = (seed?.external_args || []).join(' ');
+  // Placeholders only exist on a fresh add: an app that is already saved has a
+  // concrete URL, and re-asking for the workspace name would be wrong.
+  renderTemplateBlock(app ? null : (seed?.ph || null), seed?.cu === true, seed?.url || '');
+  // The catalog key is remembered so a save can count usage against the recipe
+  // rather than against the URL the user ended up with.
+  presetUsageKey = (!app && seed && (seed.ph || seed.cu)) ? presetKey(seed) : null;
+  syncSeedHint();
+  syncProxyMode();
+  $('#btn-delete').classList.toggle('hidden', !app);
+  setIconHint(ICON_HINT_DEFAULT);
+  renderIconPreview();
+  $('#modal-backdrop').classList.add('open');
+  $('#f-name').focus();
+  $('#f-name').select();
+}
+
+// Ask for the parts of a recipe's URL that only the user knows.
+//
+// Two shapes need this:
+//   ph  ["https://{teamId}.slack.com"] -> one input per placeholder
+//   cu  self-hosted, no URL at all     -> one input for the whole address
+//
+// The inputs write into #f-url as the user types, so the URL field stays the
+// single source of truth and saveModal needs no special case. That also means
+// an empty answer leaves the URL empty, which the existing validation rejects.
+let templateState = null;
+
+function renderTemplateBlock(placeholders, selfHosted, template) {
+  const host = $('#f-template');
+  if (!placeholders && !selfHosted) {
+    host.classList.add('hidden');
+    host.innerHTML = '';
+    templateState = null;
+    return;
+  }
+  templateState = { selfHosted, template };
+  const fields = selfHosted
+    ? [{ n: 'Server address', k: 'url', ph: 'https://cloud.example.com' }]
+    : placeholders.map(p => ({
+        n: p.n,
+        k: p.k,
+        ph: p.k === 'teamId' || p.k === 'teamID' ? 'your-workspace' : p.k,
+      }));
+  host.innerHTML = fields.map(f => `
+    <label class="tpl-field">
+      <span>${esc(f.n)}</span>
+      <input class="tpl-input" data-key="${esc(f.k)}" placeholder="${esc(f.ph)}" spellcheck="false" autocomplete="off">
+    </label>`).join('') + `<span class="tpl-preview" id="tpl-preview"></span>`;
+  host.classList.remove('hidden');
+  host.querySelectorAll('.tpl-input').forEach(input => {
+    input.addEventListener('input', applyTemplate);
+  });
+  applyTemplate();
+  const first = host.querySelector('.tpl-input');
+  if (first) {
+    // Focus lands here rather than on the name: this is the field the user
+    // cannot skip, and the name is already filled in from the recipe.
+    setTimeout(() => { first.focus(); }, 30);
+  }
+}
+
+// Substitute the placeholder values into the template and mirror the result
+// into the URL field. Called on every keystroke.
+function applyTemplate() {
+  if (!templateState) return;
+  const host = $('#f-template');
+  const values = {};
+  host.querySelectorAll('.tpl-input').forEach(i => { values[i.dataset.key] = i.value.trim(); });
+
+  let url;
+  if (templateState.selfHosted) {
+    const raw = values.url || '';
+    if (!raw) { $('#f-url').value = ''; setTemplatePreview(''); return; }
+    // Accept "cloud.example.com" as well as a full URL: typing the scheme is a
+    // detail nobody wants to remember, and both engines need one.
+    url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  } else {
+    // A missing value must leave the URL empty, not be substituted away: an
+    // empty string would turn "https://{teamId}.slack.com" into the plausible
+    // but broken "https://.slack.com", which passes URL validation and then
+    // fails to load. Checking the inputs is what makes the guard reliable.
+    if (Object.values(values).some(v => !v)) {
+      $('#f-url').value = '';
+      setTemplatePreview('');
+      return;
+    }
+    url = templateState.template;
+    for (const [key, value] of Object.entries(values)) {
+      url = url.split(`{${key}}`).join(value);
+    }
+    // Belt and braces: a placeholder the form did not ask about stays literal.
+    if (/\{[^}]+\}/.test(url)) url = '';
+  }
+  $('#f-url').value = url;
+  setTemplatePreview(url);
+}
+
+function setTemplatePreview(url) {
+  const el = $('#tpl-preview');
+  if (!el) return;
+  el.textContent = url ? `Opens ${url}` : '';
+}
+
+function closeModal() {
+  // A save or delete is mid-flight: let it finish instead of tearing down the
+  // form under it.
+  if (modalBusy) return;
+  $('#modal-backdrop').classList.remove('open');
+  editingId = null;
+  modalOpen = false;
+  // Restore the previously active embedded tab, if any
+  if (activeId) activate(activeId);
+}
+
+async function saveModal() {
+  // Second click of a double-click: the first one already owns this form.
+  if (modalBusy) return;
+  const sub = $('#modal-sub');
+  const name = $('#f-name').value.trim();
+  const url = $('#f-url').value.trim();
+  if (!name || !url) {
+    sub.textContent = 'Name and URL are required.';
+    sub.classList.remove('hidden');
+    sub.classList.add('error');
+    (!name ? $('#f-name') : $('#f-url')).focus();
+    return;
+  }
+  sub.classList.add('hidden');
+  sub.classList.remove('error');
+  // Read the fields before locking the form, so what gets saved is what the
+  // user saw when they clicked.
+  const engine = $('#f-engine').value;
+  const profileMode = $('#f-profile-mode').value;
+  const browserPath = $('#f-browser').value || null;
+  const userAgent = $('#f-ua').value.trim() || null;
+  const fingerprint = $('#f-seed').value.trim() || null;
+  // The backend appends these last, one per string, so splitting on whitespace
+  // matches what the user typed without asking them to quote each flag.
+  const extraArgs = $('#f-args').value.trim().split(/\s+/).filter(Boolean);
+  const proxyMode = currentProxyMode();
+  const linkTarget = currentLinkTarget();
+  const proxyHost = $('#f-proxy-host').value.trim();
+  // A proxy under Light would be discarded at launch and the tab would connect
+  // direct while the form claimed otherwise. Refusing the save is the only answer
+  // that cannot leave the user browsing unprotected without knowing it.
+  if (await lightProxyWouldApply()) {
+    sub.textContent = 'Light cannot use a proxy: it shares one browser environment with the shell, so the tab would connect direct. Set Storage to Isolated, or set Proxy to Direct.';
+    sub.classList.remove('hidden');
+    sub.classList.add('error');
+    $('#f-profile-mode').focus();
+    return;
+  }
+  // The endpoint is only saved for a Custom app. Keeping it around while the
+  // mode says "inherit" would leave a credential in config.json for a tunnel
+  // nothing uses, and would reappear as a surprise the next time the form is
+  // opened. Switching back to Custom means re-entering it, which is the honest
+  // cost of not storing a secret for no reason.
+  const proxy = (proxyMode === 'custom' && proxyHost) ? {
+    // WebView2 and wry only speak http and socks5; the backend normalises
+    // anything else, but sending the user's real choice is what makes the
+    // SOCKS option meaningful.
+    scheme: $('#f-proxy-scheme').value === 'socks5' ? 'socks5' : 'http',
+    host: proxyHost,
+    port: parseInt($('#f-proxy-port').value, 10) || 8080,
+    username: $('#f-proxy-user').value.trim() || null,
+    password: $('#f-proxy-pass').value || null,
+  } : null;
+
+  setModalBusy(true, 'Saving...');
+  try {
+    // Never wait on the network here: an unreachable site would hold the form
+    // for seconds. A pasted URL or an already-fetched icon is used now, and
+    // anything missing is backfilled after the app is saved.
+    const icon = $('#f-icon').value.trim() || modalIcon || null;
+    let savedId = editingId;
+
+    if (editingId) {
+      const app = apps.find(a => a.id === editingId);
+      const wasEngine = app.engine;
+      const wasUrl = app.url;
+      const wasProfileMode = app.profile_mode;
+      // The proxy is baked into the browser at build time (`--proxy-server` in
+      // the argument string, plus the environment choice), so an edit to it
+      // cannot reach a tab that is already open. Comparing the resolved form
+      // rather than the raw fields keeps a re-save that changes nothing from
+      // closing the tab.
+      const wasProxy = proxySignature(app);
+      // Spread keeps runtime toggles (enabled/muted/notifications) and session.
+      Object.assign(app, {
+        name,
+        url,
+        icon,
+        engine,
+        profile_mode: profileMode,
+        external_browser_path: browserPath,
+        proxy_mode: proxyMode,
+        proxy,
+        user_agent: userAgent,
+        link_target: linkTarget,
+        fingerprint,
+        external_args: extraArgs,
+      });
+      const proxyChanged = wasProxy !== proxySignature(app);
+      // A different storage backend needs a fresh webview: the profile is chosen
+      // when the tab is created, so the old one has to go. Site data is left on
+      // disk, so switching back restores the session.
+      if (wasEngine !== app.engine || wasProfileMode !== app.profile_mode || proxyChanged) {
+        await invoke('close_embedded_tab', { appId: app.id }).catch(() => {});
+        forgetTab(app.id);
+        if (activeId === app.id) activeId = null;
+      } else if (wasUrl !== app.url && tabUrls.has(app.id)) {
+        // Same engine, new start page: move the live tab instead of leaving the
+        // old page behind an address bar that already shows the new URL.
+        forgetTab(app.id);
+        await goToUrl(app, app.url);
+      }
+    } else {
+      const app = {
+        id: newAppId(),
+        name,
+        url,
+        icon,
+        engine,
+        profile_mode: profileMode,
+        external_browser_path: browserPath,
+        session: null,
+        proxy_mode: proxyMode,
+        proxy,
+        user_agent: userAgent,
+        link_target: linkTarget,
+        fingerprint,
+        external_args: extraArgs,
+        enabled: true,
+        muted: false,
+        notifications: true,
+      };
+      apps.push(app);
+      savedId = app.id;
+      // Track real usage so "Frequently used" reflects what this user opens.
+      // Keyed the same way the catalog tile is, so a recipe added with a
+      // workspace name still counts as that recipe.
+      const usageKey = presetUsageKey || url;
+      usage.set(usageKey, (usage.get(usageKey) || 0) + 1);
+      invoke('bump_usage', { url: usageKey }).catch(() => {});
+    }
+    await persist();
+    renderSidebar();
+    renderCatalog(); // refresh the "added" markers
+    const editedId = editingId;
+    setModalBusy(false);
+    closeModal();
+    activate(editedId || savedId);
+    // Saved first, icon later: the app is usable immediately and a slow site
+    // only delays its own artwork.
+    if (!icon && savedId) backfillIcon(savedId, url);
+  } catch (err) {
+    // Keep the form open and filled in so nothing typed is lost; the app list is
+    // rolled back to whatever is actually on disk.
+    apps = await invoke('list_apps').catch(() => apps);
+    sub.textContent = `Could not save: ${err?.message || err}`;
+    sub.classList.remove('hidden');
+    sub.classList.add('error');
+  } finally {
+    setModalBusy(false);
+  }
+}
+
+// Lock the form for the duration of a save/delete. Every control that could
+// start another operation or tear the form down goes inert, and Save keeps its
+// width so the modal does not jump when the label changes.
+function setModalBusy(busy, label) {
+  modalBusy = busy;
+  const save = $('#btn-save');
+  if (!save.dataset.idleLabel) save.dataset.idleLabel = save.textContent;
+  save.textContent = busy ? (label || 'Saving...') : save.dataset.idleLabel;
+  save.disabled = busy;
+  $('#btn-delete').disabled = busy;
+  $('#btn-cancel').disabled = busy;
+  $('#btn-fetch-icon').disabled = busy;
+  $('#modal').setAttribute('aria-busy', busy ? 'true' : 'false');
+  $('#modal-backdrop').classList.toggle('busy', busy);
+}
+
+// ---- Confirm dialog ----
+// A yes/no question with a promise: `confirmRemove()` resolves true only when
+// the user actually confirms, so callers read like plain control flow.
+let confirmResolve = null;
+// Set while the dialog is up *and* it is the one that hid the tabs, so the
+// restore only undoes what it did. A confirmation asked from inside Settings
+// must not re-show the tab on top of the still-open settings page.
+let confirmHidTabs = false;
+
+async function askConfirm({ title, text, okLabel }) {
+  // Only one question can be open; a second call settles the first as cancelled.
+  if (confirmResolve) { confirmResolve(false); confirmResolve = null; }
+  // The dialog is HTML inside the shell, and an embedded tab is a separate OS
+  // window stacked above the shell. Without this the question opens behind the
+  // page it is asking about, so the click that asked it looks like it did
+  // nothing — the only visible change is the tab redrawing.
+  confirmHidTabs = !tabsHiddenForOverlay;
+  if (confirmHidTabs) await hideTabOverlay();
+  $('#confirm-title').textContent = title;
+  $('#confirm-text').textContent = text;
+  $('#confirm-ok').textContent = okLabel || 'Remove';
+  $('#confirm-backdrop').classList.add('open');
+  $('#confirm-cancel').focus();
+  return new Promise(resolve => { confirmResolve = resolve; });
+}
+
+function settleConfirm(answer) {
+  $('#confirm-backdrop').classList.remove('open');
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (confirmHidTabs) {
+    confirmHidTabs = false;
+    restoreTabOverlay();
+  }
+  if (resolve) resolve(answer);
+}
+
+// ---- Overlay bridge ----
+// settings.js and chat.js are separate files and cannot reach into this one's
+// state, so this is the whole contract between them and the shell. Each entry
+// exists because a surface drawn in HTML cannot coexist with the tab windows
+// without help:
+//
+//   hideTabs            Embedded tabs are separate OS windows stacked ABOVE the
+//                       page. Any full-page surface has to hide them first or it
+//                       renders behind them.
+//   restoreAfterOverlay After hiding them, put the active tab back. `activate_app`
+//                       re-shows the existing window without recreating it and
+//                       restores the backend's active-tab record, which
+//                       hide_all_tabs clears.
+//   relayout            A surface that changes #content's width (the chat
+//                       column) moves the tab windows with it.
+//   askConfirm          One confirmation dialog for the whole app, so a question
+//                       asked from Settings looks like one asked from the
+//                       sidebar.
+window.RustBoxUI = {
+  askConfirm: (opts) => askConfirm(opts),
+
+  async hideTabs() {
+    await hideTabOverlay();
+  },
+
+  async restoreAfterOverlay() {
+    await restoreTabOverlay();
+  },
+
+  relayout: () => refreshContentRect(),
+
+  /** Rebuild the open tabs whose proxy just changed in Settings.
+   *
+   *  A tab's proxy is fixed when the tab is built, so a Settings save that
+   *  changes the global proxy or a pool leaves every open `inherit` tab
+   *  browsing through the old endpoint while the page reports the new one.
+   *  Called with the app ids that need a fresh webview; the backend names them
+   *  because it owns the precedence rules.
+   *
+   *  Closing is enough to make the next open pick the new proxy. Reopening is
+   *  only safe when the user can see the tab area: doing it while Settings is
+   *  up would put the webview window on top of the page they are editing. */
+  async rebuildTabsForProxy(appIds) {
+    if (!Array.isArray(appIds) || !appIds.length) return;
+    const settingsUp = !!(window.RustBoxSettings && window.RustBoxSettings.isOpen());
+    for (const appId of appIds) {
+      const wasActive = activeId === appId;
+      await invoke('close_embedded_tab', { appId }).catch(() => {});
+      forgetTab(appId);
+      if (wasActive) {
+        activeId = null;
+        if (!settingsUp) await activate(appId);
+      }
+    }
+  },
+};
+
+// Whether the tab overlay is currently hidden on behalf of an HTML surface.
+//
+// Tracked rather than assumed, because hiding is not idempotent in the way the
+// callers need: Settings hides the tabs when it opens, and a confirmation asked
+// from inside Settings must not hide them again and then restore them on the
+// way out, which would put the tab back on top of the settings page.
+let tabsHiddenForOverlay = false;
+
+async function hideTabOverlay() {
+  tabsHiddenForOverlay = true;
+  await invoke('hide_all_tabs').catch(() => {});
+}
+
+async function restoreTabOverlay() {
+  tabsHiddenForOverlay = false;
+  const app = apps.find(a => a.id === activeId);
+  if (!app) return;
+  if (isDisabled(app)) {
+    // Nothing to re-show; the disabled stage is HTML and was never covered.
+    showDisabledState(app);
+    return;
+  }
+  if (app.engine === 'os-webview') {
+    // Best effort: the tab may have been closed while the overlay was up, and
+    // a failure here must not throw out of a close handler.
+    await invoke('activate_app', { appId: app.id }).catch(() => {});
+  }
+}
+
+// The two overlay modules report their own state, so the sidebar buttons stay
+// honest when a surface is closed from inside itself (its close button, Escape,
+// or a deep-link into a settings tab).
+document.addEventListener('rustbox:overlay', (e) => {
+  const { name, open } = e.detail || {};
+  if (name === 'settings') $('#settings-btn').classList.toggle('on', !!open);
+  if (name === 'chat') $('#chat-btn').classList.toggle('on', !!open);
+});
+
+// Ask before throwing an app away, and say how much disk it is holding so the
+// answer is informed rather than blind.
+async function confirmRemove(app) {
+  // Cheap enough to ask for on demand: it walks one app's folders, not the disk.
+  const bytes = await invoke('app_data_size', { appId: app.id }).catch(() => 0);
+  const size = bytes >= 1024 * 1024
+    ? `${Math.round(bytes / (1024 * 1024))} MB`
+    : `${Math.round(bytes / 1024)} KB`;
+  return askConfirm({
+    title: 'Remove app?',
+    text: bytes > 0
+      ? `"${app.name}" will be removed from RustBox, along with its tab, settings and stored session (${size}). This cannot be undone.`
+      : `"${app.name}" will be removed from RustBox, along with its tab and settings. This cannot be undone.`,
+    okLabel: 'Remove',
+  });
+}
+
+// Remove an app from the workspace entirely: its tab closes, its config entry
+// is dropped, its sidebar entry disappears, and its stored profiles are deleted.
+// Both the Settings dialog's Delete button and the right-click menu go through
+// here, so the two can never drift into different behaviour.
+async function removeApp(app) {
+  const wasActive = activeId === app.id;
+  const before = apps;
+  apps = apps.filter(a => a.id !== app.id);
+  await invoke('close_embedded_tab', { appId: app.id }).catch(() => {});
+  forgetTab(app.id);
+  if (wasActive) activeId = null;
+  try {
+    await persist();
+  } catch (err) {
+    apps = before; // Nothing was removed, so keep the list honest.
+    throw err;
+  }
+  // Config first, data second: the app must be gone from the workspace even if
+  // a running browser still holds a profile folder open. Leaving cookies behind
+  // for an app the user deleted is a privacy problem, not just clutter.
+  invoke('purge_app_data', { appId: app.id }).catch((err) => {
+    console.error('purge_app_data', err);
+  });
+  renderSidebar();
+  updateToolbar();
+  // The tile's "N tabs added" badge is derived from `apps`, so the catalog has
+  // to be rebuilt or it keeps advertising a tab that no longer exists. This is
+  // true regardless of which stage is active: a catalog left behind the scenes
+  // must not reappear with a stale count when the user comes back to it.
+  refreshCatalogInPlace();
+  if (wasActive) {
+    hideDisabledState();
+    // Only the genuinely empty workspace gets the welcome screen; otherwise the
+    // user is dropped straight back into the catalog to pick what is next.
+    if (apps.length === 0) {
+      $('#empty-state').classList.remove('hidden');
+      $('#catalog').classList.add('hidden');
+    } else {
+      $('#empty-state').classList.add('hidden');
+      $('#catalog').classList.remove('hidden');
+    }
+  }
+}
+
+// Rebuild the catalog grid without losing where the user was reading. The grid
+// is replaced wholesale, so scroll position has to be carried over by hand.
+// Runs even when the catalog is hidden: the markup has to be current for the
+// moment it is shown again, not refreshed lazily on the next open.
+function refreshCatalogInPlace() {
+  const cat = $('#catalog');
+  if (!cat) return;
+  const top = cat.scrollTop;
+  renderCatalog();
+  cat.scrollTop = top;
+}
+
+async function deleteApp() {
+  if (modalBusy) return;
+  const app = apps.find(a => a.id === editingId);
+  if (!app) return;
+  setModalBusy(true, 'Deleting...');
+  try {
+    await removeApp(app);
+    setModalBusy(false);
+    closeModal();
+  } catch (err) {
+    apps = await invoke('list_apps').catch(() => apps);
+    const sub = $('#modal-sub');
+    sub.textContent = `Could not remove: ${err?.message || err}`;
+    sub.classList.remove('hidden');
+    sub.classList.add('error');
+    renderSidebar();
+  } finally {
+    setModalBusy(false);
+  }
+}
+
+// ---- Search filter ----
+// Matches the app name OR the URL, so "mail.google" finds Gmail. Works across
+// every section at once and collapses sections that end up with no match.
+function filterCatalog(q) {
+  pendingCatalogQuery = q || '';
+  const query = pendingCatalogQuery.trim().toLowerCase();
+  let visible = 0;
+  $('#catalog').querySelectorAll('.catalog-cell').forEach(el => {
+    const item = el.querySelector('.catalog-item');
+    const hay = (item.dataset.name + ' ' + item.dataset.url).toLowerCase();
+    const hit = !query || hay.includes(query);
+    el.style.display = hit ? '' : 'none';
+    if (hit) visible++;
+  });
+  $('#catalog').querySelectorAll('.catalog-grid').forEach(grid => {
+    const anyVisible = [...grid.children].some(c => c.style.display !== 'none');
+    grid.style.display = anyVisible ? '' : 'none';
+    const h = grid.previousElementSibling;
+    if (h && h.tagName === 'H3') h.style.display = anyVisible ? '' : 'none';
+  });
+  let empty = $('#catalog-empty');
+  if (!visible) {
+    if (!empty) {
+      empty = document.createElement('p');
+      empty.id = 'catalog-empty';
+      empty.className = 'catalog-empty';
+      $('#catalog').appendChild(empty);
+    }
+    empty.textContent = `No app matches "${pendingCatalogQuery}". Use "Create Custom App" to add it by URL.`;
+    empty.style.display = '';
+  } else if (empty) {
+    empty.style.display = 'none';
+  }
+  const counter = $('#catalog-search-count');
+  if (counter) counter.textContent = query ? `${visible} match${visible === 1 ? '' : 'es'}` : '';
+}
+
+// ---- Context menu (right-click on app icon) ----
+// The menu is rendered by a small owned popup window (ui/ctx.html) that sits
+// ABOVE the native webview tab overlays. An HTML element inside the main
+// window can never be stacked above them, and hiding the webviews would blank
+// the page — so the menu gets its own window, like Rambox does.
+function closeCtxMenu() {
+  $('#ctx-menu').classList.remove('open');
+}
+
+async function openCtxMenu(app, x, y, tabId) {
+  if (!app) return;
+  await invoke('ctx_menu_window', {
+    appId: app.id,
+    x: Math.round(x), y: Math.round(y),
+    tabId: tabId || null,
+  }).catch(() => {});
+}
+
+// Handle actions emitted by the ctx-menu popup window.
+listen('ctx-action', (event) => {
+  const { appId, action, tabId } = event.payload || {};
+  const app = apps.find(a => a.id === appId);
+  if (!app) return;
+  handleCtxAction(app, action, tabId);
+});
+
+async function handleCtxAction(app, a, tabId) {
+  const enabled = app.enabled !== false;
+  const muted = !!app.muted;
+  const notif = app.notifications !== false;
+  // Link handling lives here because "Always do this" in the chooser writes the
+  // same field. Turning the chooser back on must not cost a trip through the
+  // edit form, and turning it off must be deliberate: a silent switch would
+  // make the next click skip the question with no visible cause.
+  if (a && a.startsWith('link-target:')) {
+    const target = a.slice('link-target:'.length);
+    const labels = {
+      ask: 'ask each time a link wants a new window',
+      same: 'open those links in this tab, without asking',
+      'new-tab': 'open those links in a new tab, without asking',
+      popup: 'open those links as pop-ups, without asking',
+      external: 'hand those links to the default browser, without asking',
+    };
+    if (target !== 'ask' && target !== (app.link_target || 'ask')) {
+      const ok = await askConfirm({
+        title: 'Stop asking?',
+        text: `"${app.name}" will ${labels[target]}. You can turn the chooser back on from this menu at any time.`,
+        okLabel: 'Stop asking',
+      });
+      if (!ok) return;
+    }
+    app.link_target = target;
+    await persist();
+    renderSidebar();
+    showStrip(
+      target === 'ask'
+        ? `"${app.name}" will ask before opening a link in a new window.`
+        : `"${app.name}" will ${labels[target]}.`,
+      'info',
+    );
+    return;
+  }
+  if (a === 'toggle-enabled') {
+    await setAppEnabled(app, !enabled);
+  } else if (a === 'move-app-up' || a === 'move-app-down') {
+    // A second way to reorder, for when a drag is not practical: a long
+    // sidebar, a trackpad, or a hand that cannot hold a drag steady. The drag
+    // stays the fast path; this one always works.
+    await moveApp(app.id, a === 'move-app-up' ? -1 : 1);
+    return;
+  } else if (a === 'reload-tab') {
+    // One tab, not the whole app: a page that lost its connection is fixed by
+    // reloading it, and tearing the app down (disable/enable) used to be the
+    // only way to get that.
+    await invoke('navigate', {
+      appId: app.id,
+      action: 'reload',
+      tabId: tabId || null,
+    }).catch((err) => showStrip(`Could not reload: ${err?.message || err}`, 'error'));
+    return;
+  } else if (a === 'toggle-muted') {
+    app.muted = !muted;
+    await invoke('set_tab_muted', { appId: app.id, muted: app.muted }).catch(() => {});
+  } else if (a === 'toggle-notifications') {
+    app.notifications = !notif;
+  } else if (a === 'open-settings') {
+    openModal(app.id);
+  } else if (a === 'reset-session') {
+    // Wipes the app's isolated profile so the next open starts logged out.
+    // Close the tab first: WebView2 keeps the folder locked while it runs.
+    if (await askConfirm({
+      title: 'Reset session?',
+      text: `"${app.name}" will be signed out and its local data cleared. This cannot be undone.`,
+      okLabel: 'Reset',
+    })) {
+      await invoke('close_embedded_tab', { appId: app.id }).catch(() => {});
+      forgetTab(app.id);
+      try {
+        await invoke('reset_app_profile', { appId: app.id, engine: app.engine });
+      } catch (err) {
+        console.error('reset_app_profile', err);
+      }
+      if (activeId === app.id) await activate(app.id);
+    }
+    return;
+  } else if (a === 'remove-app') {
+    // Same outcome as Settings -> Delete, but this entry point is one click away
+    // from a live tab, so it asks first.
+    if (await confirmRemove(app)) await removeApp(app);
+    return; // removeApp already persisted and re-rendered
+  }
+  await persist();
+  renderSidebar();
+}
+document.addEventListener('click', (e) => { if (!e.target.closest('#ctx-menu')) closeCtxMenu(); });
+document.addEventListener('contextmenu', (e) => { if (!e.target.closest('#ctx-menu') && !e.target.closest('.app-icon-btn')) e.preventDefault(); });
+
+// ---- Agent access (MCP) ----
+// No sidebar button. The bridge is configured entirely from Settings → MCP,
+// which already holds the toggle, the port, the reach setting and the client
+// configuration. A second entry point in the sidebar was a second place to
+// change one setting, and it crowded the rail next to the controls people use
+// all day. This module only reflects state; the panel is reached from Settings.
+async function refreshMcpState() {
+  try {
+    // The Settings rail shows the live port and enabled state itself, so the
+    // only thing left to refresh here is nothing — kept as a no-op call site so
+    // startup still validates the bridge answers.
+    await invoke('mcp_state');
+  } catch (_) { /* older backend: nothing to reflect */ }
+}
+
+// ---- Disabled app stage ----
+$('#ds-enable').addEventListener('click', async () => {
+  const app = apps.find(a => a.id === activeId);
+  if (!app || !isDisabled(app)) return;
+  await setAppEnabled(app, true);
+});
+$('#ds-settings').addEventListener('click', () => {
+  const app = apps.find(a => a.id === activeId);
+  if (app) openModal(app.id);
+});
+
+// ---- Address bar ----
+// The input is only left alone while the user is genuinely typing in it, so a
+// live navigation never eats what they are editing.
+function currentTabUrl(app) {
+  const tabId = activeTabIdOf(app.id);
+  // The snapshot's cached URL is the fallback: a sub-tab that has just opened
+  // has not emitted a `tab-nav` yet, and showing the app's start page for it
+  // would be a lie about what is on screen.
+  const live = tabUrls.get(tabKey(app.id, tabId));
+  if (live) return live;
+  const row = appTabs(app.id);
+  const tab = row?.tabs.find(t => t.id === tabId);
+  return tab?.url || app.url;
+}
+
+function setAddressValue(url, force) {
+  const input = $('#addr-input');
+  // Never fight the user, but do not freeze the bar just because focus was
+  // never moved out of the input (that happens after pressing Enter).
+  const typing = document.hasFocus() && document.activeElement === input;
+  if (!force && typing) return;
+  if (input.value === url) return;
+  input.value = url;
+}
+
+// Navigate the active tab to `url` and remember it as pending so the stale
+// `tab-nav` events from the previous page cannot overwrite the address bar.
+async function goToUrl(app, url) {
+  if (!app || !url) return;
+  const tabId = activeTabIdOf(app.id);
+  const key = tabKey(app.id, tabId);
+  pendingNav.set(key, { url: normUrl(url), at: Date.now() });
+  setAddressValue(url, true);
+  try {
+    await invoke('navigate_to_url', { appId: app.id, url, tabId });
+  } catch (e) {
+    pendingNav.delete(key);
+  }
+}
+
+// ---- Loading state ----
+// The reload button spins while the visible tab is navigating, so a reload that
+// looks identical before and after (same URL, same title, cached paint) still
+// shows that it happened.
+//
+// A `NavigationCompleted` that never arrives would leave the spinner turning
+// forever, so each entry is also cleared by a timer. WebView2 drops the event
+// when a navigation is superseded by another one, and that is normal.
+const LOADING_GUARD_MS = 15000;
+const loadingTimers = new Map();
+
+function setTabLoading(appId, tabId, loading) {
+  const key = tabKey(appId, tabId);
+  const timer = loadingTimers.get(key);
+  if (timer) { clearTimeout(timer); loadingTimers.delete(key); }
+  if (loading) {
+    tabLoading.add(key);
+    loadingTimers.set(key, setTimeout(() => {
+      loadingTimers.delete(key);
+      tabLoading.delete(key);
+      syncLoadingIndicator();
+    }, LOADING_GUARD_MS));
+  } else {
+    tabLoading.delete(key);
+  }
+  syncLoadingIndicator();
+}
+
+// Only the visible tab decides what the button says: a background tab loading
+// is not a reason to animate the toolbar of the page on screen.
+function syncLoadingIndicator() {
+  const app = apps.find(a => a.id === activeId);
+  const loading = !!app && tabLoading.has(tabKey(app.id, activeTabIdOf(app.id)));
+  $('#nav-reload').classList.toggle('loading', loading);
+}
+
+listen('tab-loading', (event) => {
+  const { appId, tabId, loading } = event.payload || {};
+  if (!appId) return;
+  setTabLoading(appId, tabId, !!loading);
+});
+
+// Live navigation state from the tab webviews.
+listen('tab-nav', (event) => {
+  const { appId, tabId, url, canBack, canForward } = event.payload || {};
+  if (!appId || !url) return;
+  const key = tabKey(appId, tabId);
+  const pending = pendingNav.get(key);
+  if (pending) {
+    if (normUrl(url) === pending.url) {
+      pendingNav.delete(key);
+    } else if (Date.now() - pending.at < NAV_PENDING_MS) {
+      // Still the previous page talking; keep showing what the user asked for.
+      return;
+    } else {
+      pendingNav.delete(key);
+    }
+  }
+  tabUrls.set(key, url);
+  tabHistory.set(key, { canBack: !!canBack, canForward: !!canForward });
+  // A background sub-tab navigating must not move the chrome: the address bar
+  // and the history buttons describe the page the user is looking at.
+  if (appId === activeId && (tabId || 'main') === activeTabIdOf(appId)) {
+    const app = apps.find(a => a.id === appId);
+    if (app) setAddressValue(currentTabUrl(app), false);
+    updateNavButtons();
+  }
+});
+
+// ---- Sub-tabs ----
+// The backend is the source of truth. It emits a whole snapshot on every
+// change, so the strip cannot drift out of sync the way an add/close event
+// stream can when one event is lost.
+function renderTabStrip() {
+  const strip = $('#tab-strip');
+  const app = apps.find(a => a.id === activeId);
+  const embedded = !!app && app.engine === 'os-webview' && app.enabled !== false;
+  const row = embedded ? appTabs(app.id) : null;
+  // Popups are floating windows with their own frame; they are not pages the
+  // strip can switch to, so they are not chips.
+  const tabs = row ? row.tabs.filter(t => !t.popup) : [];
+  const show = embedded && tabs.length > 0;
+  // Showing or hiding the strip moves #content, and the tab webviews are
+  // positioned from that rect, so the change has to be followed.
+  const wasShown = strip.classList.contains('on');
+  if (show !== wasShown) {
+    strip.classList.toggle('on', show);
+    refreshContentRect();
+  }
+  if (!show) {
+    if (tabStripMarkup) {
+      strip.innerHTML = '';
+      tabStripMarkup = '';
+    }
+    return;
+  }
+  const current = row.active || 'main';
+  const markup = tabs.map(t => {
+    const active = t.id === current;
+    const label = (t.title || '').trim() || prettyHost(t.url) || app.name;
+    // The first tab is the app itself: it carries the app's own icon and no
+    // close button, because closing it would close the app.
+    const lead = t.pinned ? `<span class="st-pin">${iconHtml(app, 'st-icon')}</span>` : '';
+    const close = t.pinned ? ''
+      : `<button class="st-close" data-close="${esc(t.id)}" title="Close tab" tabindex="-1">&times;</button>`;
+    return `<div class="sub-tab${active ? ' active' : ''}${t.pinned ? ' pinned' : ''}"
+      role="tab" aria-selected="${active}" data-tab="${esc(t.id)}" title="${esc(label)}"
+      draggable="${t.pinned ? 'false' : 'true'}"
+      >${lead}<span class="st-label">${esc(label)}</span>${close}</div>`;
+  }).join('') + `<button id="tab-add" title="New tab in ${esc(app.name)}" aria-label="New tab">+</button>`;
+  if (markup === tabStripMarkup) return;
+  tabStripMarkup = markup;
+  strip.innerHTML = markup;
+
+  strip.querySelectorAll('.sub-tab').forEach(chip => {
+    const tabId = chip.dataset.tab;
+    chip.addEventListener('click', (e) => {
+      if (e.target.closest('[data-close]')) return;
+      if (tabId === activeTabIdOf(app.id)) return;
+      invoke('activate_sub_tab', { appId: app.id, tabId }).catch(() => {});
+    });
+    // Right-click is where per-tab settings live, including the link-handling
+    // default: ticking "Always do this" in the chooser has to be undoable
+    // somewhere, and the tab that raised the question is where a user looks.
+    chip.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openCtxMenu(app, e.clientX, e.clientY, tabId);
+    });
+    // The first tab is the app itself, so it is not draggable: it is the anchor
+    // the rest of the strip is ordered against, exactly like the sidebar's own
+    // entry. Everything after it can be moved.
+    if (chip.classList.contains('pinned')) return;
+    chip.addEventListener('dragstart', (e) => {
+      subDragId = tabId;
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', tabId); } catch (_) {}
+      chip.classList.add('dragging');
+    });
+    chip.addEventListener('dragend', () => {
+      subDragId = null;
+      clearSubDropMarkers();
+      chip.classList.remove('dragging');
+    });
+    chip.addEventListener('dragover', (e) => {
+      if (!subDragId || subDragId === tabId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const r = chip.getBoundingClientRect();
+      const after = e.clientX > r.left + r.width / 2;
+      clearSubDropMarkers();
+      chip.classList.add(after ? 'drop-after' : 'drop-before');
+    });
+    chip.addEventListener('dragleave', () => chip.classList.remove('drop-before', 'drop-after'));
+    chip.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const from = subDragId;
+      clearSubDropMarkers();
+      if (!from || from === tabId) return;
+      const r = chip.getBoundingClientRect();
+      const after = e.clientX > r.left + r.width / 2;
+      invoke('reorder_sub_tab', { appId: app.id, tabId: from, targetId: tabId, after })
+        .catch((err) => showStrip(String(err?.message || err)));
+    });
+  });
+  strip.querySelectorAll('[data-close]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      invoke('close_sub_tab', { appId: app.id, tabId: btn.dataset.close })
+        .catch((err) => showStrip(String(err?.message || err)));
+    });
+  });
+  $('#tab-add').addEventListener('click', () => addSubTab(app.id));
+  // Keep the active chip in view when the strip overflows.
+  const activeChip = strip.querySelector('.sub-tab.active');
+  if (activeChip && activeChip.scrollIntoView) {
+    activeChip.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+}
+
+function addSubTab(appId) {
+  invoke('add_sub_tab', { appId }).catch((err) => showStrip(String(err?.message || err)));
+}
+
+function prettyHost(url) {
+  try { return new URL(url).host; } catch (_) { return ''; }
+}
+
+// A double-click on the empty part of the strip is the browser shortcut for a
+// new tab. Bound once, on the container, because the chips are re-rendered.
+$('#tab-strip').addEventListener('dblclick', (e) => {
+  if (e.target === e.currentTarget && activeId) addSubTab(activeId);
+});
+
+listen('tabs-changed', (event) => {
+  subTabs = Array.isArray(event.payload) ? event.payload : [];
+  // A tab that was closed or replaced must not leave a stale history behind.
+  for (const app of apps) {
+    const row = appTabs(app.id);
+    if (!row) { forgetTab(app.id); continue; }
+    const live = new Set(row.tabs.map(t => tabKey(app.id, t.id)));
+    for (const map of [tabUrls, tabHistory, pendingNav]) {
+      for (const key of [...map.keys()]) {
+        if (key.startsWith(`${app.id}\u0000`) && !live.has(key)) map.delete(key);
+      }
+    }
+  }
+  // A closed tab can be the one that was on screen; the backend has already
+  // picked a neighbour, so the chrome just follows the new answer.
+  renderTabStrip();
+  const app = apps.find(a => a.id === activeId);
+  if (app) setAddressValue(currentTabUrl(app), true);
+  updateNavButtons();
+});
+
+listen('tab-title', (event) => {
+  const { appId, tabId, title } = event.payload || {};
+  const row = appTabs(appId);
+  const tab = row?.tabs.find(t => t.id === tabId);
+  if (tab) tab.title = title;
+  if (appId === activeId) renderTabStrip();
+});
+$('#addr-input').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const val = $('#addr-input').value.trim();
+  const app = apps.find(a => a.id === activeId);
+  if (!val || !app) return;
+  e.target.blur(); // hand the bar back to live updates
+  goToUrl(app, val);
+});
+$('#addr-input').addEventListener('focus', (e) => e.target.select());
+// There is no separate "Go" button: Enter in the field is the browser-standard
+// way, and a second control for the same keystroke is one more thing to explain.
+// "Default URL" is gone for the same reason — the home button in the history
+// cluster already goes to the app's start page.
+
+// ---- Error surface (debug aid) ----
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('tab-title');
+  if (el) el.textContent = 'JS ERROR: ' + e.message;
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const el = document.getElementById('tab-title');
+  if (el) el.textContent = 'PROMISE ERR: ' + (e.reason?.message || e.reason);
+});
+
+// ---- Events ----
+// The catalog is an HTML overlay living UNDER the embedded webview windows:
+// they are separate OS windows stacked above the page, so the catalog has to
+// hide them first or it opens behind the active tab. Every path that brings
+// the catalog forward (the + button, the empty state, the toolbar search,
+// Ctrl+K) goes through here for that reason.
+async function showCatalogStage() {
+  // Settings sits over the same area the catalog occupies, so leaving it up
+  // would show the catalog underneath an opaque page. Checked before the
+  // already-here shortcut, because "the catalog is technically not hidden" is
+  // true even while settings covers it.
+  if (window.RustBoxSettings && window.RustBoxSettings.isOpen()) {
+    await window.RustBoxSettings.close();
+    if (window.RustBoxSettings.isOpen()) return;
+  }
+  // Already here: re-rendering 441 tiles on every keystroke would fight the
+  // search field the user is typing into.
+  if (activeId === null && !$('#catalog').classList.contains('hidden')) return;
+  await invoke('hide_all_tabs').catch(() => {});
+  activeId = null;
+  updateToolbar();
+  hideDisabledState();
+  $('#empty-state').classList.add('hidden');
+  $('#catalog').classList.remove('hidden');
+  renderCatalog(); // refresh added-state markers + re-apply the search text
+}
+$('#add-app-btn').addEventListener('click', () => showCatalogStage());
+$('#empty-add').addEventListener('click', () => showCatalogStage());
+$('#catalog-custom').addEventListener('click', () => openModal(null));
+
+// ---- Settings and chat ----
+// Two surfaces, two shapes. Settings covers the tab area (it is a page you read,
+// not something you use alongside a page); chat takes a column so the tab it is
+// talking about stays visible. Both hide the embedded tabs first, because those
+// are separate OS windows stacked above the page.
+$('#settings-btn').addEventListener('click', async () => {
+  if (!window.RustBoxSettings) return;
+  // Clicking the button that opened a page is how people close it, so it is a
+  // toggle rather than "open again".
+  if (window.RustBoxSettings.isOpen()) {
+    await window.RustBoxSettings.close();
+    return;
+  }
+  // The chat panel would otherwise sit behind the settings overlay, still
+  // holding its width and its conversation.
+  if (window.RustBoxChat && window.RustBoxChat.isOpen()) window.RustBoxChat.close();
+  await window.RustBoxSettings.open();
+});
+$('#chat-btn').addEventListener('click', () => {
+  if (window.RustBoxChat) window.RustBoxChat.toggle();
+});
+// Ctrl+Shift+C is the shortcut every browser gave to "inspect"; here it opens
+// the panel that can actually talk about the page.
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'c') {
+    e.preventDefault();
+    if (window.RustBoxChat) window.RustBoxChat.toggle();
+  }
+});
+// "Switch app": the launcher is one keystroke or one click away from any tab,
+// and lands with the cursor already in the search field.
+$('#tb-switch').addEventListener('click', async () => {
+  await showCatalogStage();
+  $('#search').focus();
+});
+// One strip for both failures and things worth knowing. It lives outside
+// #content because embedded tab windows are separate OS windows stacked above
+// the page, and would cover anything drawn inside it.
+function showStrip(text, kind = 'error', actions = []) {
+  $('#tab-error-text').textContent = text;
+  const strip = $('#tab-error');
+  strip.classList.toggle('warn', kind === 'warn');
+  strip.classList.toggle('info', kind === 'info');
+  // Buttons are rebuilt per message: the answers belong to this prompt, and a
+  // stale one would offer to fix something that is no longer the problem.
+  const bar = $('#tab-error-actions');
+  bar.textContent = '';
+  for (const a of actions) {
+    const b = document.createElement('button');
+    b.textContent = a.label;
+    if (a.primary) b.className = 'primary';
+    b.addEventListener('click', () => {
+      // The answer is spent once given: hiding the strip first means a slow
+      // command cannot be double-fired by an impatient second click.
+      hideStrip();
+      a.run();
+    });
+    bar.append(b);
+  }
+  bar.classList.toggle('hidden', actions.length === 0);
+  if (!strip.classList.contains('hidden')) return;
+  strip.classList.remove('hidden');
+  // The strip moves where #content starts, and the tab windows are positioned
+  // from that rect, so they have to follow it.
+  refreshContentRect();
+}
+
+function hideStrip() {
+  $('#tab-error').classList.add('hidden');
+  $('#tab-error-actions').classList.add('hidden');
+  refreshContentRect();
+}
+
+$('#tab-error-close').addEventListener('click', () => {
+  hideStrip();
+  // Dismissing the runtime-swap prompt has to drop the held-back tab too,
+  // otherwise the next click would silently reuse a stale request.
+  invoke('dismiss_runtime_swap').catch(() => {});
+});
+$('#btn-cancel').addEventListener('click', closeModal);
+$('#btn-save').addEventListener('click', saveModal);
+$('#btn-delete').addEventListener('click', deleteApp);
+$('#btn-fetch-icon').addEventListener('click', () => fetchSiteIcon({ manual: true }));
+// Typing a URL is the moment the site becomes knowable: try once, quietly, when
+// the field loses focus and no icon has been chosen yet.
+$('#f-url').addEventListener('change', () => {
+  if (!$('#f-icon').value.trim() && !modalIcon) fetchSiteIcon();
+});
+$('#f-icon').addEventListener('input', () => { renderIconPreview(); setIconHint(ICON_HINT_DEFAULT); });
+$('#f-name').addEventListener('input', renderIconPreview);
+$('#icon-preview').addEventListener('click', () => {
+  modalIcon = null;
+  $('#f-icon').value = '';
+  iconFetchSeq++; // a fetch in flight must not resurrect the icon
+  renderIconPreview();
+  setIconHint(ICON_HINT_DEFAULT);
+});
+$('#modal-backdrop').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeModal(); });
+// Choosing a mode is what makes the fields below meaningful, so the form reacts
+// immediately rather than at save time.
+document.querySelectorAll('#f-proxy-mode input').forEach(input => {
+  input.addEventListener('change', () => syncProxyMode());
+});
+document.querySelectorAll('#f-link-target input').forEach(input => {
+  input.addEventListener('change', () => syncLinkTargetHint());
+});
+$('#confirm-ok').addEventListener('click', () => settleConfirm(true));
+$('#confirm-cancel').addEventListener('click', () => settleConfirm(false));
+$('#confirm-backdrop').addEventListener('click', (e) => { if (e.target === e.currentTarget) settleConfirm(false); });
+// The one search field in the app. It lives in the toolbar, so it survives a
+// catalog re-render mid-keystroke and stays in the same place whether or not a
+// tab is open.
+$('#search').addEventListener('input', (e) => filterCatalog(e.target.value));
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    showCatalogStage().then(() => $('#search').focus());
+  }
+  // Escape answers "no" to a confirmation before it closes the form: the
+  // question is on top, so it owns the key.
+  if (e.key === 'Escape') {
+    if (confirmResolve) { settleConfirm(false); return; }
+    closeModal();
+  }
+});
+$('#nav-back').addEventListener('click', () => activeId && invoke('navigate', { appId: activeId, action: 'back', tabId: activeTabIdOf(activeId) }));
+$('#nav-fwd').addEventListener('click', () => activeId && invoke('navigate', { appId: activeId, action: 'forward', tabId: activeTabIdOf(activeId) }));
+$('#nav-reload').addEventListener('click', () => activeId && invoke('navigate', { appId: activeId, action: 'reload', tabId: activeTabIdOf(activeId) }));
+// Home = go back to the app's configured start page, like a browser's home button.
+$('#nav-home').addEventListener('click', () => {
+  const app = apps.find(a => a.id === activeId);
+  if (!app) return;
+  goToUrl(app, app.url);
+});
+window.addEventListener('resize', () => refreshContentRect());
+$('#f-engine').addEventListener('change', () => { syncProfileModeHint(); syncSeedHint(); syncProxyHint(); });
+$('#f-profile-mode').addEventListener('change', () => { syncProfileModeHint(); syncProxyHint(); });
+$('#f-proxy-host').addEventListener('input', syncProxyHint);
+$('#f-browser').addEventListener('change', syncSeedHint);
+// A seed the user does not care about still has to be *some* number; the
+// browser only needs it to be stable, not memorable.
+$('#btn-random-seed').addEventListener('click', () => {
+  const seed = String(Math.floor(Math.random() * 900000) + 100000);
+  $('#f-seed').value = seed;
+});
+// F12 opens devtools for debugging
+document.addEventListener('keydown', (e) => { if (e.key === 'F12') invoke('open_devtools').catch(() => {}); });
+
+// ---- Init ----
+(async function init() {
+  // The theme was already applied by the inline script in the document head, so
+  // the first paint is correct. This call is what binds the OS listener, so a
+  // user on "follow the system" sees the window flip when Windows does.
+  if (window.RustBoxTheme) window.RustBoxTheme.applyRemembered();
+  const r = document.getElementById('content').getBoundingClientRect();
+  await invoke('hide_all_tabs').catch(() => {});
+  await invoke('resize_tabs', { x: r.left, y: r.top, width: r.width, height: r.height }).catch(() => {});
+  browsers = await invoke('detect_browsers').catch(() => []);
+  // The one place the platform is read; every later caller awaits this promise.
+  await loadPlatformInfo();
+  syncProfileModeHint();
+  const sel = $('#f-browser');
+  // Only append the family when the name does not already say it:
+  // "camoufox (Camoufox)" reads like a bug, while "chrome (Chromium)" carries
+  // the one fact that decides whether a seed will work.
+  const familyLabel = { chromium: 'Chromium', firefox: 'Firefox', camoufox: 'Camoufox' };
+  // Several stealth builds can be installed side by side under the same name
+  // (e.g. one in Camoufox's own cache and one vendored by a profile manager).
+  // When a name repeats, append where that copy lives so the choices are
+  // distinguishable instead of reading as duplicates.
+  const nameCount = new Map();
+  for (const b of browsers) nameCount.set(b.name, (nameCount.get(b.name) || 0) + 1);
+  for (const b of browsers) {
+    const opt = document.createElement('option');
+    const family = b.family || 'chromium';
+    const label = familyLabel[family] || family;
+    const base = b.name.toLowerCase().includes(family) ? b.name : `${b.name} (${label})`;
+    const repeated = nameCount.get(b.name) > 1;
+    // A copy installed by the browser itself reports its own name as the
+    // source; "camoufox — camoufox" is noise, so say whose install it is.
+    const source = (b.source || '').trim();
+    const suffix = !source ? '' : source.toLowerCase() === b.name.toLowerCase() ? 'own install' : source;
+    opt.value = b.path;
+    opt.textContent = repeated && suffix ? `${base} — ${suffix}` : base;
+    opt.dataset.family = family;
+    sel.appendChild(opt);
+  }
+  apps = await invoke('list_apps').catch(() => []);
+  // Restore which tab was open last. Kept in localStorage rather than the
+  // config so it stays a UI detail: it changes on every click and has no
+  // business rewriting config.json each time.
+  try { lastActiveId = localStorage.getItem('rustbox.lastActiveId'); } catch (_) {}
+  const catState = await invoke('get_catalog_state').catch(() => [[], {}]);
+  favorites = new Set(catState[0] || []);
+  usage = new Map(Object.entries(catState[1] || {}));
+  renderSidebar();
+  renderCatalog();
+  listen('apps-changed', (e) => {
+    const incoming = e.payload || [];
+    if (JSON.stringify(incoming) !== JSON.stringify(apps)) { apps = incoming; renderSidebar(); }
+  });
+  // A Settings save can change what an open app resolves to (the global proxy,
+  // a pool, or the app's own mode). The proxy is fixed when a tab is built, so
+  // the affected tabs have to be rebuilt or they keep using the old endpoint
+  // while Settings reports the new one. The backend names the apps because it
+  // owns the precedence rules.
+  listen('proxy-changed', (e) => {
+    const changed = e.payload?.apps || [];
+    if (changed.length) window.RustBoxUI.rebuildTabsForProxy(changed);
+  });
+  // A tab that fails to open (bad URL, refused attach, webview failure) emits
+  // this. Release builds have no console, so without a listener the click just
+  // did nothing with no explanation.
+  listen('tab-error', (event) => {
+    const text = String(event.payload || 'The tab could not be opened.');
+    showStrip(text, 'error');
+  });
+  // Windows updated the WebView2 runtime while RustBox was running, so the app
+  // cannot create the tab the user just asked for. The backend has already held
+  // that request back; this asks what to do instead of failing with an HRESULT
+  // the user cannot act on.
+  listen('runtime-swap', (event) => {
+    const p = event.payload || {};
+    const name = p.appName || p.appId || 'this app';
+    showStrip(
+      `Could not open ${name}. Windows updated its WebView2 runtime to ${p.to} ` +
+        `while RustBox was running on ${p.from}, and a running app cannot switch ` +
+        `to the new one. Restarting fixes it: your apps reopen, and logins are ` +
+        `kept, but extra tabs inside an app start over.`,
+      'warn',
+      [
+        {
+          label: 'Restart RustBox',
+          primary: true,
+          run: () => invoke('restart_after_runtime_swap').catch(() => {}),
+        },
+        {
+          // Kept because the detection is a guess about the filesystem: if it is
+          // wrong, this tab opens normally and the user is not blocked by a false
+          // alarm. If it is right, they get the real error and can restart.
+          label: 'Open anyway',
+          run: () => invoke('open_blocked_tab').catch(() => {}),
+        },
+      ],
+    );
+  });
+  // Deliberately not awaited: icons are a background detail and the window is
+  // already interactive. Firing this after the first paint keeps startup snappy.
+  backfillMissingIcons();
+  // Reflect the persisted agent-access state; the button is a capability
+  // switch, so it must show what the backend actually has, not a guess.
+  refreshMcpState();
+  // Open the first usable tab instead of the welcome screen. Starting on
+  // "Welcome to RustBox" while the sidebar clearly lists apps reads as if the
+  // tabs were lost; a mail client opens your inbox, it does not greet you.
+  // Only when there is nothing to open does the welcome/catalog screen show.
+  openFirstTabOnStartup();
+})();
+</script>
+</body>
+</html>

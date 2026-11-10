@@ -1,0 +1,86 @@
+/* Theme tokens.
+ *
+ * The dark palette lives in index.html's own :root block, because it is the
+ * default and every rule above depends on it. This file only overrides, so the
+ * two cannot drift: a token added to :root keeps working in both themes until it
+ * needs a light value.
+ *
+ * `html[data-theme="light"]` is set by settings.js. The attribute is on <html>
+ * rather than <body> so the scrollbar gutter and the root background change
+ * together, with no flash of dark behind a light page.
+ */
+
+html[data-theme="light"] {
+  --bg: #F4F6F9;
+  --surface: #FFFFFF;
+  --surface-2: #EBEFF5;
+  --border: #CBD5E1;
+  --text: #0F172A;
+  --text-dim: #5B6779;
+  /* A darker green than the dark theme's, so the accent still reads as "active"
+     on a white surface without dropping the contrast of the ink on top of it. */
+  --accent: #16A34A;
+  --accent-hover: #15803D;
+  --danger: #DC2626;
+  --tile-edge: rgba(15,23,42,.10);
+  /* Sidebar sockets: on a white rail the resting fill has to be a wash of ink,
+     and the selected one a step stronger, or "unselected" and "empty" look the
+     same. The dark theme reaches the same relationship from the other side. */
+  --icon-socket: #F1F5F9;
+  --icon-socket-hover: #E4EAF2;
+}
+
+html[data-theme="light"] body {
+  color-scheme: light;
+}
+
+/* Surfaces that assumed a near-black page. */
+html[data-theme="light"] ::-webkit-scrollbar-thumb { background: #C3CBD6; }
+html[data-theme="light"] #modal-backdrop,
+html[data-theme="light"] #confirm-backdrop { background: rgba(15,23,42,.34); }
+html[data-theme="light"] #ctx-menu { box-shadow: 0 8px 26px rgba(15,23,42,.16); }
+html[data-theme="light"] .catalog-item:active { transform: scale(.97); }
+/* The tile fallback and the icon well were built on a dark plate; on white they
+   need a hint of ink or they vanish into the surface. */
+html[data-theme="light"] .tile-fallback,
+html[data-theme="light"] .icon-preview,
+html[data-theme="light"] .ds-ring {
+  background: #F1F5F9;
+}
+html[data-theme="light"] #tab-error { color: #B91C1C; }
+html[data-theme="light"] #tab-error.warn { color: #B45309; }
+html[data-theme="light"] .sp-pill,
+html[data-theme="light"] .ch-chip,
+html[data-theme="light"] .sp-tool {
+  background: #F1F5F9;
+}
+/* Inline code and code blocks invert in light mode: a near-black block on a
+   white page is a hole, not a highlight. */
+html[data-theme="light"] .ch-body code,
+html[data-theme="light"] .ch-body pre,
+html[data-theme="light"] .sp-code,
+html[data-theme="light"] .ch-tool {
+  background: #F1F5F9;
+}
+html[data-theme="light"] .ch-msg.user .ch-body { background: #E8EEF6; }
+html[data-theme="light"] .ch-probe.ok,
+html[data-theme="light"] .sp-probe.ok { color: #15803D; }
+html[data-theme="light"] .ch-probe.bad,
+html[data-theme="light"] .sp-probe.bad { color: #B91C1C; }
+html[data-theme="light"] .sp-rail-item .st,
+html[data-theme="light"] .ch-role,
+html[data-theme="light"] .sp-note code { color: #64748B; }
+html[data-theme="light"] .sp-note.warn { color: #B45309; }
+/* The request log colours a failed row by tinting the whole line. The dark
+   theme's pale red is unreadable on white, so the light theme uses a deep red
+   for the text and a faint wash for the row itself. */
+html[data-theme="light"] .sp-logrow.bad,
+html[data-theme="light"] .sp-logrow.bad .lr-model,
+html[data-theme="light"] .sp-logerror { color: #B91C1C; }
+html[data-theme="light"] .sp-logrow.bad { background: #FEF2F2; }
+html[data-theme="light"] .sp-logrow:hover { background: var(--surface-2); }
+html[data-theme="light"] .sp-loghead { color: #64748B; }
+html[data-theme="light"] .sp-chart rect.zero { fill: #94A3B8; }
+/* The reach strip's dot pulses in the accent; on white the dark theme's glow
+   reads as a smudge, so the ring is tightened instead. */
+html[data-theme="light"] .ep-dot { box-shadow: 0 0 0 3px rgba(22,163,74,.16); }

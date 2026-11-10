@@ -1,0 +1,84 @@
+[package]
+name = "rustbox"
+version = "0.1.0"
+edition = "2024"
+# Two binaries live here (the app and the MCP shim). Without this, `cargo tauri
+# build` cannot tell which one is the product and refuses to bundle.
+default-run = "rustbox"
+
+[dependencies]
+base64 = "0.22"
+dirs-next = "2.0.0"
+# Favicon discovery for apps added by URL (src/favicon.rs), the proxy tester and
+# the AI provider client (src/settings.rs, src/chat.rs). Native TLS maps to
+# SChannel on Windows, so no OpenSSL/cmake toolchain is needed to build.
+# `socks` is required because a proxy pool may hold socks5 entries and the
+# tester must be able to dial them, not silently fail on them.
+# `blocking` is what the AI Router uses: it serves one request per thread, and a
+# blocking client is a better fit there than a runtime per connection.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "charset", "json", "socks", "blocking"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.4", features = ["devtools", "unstable"] }
+# The chat panel awaits an HTTP reply from inside a synchronous command (the tool
+# loop is blocking), so it needs a small runtime of its own. `current_thread`
+# keeps it to one thread: the panel sends one request at a time.
+tokio = { version = "1", features = ["rt", "time"] }
+# Direct dependency so the app can register the WebView2 profile name before a
+# tab webview is built. Cargo resolves this to the patched copy in
+# `[patch.crates-io]` below, i.e. the same crate instance `tauri` links against,
+# so the registry lookup happens in-process. `default-features = false` keeps
+# this from turning on features `tauri` did not ask for.
+tauri-runtime-wry = { version = "2.12.2", default-features = false }
+url = "2.5"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39.1"
+windows-core = "0.62"
+# Clipboard writes (src/clipboard.rs). WebView2 rejects `navigator.clipboard`
+# with NotAllowedError whenever the document is not focused, which is a state a
+# Copy button can legitimately be clicked in, so the write goes through Win32
+# instead. Only the modules named here are linked; the crate is already in the
+# dependency graph via `windows-core`, so this adds no download.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+# The MCP shim is a separate, dependency-free binary: an MCP client launches it
+# over stdio and it forwards to the running app. It cannot live inside the app
+# binary because MCP over stdio needs a clean stdin/stdout, and the GUI build is
+# `windows_subsystem = "windows"` (no console handles at all).
+[[bin]]
+name = "rustbox-mcp"
+path = "src/bin/mcp.rs"
+
+# Tauri 2.12 does not expose WebView2 multi-profile support, so `ProfileMode::Light`
+# could not exist without this patch. Upstream tracking:
+# https://github.com/tauri-apps/tauri/issues/9285 (open since Mar 2024).
+#
+# The vendored crate is a verbatim copy of tauri-runtime-wry 2.12.2 plus one
+# change: `create_webview` looks the webview label up in a registry of profile
+# names and, when found, forwards the name to wry's `with_profile_name`. That is
+# all it takes to get a second WebView2 profile (separate cookies, localStorage,
+# IndexedDB, cache) inside the existing shared browser process tree.
+#
+# The name deliberately does NOT ride along in `additional_browser_args`: WebView2
+# requires every webview sharing a user data folder to be created with identical
+# environment options, so a tab carrying extra args fails with
+# HRESULT(0x8007139F) against the shell window. Out-of-band registration leaves
+# `additional_browser_args` untouched, so wry keeps passing its own defaults and
+# the environment options stay identical.
+#
+# Maintenance: when Tauri is upgraded, re-copy the new tauri-runtime-wry version
+# here and re-apply the patch (search for "rustbox patch"). Delete this block
+# once upstream ships profile support.
+[patch.crates-io]
+tauri-runtime-wry = { path = "../vendor/tauri-runtime-wry" }

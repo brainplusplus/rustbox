@@ -1,0 +1,901 @@
+/* Settings page.
+ *
+ * A full-height surface rather than a modal: six sections, each with a list
+ * inside it, do not belong in a dialog, and "add one app" already owns the modal
+ * vocabulary. It starts at the sidebar edge so the app list stays visible while
+ * a setting is being changed.
+ *
+ * The rail is a status board, not a menu. Every row carries the live value of the
+ * thing it configures in monospace (direct, 3 members, 2 ready, on, 1/2), so the
+ * page answers "what is this app doing right now" before a single click. That is
+ * the one idea the layout is built around: the same information a browser's
+ * about:networking page makes you hunt for, put on the navigation itself.
+ */
+
+#settings-page {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: var(--sidebar-w);
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+#settings-page.hidden { display: none; }
+
+/* ---------- Header ---------- */
+.sp-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--toolbar-h);
+  flex: 0 0 auto;
+  padding: 0 10px 0 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.sp-head h1 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--text);
+}
+/* Save confirmation sits next to the title, not in a toast: the Save button is
+   right there and the two belong to the same gesture. */
+.sp-flash {
+  font-size: 11.5px;
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity .18s;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-flash.on { opacity: 1; }
+.sp-head .sp-spacer { flex: 1; }
+.sp-close {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  transition: background .15s, color .15s;
+}
+.sp-close:hover { background: var(--surface-2); color: var(--text); }
+.sp-close svg { width: 15px; height: 15px; fill: currentColor; }
+
+/* ---------- Two columns ---------- */
+.sp-body { flex: 1; display: flex; min-height: 0; }
+
+.sp-rail {
+  flex: 0 0 218px;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sp-rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: left;
+  transition: background .12s, color .12s;
+}
+.sp-rail-item:hover { background: var(--surface-2); color: var(--text); }
+.sp-rail-item.active { background: var(--surface-2); color: var(--text); }
+.sp-rail-item.active .lbl { font-weight: 600; }
+.sp-rail-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  height: 16px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+.sp-rail-item .lbl {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The status column. Monospace and dim so six of them read as a column of
+   values rather than six more words competing with the labels. */
+.sp-rail-item .st {
+  flex: 0 0 auto;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10px;
+  color: #64748B;
+  max-width: 88px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-rail-item.active .st { color: var(--text-dim); }
+.sp-rail-item .st.ok { color: var(--accent); }
+.sp-rail-item .st.warn { color: #F59E0B; }
+.sp-rail-sep { height: 1px; background: var(--border); margin: 8px 6px; }
+.sp-rail-note {
+  margin-top: auto;
+  padding: 12px 10px 4px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: #64748B;
+}
+
+.sp-pane {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 22px 26px 64px;
+}
+.sp-wrap { max-width: 660px; }
+
+/* ---------- Section headings ---------- */
+.sp-title { font-size: 17px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.sp-lede {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-dim);
+  margin-bottom: 20px;
+  max-width: 62ch;
+}
+
+/* ---------- Cards ---------- */
+.sp-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 16px;
+  margin-bottom: 14px;
+}
+.sp-card > h3 {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.sp-headrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.sp-headrow h3 { flex: 1; margin: 0; }
+.sp-row { display: flex; gap: 10px; }
+.sp-row > * { flex: 1; min-width: 0; }
+.sp-row.tight { gap: 8px; }
+.sp-note { margin-top: 8px; font-size: 11px; line-height: 1.6; color: var(--text-dim); }
+.sp-note.tight { margin-top: 5px; }
+.sp-note.warn { color: #F59E0B; }
+.sp-note.ok { color: var(--accent); }
+.sp-note code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* ---------- Fields ---------- */
+.sp-field { margin-bottom: 11px; }
+.sp-field:last-child { margin-bottom: 0; }
+.sp-field > label {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.sp-field input, .sp-field select, .sp-field textarea { width: 100%; }
+.sp-field textarea {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.65;
+  outline: none;
+  resize: vertical;
+  min-height: 92px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+}
+.sp-field textarea:focus { border-color: var(--accent); }
+.sp-field input:disabled, .sp-field select:disabled, .sp-field textarea:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+/* ---------- Choice rows (theme, proxy mode, scope) ---------- */
+.sp-choices { display: flex; flex-direction: column; gap: 6px; }
+.sp-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--tile-edge);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.sp-choice:hover { border-color: var(--border); }
+.sp-choice.on { border-color: var(--accent); background: rgba(34,197,94,.07); }
+.sp-choice input { width: auto; flex: 0 0 auto; margin: 2px 0 0; accent-color: var(--accent); }
+.sp-choice .cbody { flex: 1; min-width: 0; }
+.sp-choice .cname { display: block; font-size: 12.5px; font-weight: 600; color: var(--text); }
+.sp-choice .cdesc { display: block; font-size: 11.5px; line-height: 1.55; color: var(--text-dim); margin-top: 2px; }
+.sp-choice.inline { flex: 1; }
+
+/* ---------- Buttons ---------- */
+.sp-btn {
+  padding: 7px 13px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  white-space: nowrap;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.sp-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.sp-btn:disabled { opacity: .5; cursor: default; }
+.sp-btn.primary { background: var(--accent); border-color: var(--accent); color: #052e16; }
+.sp-btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: #052e16; }
+.sp-btn.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+.sp-btn.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+.sp-btn.danger { background: transparent; border-color: transparent; color: var(--danger); }
+.sp-btn.danger:hover:not(:disabled) { background: rgba(239,68,68,.1); color: var(--danger); }
+.sp-btn.sm { padding: 4px 9px; font-size: 11px; border-radius: 6px; }
+.sp-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.sp-actions .sp-spacer { flex: 1; }
+
+/* ---------- Lists (providers, pools, skills) ---------- */
+.sp-list { display: flex; flex-direction: column; gap: 6px; }
+.sp-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--tile-edge);
+  background: var(--surface-2);
+  transition: border-color .12s;
+}
+.sp-item:hover { border-color: var(--border); }
+.sp-item.sel { border-color: var(--accent); }
+.sp-item .i-main { flex: 1; min-width: 0; }
+.sp-item .i-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-item .i-meta {
+  font-size: 10.5px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.sp-item .i-acts { display: flex; gap: 2px; flex: 0 0 auto; }
+
+/* A pill carries exactly one fact about an item: ready, empty, 3 members. */
+.sp-pill {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  background: var(--surface);
+  color: var(--text-dim);
+  box-shadow: inset 0 0 0 1px var(--tile-edge);
+  white-space: nowrap;
+}
+.sp-pill.ok { color: var(--accent); box-shadow: inset 0 0 0 1px rgba(34,197,94,.4); }
+.sp-pill.warn { color: #F59E0B; box-shadow: inset 0 0 0 1px rgba(245,158,11,.4); }
+.sp-pill.bad { color: var(--danger); box-shadow: inset 0 0 0 1px rgba(239,68,68,.4); }
+/* A request is running: the spinner is the whole point of the pill, so it sits
+   inline with the count rather than beside it. */
+.sp-pill.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(34,197,94,.4);
+}
+
+/* ---------- Probe result ---------- */
+.sp-probe {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.sp-probe:empty { display: none; }
+.sp-probe.ok { background: rgba(34,197,94,.1); color: #86EFAC; }
+.sp-probe.bad { background: rgba(239,68,68,.1); color: #FCA5A5; }
+.sp-probe.busy { background: var(--surface-2); color: var(--text-dim); }
+.sp-probe .p-ms {
+  flex: 0 0 auto;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  opacity: .75;
+}
+
+/* ---------- Copy-paste guides ---------- */
+.sp-guide { margin-bottom: 12px; }
+.sp-guide:last-child { margin-bottom: 0; }
+.sp-guide-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.sp-guide-head .g-name { font-size: 11.5px; font-weight: 600; color: var(--text); }
+.sp-guide-head .g-where { font-size: 10.5px; color: var(--text-dim); }
+.sp-code {
+  position: relative;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--text-dim);
+  white-space: pre;
+  overflow-x: auto;
+}
+.sp-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  opacity: 0;
+  transition: opacity .12s, color .12s;
+}
+.sp-code:hover .sp-copy, .sp-copy:focus-visible { opacity: 1; }
+.sp-copy:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ---------- Empty state ---------- */
+.sp-empty {
+  padding: 22px 16px;
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--text-dim);
+}
+
+/* ---------- Switch ---------- */
+.sp-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transition: background .15s;
+}
+.sp-switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform .15s, background .15s;
+}
+.sp-switch.on { background: rgba(34,197,94,.22); box-shadow: inset 0 0 0 1px rgba(34,197,94,.55); }
+.sp-switch.on::after { transform: translateX(16px); background: var(--accent); }
+.sp-switch:disabled { opacity: .4; cursor: not-allowed; }
+
+/* The rule hint under a key's restricted-access box: what the rules would match
+   right now, in the same monospace as the rules themselves. */
+.sp-rule-hint {
+  margin-top: 7px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.sp-rule-hint code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text);
+}
+/* A checkbox list of members is denser than the provider list it borrows from,
+   because a combo can have a dozen candidates. */
+.sp-list.tight .sp-item { padding: 6px 9px; }
+.sp-check-item input[type="checkbox"] { margin: 0; accent-color: var(--accent); }
+
+/* ---------- AI Router: the reach strip ----------
+ *
+ * The one element this page is built around. A router's whole job is to answer
+ * "what URL do I put in my client", so the answer sits at the top as a terminal
+ * readout: a live dot, the port, and one row per way in. Monospace and
+ * left-aligned, because an address is something you copy, not something you read.
+ */
+.sp-endpoint {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+.sp-endpoint.live { border-color: rgba(34,197,94,.45); }
+.ep-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.ep-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #64748B;
+  flex: 0 0 auto;
+}
+.sp-endpoint.live .ep-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(34,197,94,.16);
+  animation: ep-pulse 2.4s ease-in-out infinite;
+}
+@keyframes ep-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(34,197,94,.16); }
+  50% { box-shadow: 0 0 0 6px rgba(34,197,94,.06); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sp-endpoint.live .ep-dot { animation: none; }
+}
+.ep-state {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.sp-endpoint.live .ep-state { color: var(--accent); }
+.ep-port {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.ep-head .spacer { flex: 1; }
+.ep-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--tile-edge);
+}
+.ep-row:first-of-type { border-top: none; }
+.ep-name {
+  flex: 0 0 104px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: #64748B;
+}
+.ep-url {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ep-row .sp-btn {
+  flex: 0 0 auto;
+  opacity: 0;
+}
+.ep-row:hover .sp-btn, .ep-row .sp-btn:focus-visible { opacity: 1; }
+.ep-note {
+  padding: 8px 12px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10px;
+  color: #64748B;
+  border-top: 1px solid var(--tile-edge);
+}
+
+/* ---------- Published models, grouped by prefix ---------- */
+.sp-prefix-group {
+  display: flex;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--tile-edge);
+  margin-bottom: 6px;
+}
+.sp-prefix-group:last-of-type { margin-bottom: 0; }
+.pg-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.pg-head code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.pg-head span {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 9.5px;
+  color: #64748B;
+}
+.pg-ids {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.pg-ids code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+/* The copy button in a prefix group. Always visible rather than on hover: a
+   group of ids exists to be pasted somewhere, and a control you have to discover
+   first is a control most people never find. */
+.pg-copy {
+  /* .sp-copy pins itself to the top-right of its nearest positioned ancestor,
+     which is right for the guide blocks it was written for. A prefix group lays
+     its copy button out as a flex child instead, so it has to opt out of that
+     absolute positioning — without this it escapes the row entirely and every
+     group's button stacks on the same spot outside the pane. */
+  position: static;
+  flex: 0 0 auto;
+  align-self: flex-start;
+  opacity: .75;
+}
+.sp-prefix-group:hover .pg-copy { opacity: 1; }
+.sp-prefix-group.combo-group { border-style: dashed; }
+.sp-prefix-group.combo-group .pg-head code { color: #A78BFA; }
+
+/* ---------- Tunnel / Tailscale rows ---------- */
+.sp-tunnel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 11px;
+  border-radius: 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--tile-edge);
+  margin-bottom: 8px;
+}
+.sp-tunnel:last-of-type { margin-bottom: 0; }
+.tun-main { flex: 1; min-width: 0; }
+.tun-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.tun-meta {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  margin-top: 2px;
+  word-break: break-word;
+}
+.tun-meta code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text);
+  word-break: break-all;
+}
+
+/* ---------- Prefix preview in the provider editor ---------- */
+.sp-prefix-preview {
+  display: flex;
+  align-items: center;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+/* ---------- Combo member picker ---------- */
+.sp-check-item { cursor: pointer; }
+.sp-check-item input[type="checkbox"] {
+  width: auto;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.sp-check-item .i-name code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+}
+
+/* ---------- Request logs: chart ---------- */
+.sp-chart {
+  display: block;
+  width: 100%;
+  height: 76px;
+  margin: 4px 0 2px;
+  overflow: visible;
+}
+.sp-chart rect.on { fill: var(--accent); opacity: .85; }
+.sp-chart rect.zero { fill: #64748B; opacity: .25; }
+.sp-chart rect:hover { opacity: 1; }
+.sp-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 9.5px;
+  color: #64748B;
+  padding-top: 2px;
+}
+
+/* Four figures under the chart. A row, not cards: they are one sentence read
+   left to right, and four bordered boxes would turn them into four claims. */
+.sp-stats {
+  display: flex;
+  gap: 18px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--tile-edge);
+  flex-wrap: wrap;
+}
+.sp-stat { display: flex; flex-direction: column; gap: 2px; }
+.sp-stat .s-val {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.sp-stat .s-lbl {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: #64748B;
+}
+
+/* ---------- Request logs: top models ---------- */
+.sp-bars { display: flex; flex-direction: column; gap: 10px; }
+.sp-bar .b-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.sp-bar .b-head code {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-bar .b-head span {
+  flex: 0 0 auto;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.sp-bar .b-track {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sp-bar .b-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: .8;
+}
+.sp-bar .b-foot {
+  display: flex;
+  gap: 12px;
+  margin-top: 3px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 9.5px;
+  color: #64748B;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Request logs: table ---------- */
+.sp-logtable {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+}
+/* Nine columns: status, model, api, tokens, first token, throughput, total,
+   cost, when. TTFT and t/s are what a slow model is diagnosed with, so they get
+   their own columns instead of living behind a click. */
+.sp-loghead, .sp-logrow {
+  display: grid;
+  grid-template-columns: 38px minmax(0,1fr) 78px 50px 54px 52px 52px 52px 52px;
+  gap: 7px;
+  align-items: center;
+  padding: 5px 6px;
+  border-radius: 5px;
+}
+.sp-loghead {
+  color: #64748B;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--tile-edge);
+  border-radius: 0;
+  padding-bottom: 6px;
+}
+.sp-logrow { color: var(--text-dim); }
+.sp-logrow:hover { background: var(--surface-2); }
+.sp-logrow.bad { color: #FCA5A5; }
+.sp-logrow .lr-status { font-weight: 700; }
+.sp-logrow .lr-status.ok { color: var(--accent); }
+.sp-logrow .lr-status.bad { color: var(--danger); }
+.sp-logrow .lr-model {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-logrow.bad .lr-model { color: #FCA5A5; }
+.sp-logrow .lr-endpoint, .sp-logrow .lr-tokens, .sp-logrow .lr-ms,
+.sp-logrow .lr-ttft, .sp-logrow .lr-tps,
+.sp-logrow .lr-cost, .sp-logrow .lr-when {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-logerror {
+  padding: 4px 6px 8px 51px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #FCA5A5;
+  word-break: break-word;
+}
+
+/* ---------- Request logs: a request in flight ---------- */
+/* Deliberately not a separate list above the table: a streamed request is one
+   more row, and splitting the two would make a running call look like a
+   different kind of event from the finished one it becomes. */
+.sp-logrow.live {
+  color: var(--text);
+  background: rgba(34,197,94,.05);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.sp-logrow.live:hover { background: rgba(34,197,94,.09); }
+.sp-logrow .lr-status.run { display: flex; align-items: center; }
+.lr-spin {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(34,197,94,.28);
+  border-top-color: var(--accent);
+  animation: lr-spin .8s linear infinite;
+}
+@keyframes lr-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .lr-spin { animation: none; border-top-color: var(--accent); }
+}
+
+/* ---------- Request logs: detail panel ---------- */
+.sp-logrow.open {
+  background: var(--surface-2);
+  border-radius: 5px 5px 0 0;
+}
+.sp-logdetail {
+  margin: 0 0 4px;
+  padding: 9px 11px 10px;
+  border-radius: 0 0 7px 7px;
+  border: 1px solid var(--tile-edge);
+  border-top: none;
+  background: var(--bg);
+}
+.ld-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 7px 14px;
+}
+.ld-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ld-lbl {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: #64748B;
+}
+.ld-val {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text);
+  word-break: break-all;
+}
+.ld-error {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(239,68,68,.08);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: #FCA5A5;
+  word-break: break-word;
+}
+.ld-note {
+  margin-top: 8px;
+  font-size: 10px;
+  line-height: 1.55;
+  color: #64748B;
+}
+
+/* The log table needs more width than a settings card gives at 660px. Widening
+   only this pane keeps every other card on the same measure. */
+.sp-wrap:has(.sp-logtable) { max-width: 860px; }

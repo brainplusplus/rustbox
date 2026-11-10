@@ -1,0 +1,12 @@
+{
+  "name": "rustbox",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "build:installer": "node scripts/build-installer.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
