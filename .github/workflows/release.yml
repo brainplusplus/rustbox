@@ -36,7 +36,7 @@ jobs:
     name: test + ui + probes
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -44,7 +44,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -99,13 +99,14 @@ jobs:
           - name: macos-universal
             os: macos-latest
             target: universal-apple-darwin
+            universal: "1"
             bundles: dmg
             artifact: rustbox-macos-universal
             glob: |
               src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -121,7 +122,7 @@ jobs:
           workspaces: src-tauri -> target
           key: ${{ matrix.name }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -144,8 +145,12 @@ jobs:
       - name: release build
         env:
           RB_BUNDLES: ${{ matrix.bundles }}
+          # `universal-apple-darwin`: one binary that runs on Apple Silicon and
+          # Intel, so the Intel hardware still in use is covered without depending
+          # on the x86_64 runner image that retires in 2027.
           RB_TARGET: ${{ matrix.target }}
-        # RB_TARGET empty means "native", which is what the script already assumes.
+          RB_UNIVERSAL: ${{ matrix.universal }}
+        # An empty RB_TARGET means "native", which the script already assumes.
         run: node scripts/build-installer.mjs
 
       # A bundle that exists but cannot start is worse than a failed build, because
@@ -165,7 +170,7 @@ jobs:
           if (-not (Test-Path $shim)) { throw "MCP sidecar missing next to the app: $shim" }
           "sidecar: $shim ($((Get-Item $shim).Length) bytes)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.glob }}
@@ -180,7 +185,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

@@ -76,7 +76,12 @@ if (!triple) {
   process.exit(1);
 }
 
-const universal = triple === "universal-apple-darwin";
+// A universal build is requested with the meta-triple `universal-apple-darwin`,
+// which cargo cannot compile directly. Either Apple triple in RB_TARGET means the
+// caller wants a binary that runs on both, so both are built and lipo'd.
+const universal =
+  triple.includes("apple-darwin") &&
+  (triple === "universal-apple-darwin" || process.env.RB_UNIVERSAL === "1");
 // A universal app is built from two real architectural targets, so the shim has
 // to be compiled twice and lipo'd. Every other triple is a plain native build.
 const shimTriples = universal
@@ -141,15 +146,23 @@ if (universal) {
 console.log(`\nstaged ${staged} (${statSync(staged).size} bytes)`);
 
 // 3. Build the app and the installer(s).
+//
+// The Tauri CLI is invoked through the local npm install rather than `cargo tauri`:
+// the cargo subcommand only exists where someone ran `cargo install tauri-cli`
+// by hand, which is true on a developer machine and false on a CI runner. The npm
+// binary is pinned by package-lock.json and is the same version everywhere.
 const targets = bundles();
 console.log(`\nBundling: ${targets}`);
-run("cargo", [
-  "tauri",
-  "build",
-  "--bundles",
-  targets,
-  ...(triple === hostTriple ? [] : ["--target", triple]),
-]);
+const tauriCli = join(repo, "node_modules", ".bin", process.platform === "win32" ? "tauri.cmd" : "tauri");
+if (!existsSync(tauriCli)) {
+  console.error(`build-installer: Tauri CLI missing at ${tauriCli}; run npm ci`);
+  process.exit(1);
+}
+execFileSync(
+  tauriCli,
+  ["build", "--bundles", targets, ...(triple === hostTriple ? [] : ["--target", triple])],
+  { cwd: srcTauri, stdio: "inherit", env: process.env, shell: process.platform === "win32" },
+);
 
 // Report whatever the bundler actually produced rather than a name built from
 // the version string, so a version bump does not silently hide the artifact.
