@@ -280,6 +280,11 @@ fn emit_nav(
       t.url = url.to_string();
     }
   });
+  // A navigation is the one change the strip does not redraw for, so it is not
+  // covered by `emit_tabs_changed`. Saving here is what keeps the remembered URL
+  // current — the difference between reopening the page the user left and
+  // reopening the app's start page.
+  remember_tabs(handle, app_id);
   let _ = handle.emit(
     "tab-nav",
     serde_json::json!({
@@ -319,6 +324,9 @@ fn emit_title(handle: &tauri::AppHandle, app_id: &str, tab_id: &str, title: &str
       t.title = title.to_string();
     }
   });
+  // The saved title is what the strip shows for a restored tab before its page
+  // has loaded, so it is worth keeping current as the document changes.
+  remember_tabs(handle, app_id);
   let _ = handle.emit(
     "tab-title",
     serde_json::json!({ "appId": app_id, "tabId": tab_id, "title": title }),
@@ -570,6 +578,12 @@ struct PendingOpen {
   app: App,
   kind: OpenKind,
   url: Option<String>,
+  /// Document title to show in the strip until the page reports its own.
+  ///
+  /// Only a restored tab has one: it was remembered along with the URL, and
+  /// without it the strip would label a reopened tab with the app's name until
+  /// the page finished loading, which reads as "it forgot where I was".
+  title: Option<String>,
   rect: (f64, f64, f64, f64),
   /// Build the window without showing it and without hiding the tab that is
   /// already on screen.
@@ -597,6 +611,36 @@ static PENDING_OPENS: Mutex<Vec<PendingOpen>> = Mutex::new(Vec::new());
 static SWAP_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
+/// Restored apps whose strip still has to be pointed at the right tab.
+///
+/// A list rather than one entry because startup preloading restores every app at
+/// once: each one needs its remembered active tab recorded while nobody is
+/// looking, and a single slot would let the last app overwrite the others.
+///
+/// The flag says whether that tab should also be made visible. Preloading must
+/// not show anything — it would flash every app over the one the user is reading
+/// — but the app still has to remember which tab it was on, so that revealing it
+/// later lands where the user left off.
+static RESTORE_SHOW: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
+
+/// Apps whose tabs are in the middle of being rebuilt.
+///
+/// While an app is here, its remembered tabs are not overwritten. Rebuilding is
+/// incremental — the first tab exists before the others — so saving in the
+/// middle would record "this app has one tab" and throw away the rest. A crash
+/// in that window would then make the partial state permanent, which is the one
+/// outcome this feature exists to prevent.
+static RESTORING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether `app_id` is mid-restore and must not be saved yet.
+fn is_restoring(app_id: &str) -> bool {
+  RESTORING
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .iter()
+    .any(|id| id == app_id)
+}
+
 /// Drain queued tab opens. Must run on the main thread OUTSIDE any IPC
 /// handler (we get there by scheduling this as a fresh main-thread task
 /// after the handler returns).
@@ -604,12 +648,156 @@ fn drain_pending_opens(handle: &tauri::AppHandle) {
   loop {
     let mut next = PENDING_OPENS.lock().unwrap();
     if next.is_empty() {
+      drop(next);
+      // The queue is empty, so anything a restore staged is now built and can
+      // be brought to the front. Done here rather than after each build because
+      // only now is there a tab to show.
+      finish_restore(handle);
       return;
     }
     let pending = next.remove(0);
     drop(next);
     build_tab_window(handle, pending);
   }
+}
+
+/// Queue the tabs a remembered app still needs, behind the one being built.
+///
+/// `shown` is the index among *these* tabs that the app should end up on, or
+/// `None` when the tab already being built is the right one. `reveal` says
+/// whether that tab should be made visible now or only remembered for when the
+/// app is revealed. Popups are absent by construction: `session` never remembers
+/// them.
+fn restore_queue(
+  handle: &tauri::AppHandle,
+  app_id: &str,
+  tabs: &[crate::session::SavedTab],
+  shown: Option<usize>,
+  rect: (f64, f64, f64, f64),
+  reveal: bool,
+) {
+  if tabs.is_empty() {
+    return;
+  }
+  let Some(app) = app_by_id(handle, app_id) else {
+    return;
+  };
+  {
+    let mut queue = PENDING_OPENS.lock().unwrap();
+    for tab in tabs {
+      queue.push(PendingOpen {
+        app: app.clone(),
+        kind: OpenKind::Sub,
+        url: Some(tab.url.clone()),
+        title: Some(tab.title.clone()).filter(|t| !t.is_empty()),
+        rect,
+        // Hidden on build: restoring nine tabs must not flash nine windows over
+        // the tab the user is looking at. `finish_restore` shows the one that
+        // was active.
+        warm: true,
+      });
+    }
+  }
+  if let Some(index) = shown {
+    RESTORE_SHOW
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .push((app_id.to_string(), index, reveal));
+  }
+  // Marked before the builds run, so none of them overwrites the memory with the
+  // half-built strip. Cleared by `finish_restore` once they are all there.
+  RESTORING
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+    .push(app_id.to_string());
+  shell_log(&format!("restoring {} tab(s) for {app_id}", tabs.len()));
+  // Normal opens already drain the queue, so this is a no-op there. Startup
+  // preloading builds each window directly instead of queueing, so without this
+  // the restored tabs would sit in the queue forever.
+  schedule_drain(handle);
+}
+
+/// Make sure the pending queue is drained, without assuming the caller is
+/// already inside a drain.
+///
+/// Deferred exactly like `schedule_open` and for the same reason: draining means
+/// creating WebView2 controllers, which deadlocks on the main thread inside an
+/// IPC handler (wry#583).
+fn schedule_drain(handle: &tauri::AppHandle) {
+  let h = handle.clone();
+  std::thread::spawn(move || {
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let h2 = h.clone();
+    let _ = h.run_on_main_thread(move || drain_pending_opens(&h2));
+  });
+}
+
+/// Point every restored app's strip at the tab the user left it on.
+///
+/// Restored tabs are built hidden so they cannot flash over the workspace, which
+/// leaves each app on its first tab. This restores the rest of the state: the
+/// active tab id, so a later reveal lands where the user was, and — when the app
+/// was opened rather than preloaded — the visible tab as well.
+fn finish_restore(handle: &tauri::AppHandle) {
+  let pending = {
+    let mut guard = RESTORE_SHOW.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
+  };
+  let pending_was_empty = pending.is_empty();
+  // Every app named here has finished rebuilding, so saving is correct again.
+  // Cleared before the save below, otherwise the save would skip the very app it
+  // is supposed to record.
+  {
+    let mut guard = RESTORING.lock().unwrap_or_else(|e| e.into_inner());
+    for (app_id, _, _) in &pending {
+      guard.retain(|id| id != app_id);
+    }
+    guard.clear();
+  }
+  let mut revealed = false;
+  for (app_id, index, reveal) in pending {
+    // Ids are minted in build order, and the restored tabs are built in the
+    // order they were queued, so the tab at `index` among them is the one to
+    // show. Looked up through the registry rather than computed from a pattern,
+    // so a build that failed and skipped an id cannot show the wrong page.
+    let target = tabs(|m| {
+      m.get(&app_id).and_then(|a| {
+        a.tabs
+          .iter()
+          .filter(|t| !t.detached && !t.pinned)
+          .nth(index)
+          .map(|t| t.id.clone())
+      })
+    });
+    let Some(tab_id) = target else {
+      continue;
+    };
+    if reveal {
+      show_only(handle, &app_id, &tab_id);
+      revealed = true;
+    } else {
+      // Preloaded: nobody is looking, so only the bookkeeping moves. The tab is
+      // recorded as active so revealing the app later shows the right one.
+      tabs(|m| {
+        if let Some(a) = m.get_mut(&app_id) {
+          a.active = tab_id;
+        }
+      });
+    }
+  }
+  if revealed {
+    sync_all_tabs(handle);
+    // Saved last, after the active tab moved, so the file does not record the
+    // first tab as the one the user was on.
+    emit_tabs_changed(handle);
+  } else if !pending_was_empty {
+    // Nothing to reveal, but the active tab did move. Persist it without asking
+    // the UI to redraw a strip the user is not looking at.
+    remember_all_tabs(handle);
+  }
+  // Re-record the completed strips. Until now the save was suppressed so a crash
+  // mid-restore could not overwrite the memory with a partial list.
+  remember_all_tabs(handle);
 }
 
 /// Queue a window build and schedule the drain.
@@ -667,9 +855,12 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     app,
     kind,
     url: requested,
+    title: requested_title,
     rect: (x, y, width, height),
     warm,
   } = pending;
+  let mut requested = requested;
+  let mut requested_title = requested_title;
   if app.engine != Engine::OsWebview || !app.enabled {
     return;
   }
@@ -737,6 +928,38 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         emit_tabs_changed(handle);
         return;
       }
+      // Nothing is open yet, so this is the moment to bring back the tabs the
+      // user had last time. The first one is built by the normal path below;
+      // the rest are queued behind it so the strip fills in order and the build
+      // stays paced one window at a time.
+      //
+      // An explicit `url` wins: a caller that asked for a specific page (a link
+      // opened in a new tab, a deep link) is not asking to be sent somewhere
+      // RustBox remembers instead.
+      //
+      // A warm build restores too: the point of preloading is that clicking the
+      // app shows what you left, not a fresh start page.
+      if requested.is_none()
+        && let Some((saved, active)) = crate::session::restore_plan(&app_id, &app.url)
+        && !saved.is_empty()
+      {
+        let rect = (x, y, width, height);
+        requested = Some(saved[0].url.clone());
+        requested_title = Some(saved[0].title.clone()).filter(|t| !t.is_empty());
+        // The remaining tabs are queued from the drain that runs after this build
+        // finishes, so the window count grows one at a time rather than nine
+        // controller creations deep on one main-thread message.
+        //
+        // `active` indexes the whole saved list, where 0 is the tab being built
+        // right now; among the queued remainder it is `active - 1`. Zero means
+        // the tab already being built is the one to show, so nothing is raised
+        // at the end.
+        let shown = (active > 0).then(|| active - 1);
+        restore_queue(handle, &app_id, &saved[1..], shown, rect, !warm);
+        // The tab being built right now is the remembered active one when
+        // `active` is 0. It is already the default, so nothing to raise — but a
+        // preload must not mark it visible, and that needs no action either.
+      }
       ("main".to_string(), label_for(&app, "main"))
     }
     OpenKind::Sub => {
@@ -776,6 +999,9 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
       return;
     }
   };
+  // The window can exist before its first navigation, so the strip gets a
+  // label now rather than after the page loads.
+  let shown_title = requested_title.unwrap_or_else(|| app.name.clone());
 
   let scale = main.scale_factor().unwrap_or(1.0);
   // A popup is a floating window, not a page-sized one: it keeps its own size
@@ -1068,7 +1294,7 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
           pinned: tab_id == "main",
           detached,
           url: target_url.clone(),
-          title: app.name.clone(),
+          title: shown_title,
         });
         if !detached {
           a.active = tab_id.clone();
@@ -1600,6 +1826,7 @@ fn perform_link_action(
           app,
           kind,
           url: Some(url.to_string()),
+          title: None,
           rect,
           warm: false,
         },
@@ -1617,13 +1844,113 @@ fn app_by_id(handle: &tauri::AppHandle, app_id: &str) -> Option<App> {
   cfg.apps.iter().find(|a| a.id == app_id).cloned()
 }
 
+/// Remember an app's open tabs so they come back on the next launch.
+///
+/// Called from every point that changes what the user would expect to find after
+/// a restart: a tab is built, a tab is closed, a tab navigates, the active tab
+/// moves, and a tab is reordered. Anything narrower loses a case — saving only on
+/// close would lose the last URL, saving only on navigate would lose a tab that
+/// was opened and not yet loaded.
+///
+/// Popups are excluded: they are transient windows rather than tabs the user
+/// built, and restoring one would put a window on screen that they had already
+/// dismissed.
+///
+/// Deliberately silent on failure. Losing a remembered tab is a small, invisible
+/// loss; turning it into an error dialog or a failed tab open is a large, visible
+/// one, and the tab in front of the user is what matters at that moment.
+fn remember_tabs(handle: &tauri::AppHandle, app_id: &str) {
+  if is_restoring(app_id) {
+    return;
+  }
+  let (tabs, active) = saved_tabs_of(app_id);
+  if tabs.is_empty() {
+    // The app is closed entirely, so it must not come back as a phantom entry.
+    crate::session::forget(app_id);
+  } else {
+    // The app's configured start page is recorded alongside, so a later restore
+    // can tell an edited address from a page the user navigated to.
+    let base = app_by_id(handle, app_id)
+      .map(|a| a.url)
+      .unwrap_or_default();
+    crate::session::remember(app_id, &base, &tabs, active);
+  }
+}
+
+/// One app's open tabs as the session store wants them, plus the active index.
+fn saved_tabs_of(app_id: &str) -> (Vec<(String, String)>, usize) {
+  tabs(|m| {
+    let Some(a) = m.get(app_id) else {
+      return (Vec::new(), 0usize);
+    };
+    let rows: Vec<SavedRow> = a
+      .tabs
+      .iter()
+      .map(|t| SavedRow {
+        id: t.id.clone(),
+        url: t.url.clone(),
+        title: t.title.clone(),
+        detached: t.detached,
+      })
+      .collect();
+    pick_saved(&rows, &a.active)
+  })
+}
+
+/// A tab as the session store needs it, stripped of everything that ties it to a
+/// live window.
+///
+/// Exists so the selection below can be tested without a real `WebviewWindow`: a
+/// `Surface` can only be built from one, and the decision worth testing is which
+/// tabs to keep, not how they are drawn.
+struct SavedRow {
+  id: String,
+  url: String,
+  title: String,
+  detached: bool,
+}
+
+/// Which tabs to remember, and which of the kept ones was on screen.
+///
+/// Popups are dropped, and the active index is computed *among the kept tabs* —
+/// counting it against the full list would land on the wrong tab whenever a
+/// popup sits before the active one, restoring the user onto a different page
+/// than the one they left.
+fn pick_saved(tabs: &[SavedRow], active: &str) -> (Vec<(String, String)>, usize) {
+  let mut kept: Vec<(String, String)> = Vec::new();
+  let mut active_index = 0usize;
+  for t in tabs.iter().filter(|t| !t.detached) {
+    if t.id == active {
+      active_index = kept.len();
+    }
+    kept.push((t.url.clone(), t.title.clone()));
+  }
+  (kept, active_index)
+}
+
+/// Remember every app's tabs. Used where the registry as a whole may have moved.
+fn remember_all_tabs(handle: &tauri::AppHandle) {
+  let ids: Vec<String> = tabs(|m| m.keys().cloned().collect());
+  for id in ids {
+    remember_tabs(handle, &id);
+  }
+}
+
 /// Tell the UI the set of sub-tabs changed, so the tab strip can redraw.
 ///
 /// Sent as a whole snapshot rather than as add/close events: the strip is small,
 /// and a snapshot cannot drift out of sync with the backend the way an
 /// incremental stream can when one event is dropped.
+///
+/// Also the single point where the remembered tabs are updated, because every
+/// path that changes the strip calls this: a build, a close, a reorder, an
+/// activation, a close of the whole app. Hooking the save here is what keeps it
+/// from having to be repeated — and eventually forgotten — at each of those call
+/// sites. Navigation is the one change that does not redraw the strip, and it
+/// saves through `remember_tabs` directly.
 fn emit_tabs_changed(handle: &tauri::AppHandle) {
   use tauri::Emitter;
+  remember_all_tabs(handle);
   let _ = handle.emit("tabs-changed", tabs_snapshot());
 }
 
@@ -1724,6 +2051,7 @@ pub fn schedule_sub_tab(
       app,
       kind: OpenKind::Sub,
       url,
+      title: None,
       rect,
       warm: false,
     },
@@ -1954,6 +2282,7 @@ pub fn probe_open_all(handle: &tauri::AppHandle) {
       app,
       kind: OpenKind::Main,
       url: None,
+      title: None,
       rect: (0.0, 60.0, 800.0, 600.0),
       warm: false,
     });
@@ -1988,6 +2317,7 @@ pub fn open_embedded_tab(
       app,
       kind: OpenKind::Main,
       url: None,
+      title: None,
       rect: (x, y, width, height),
       warm: false,
     },
@@ -2055,10 +2385,16 @@ pub fn warm_start_apps(
             app,
             kind: OpenKind::Main,
             url: None,
+            title: None,
             rect,
             warm: true,
           },
         );
+        // A preloaded app queues its remaining tabs the same way an opened one
+        // does, but nothing here goes through the queue drain that would
+        // otherwise finish the restore. Draining also marks the app as restored,
+        // which is what lets its state be saved again.
+        drain_pending_opens(&h);
       });
       // The controller creation above is synchronous, so this gap is what keeps
       // the window responsive while a whole workspace comes up.
@@ -2862,6 +3198,7 @@ mod runtime_swap_tests {
       },
       kind,
       url: Some("https://example.com/sub".to_string()),
+      title: None,
       rect: (0.0, 60.0, 800.0, 600.0),
       warm: false,
     }
@@ -2912,5 +3249,87 @@ mod runtime_swap_tests {
     assert_eq!(pending.url.as_deref(), Some("https://example.com/sub"));
     assert_eq!(pending.app.id, "app-test");
     assert_eq!(pending.kind, OpenKind::Sub);
+  }
+
+  /// A restored tab must arrive with its remembered title, or the strip shows the
+  /// app's name until the page loads and the reopen looks like it lost the page.
+  #[test]
+  fn a_restored_tab_keeps_the_title_it_was_saved_with() {
+    let mut pending = parked(OpenKind::Sub);
+    pending.title = Some("Google".to_string());
+    assert_eq!(pending.title.as_deref(), Some("Google"));
+  }
+}
+
+#[cfg(test)]
+mod restore_tests {
+  use super::{pick_saved, SavedRow};
+
+  fn row(id: &str, url: &str, detached: bool) -> SavedRow {
+    SavedRow {
+      id: id.to_string(),
+      url: url.to_string(),
+      title: format!("title-{id}"),
+      detached,
+    }
+  }
+
+  /// The reason a popup must be filtered out: reopening one would put a window
+  /// on screen the user had already dismissed.
+  #[test]
+  fn popups_are_not_remembered() {
+    let rows = [
+      row("main", "https://app.test", false),
+      row("t2", "https://sub.test", false),
+      row("t3", "https://popup.test", true),
+    ];
+    let (tabs, active) = pick_saved(&rows, "t2");
+    assert_eq!(tabs.len(), 2, "the popup must not be in the saved list");
+    assert_eq!(tabs[1].0, "https://sub.test");
+    assert_eq!(active, 1, "the active sub-tab is index 1 among the kept tabs");
+  }
+
+  /// A popup earlier in the list must not shift the active index onto the wrong
+  /// tab, which would restore the user onto the wrong page.
+  #[test]
+  fn a_popup_before_the_active_tab_does_not_shift_the_index() {
+    let rows = [
+      row("main", "https://app.test", false),
+      row("t2", "https://popup.test", true),
+      row("t3", "https://wanted.test", false),
+    ];
+    let (tabs, active) = pick_saved(&rows, "t3");
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(
+      tabs[active].0, "https://wanted.test",
+      "the remembered index must still name the tab the user was on"
+    );
+  }
+
+  /// With no active tab recorded, the first kept tab is the answer, which is what
+  /// the restore path falls back to.
+  #[test]
+  fn an_unknown_active_tab_falls_back_to_the_first_kept() {
+    let rows = [
+      row("main", "https://app.test", false),
+      row("t2", "https://sub.test", false),
+    ];
+    let (_, active) = pick_saved(&rows, "t9");
+    assert_eq!(active, 0);
+  }
+
+  /// The plain case the feature exists for: the pinned tab plus one sub-tab, with
+  /// the sub-tab on screen.
+  #[test]
+  fn the_pinned_tab_comes_first_and_the_sub_tab_second() {
+    let rows = [
+      row("main", "https://whatsapp.test", false),
+      row("t2", "https://google.test", false),
+    ];
+    let (tabs, active) = pick_saved(&rows, "t2");
+    assert_eq!(tabs[0].0, "https://whatsapp.test");
+    assert_eq!(tabs[0].1, "title-main", "the title is remembered too");
+    assert_eq!(tabs[1].0, "https://google.test");
+    assert_eq!(active, 1);
   }
 }

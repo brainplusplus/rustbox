@@ -10,6 +10,8 @@
 //!
 //! rustbox\
 //!   config.json             workspace config (apps, favorites, usage)
+//!   session.json            remembered open sub-tabs and their last URLs
+//!   logs\shell.log          release-build log (there is no console to print to)
 //!   EBWebView\              main-window webview data (Tauri default location)
 //!     WV2Profile_<app-id>\  per-app profile for `ProfileMode::Light`
 //!   profiles\<app-id>\      per-app profile for `ProfileMode::Isolated`

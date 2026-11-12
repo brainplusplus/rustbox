@@ -15,6 +15,7 @@ mod favicon;
 mod mcp;
 mod paths;
 mod proxy_auth;
+mod session;
 mod settings;
 mod tabs;
 mod webview2_skew;
@@ -843,6 +844,11 @@ fn main() {
             // out its read timeout.
             if matches!(event, tauri::RunEvent::Exit) {
                 mcp::remove_endpoint();
+                // Remembered tabs are written as they change, not on exit, so
+                // this only catches a change made inside the debounce window.
+                // It still matters: a clean quit is when a user expects their
+                // last tab to be exactly where they left it.
+                session::flush();
             }
         });
 }
