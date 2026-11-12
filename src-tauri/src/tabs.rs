@@ -88,6 +88,19 @@ impl Surface {
     }
   }
 
+  /// Whether the window is on screen.
+  ///
+  /// **Never call this while holding the tab registry.** `is_visible` posts a
+  /// message to the event loop and blocks until it answers
+  /// (`tauri-runtime-wry`'s `window_getter!`), and the main thread takes the
+  /// registry lock whenever it builds a tab. Reading it under that lock deadlocks
+  /// the whole app: the title bar said "Not Responding" and the `+` button
+  /// answered "cannot add a tab to an app that is not open", because
+  /// `add_sub_tab` runs on the blocked main thread.
+  ///
+  /// `list_tabs` therefore collects the surfaces under the lock and asks them
+  /// afterwards. `hwnd()` does not help as an alternative — it is a
+  /// `window_getter!` as well, which was verified the hard way.
   fn is_visible(&self) -> bool {
     self
       .as_window()
@@ -3222,6 +3235,9 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
     active: String,
     url: String,
     tabs: Vec<serde_json::Value>,
+    /// The window behind each entry in `tabs`, in the same order, so visibility
+    /// can be resolved after the registry lock is released.
+    surfaces: Vec<Surface>,
     console: (u64, usize),
     network: (u64, usize),
     surface: Surface,
@@ -3232,6 +3248,7 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
       // advertise a tab nobody can address.
       .filter(|(_, a)| !a.tabs.is_empty())
       .map(|(id, a)| {
+        let surfaces: Vec<Surface> = a.tabs.iter().map(|t| t.surface.clone()).collect();
         let tabs = a
           .tabs
           .iter()
@@ -3249,11 +3266,11 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
               // can switch to; saying so keeps a caller from activating it.
               "popup": t.detached,
               "active": t.id == a.active,
-              // Whether the window is actually on screen. Distinct from `active`:
-              // a tab can be the active one and still be hidden, which is a bug
-              // in whatever hid it — and the only way to see that from a script
-              // instead of guessing from the UI.
-              "visible": t.surface.is_visible(),
+              // Whether the window is actually on screen. Filled in below, after
+              // the registry lock is released: asking a window posts to the event
+              // loop and waits, and the main thread takes this same lock when it
+              // builds a tab, so doing it here deadlocks the whole app.
+              "visible": false,
               "console": { "cursor": console.0, "buffered": console.1 },
               "network": { "cursor": network.0, "buffered": network.1 },
             })
@@ -3267,6 +3284,7 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
           active: a.active.clone(),
           url: shown.url.clone(),
           tabs,
+          surfaces,
           console: logs.console.lock().map(|b| (b.cursor(), b.len())).unwrap_or((0, 0)),
           network: logs.network.lock().map(|b| (b.cursor(), b.len())).unwrap_or((0, 0)),
           surface: shown.surface.clone(),
@@ -3277,10 +3295,16 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
   let out: Vec<serde_json::Value> = rows
     .into_iter()
     .map(|row| {
-      // `visible` is a cheap window flag, not a webview round trip, so it is
-      // safe to read here; the URL and title come from the cache for the reason
-      // documented on `SubTab`.
+      // Everything below is outside the registry lock, which is what makes these
+      // reads safe: `is_visible` waits for the main thread, and the main thread
+      // waits for that lock when it builds a tab.
       let visible = row.surface.is_visible();
+      let mut tabs = row.tabs;
+      for (entry, surface) in tabs.iter_mut().zip(row.surfaces.iter()) {
+        if let Some(obj) = entry.as_object_mut() {
+          obj.insert("visible".to_string(), serde_json::json!(surface.is_visible()));
+        }
+      }
       serde_json::json!({
         "appId": row.app_id,
         // The active sub-tab: what the user is looking at, and what every call
@@ -3288,8 +3312,8 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
         "tabId": row.active,
         "url": row.url,
         "visible": visible,
-        "tabs": row.tabs.len(),
-        "subTabs": row.tabs,
+        "tabs": tabs.len(),
+        "subTabs": tabs,
         // `cursor` is the total ever seen, `buffered` how many are still held.
         // When they differ, older entries have been dropped by the cap.
         "console": { "cursor": row.console.0, "buffered": row.console.1 },
@@ -3681,5 +3705,69 @@ mod restore_tests {
     assert_eq!(tabs[0].1, "title-main", "the title is remembered too");
     assert_eq!(tabs[1].0, "https://google.test");
     assert_eq!(active, 1);
+  }
+}
+
+/// Guards against reintroducing the deadlock that froze the whole app.
+///
+/// `list_tabs` reads the tab registry while holding `OPEN_TABS`, and the main
+/// thread takes that lock whenever it builds a tab. Anything that waits for the
+/// event loop inside that window deadlocks: the reader waits for the event loop,
+/// the event loop waits for the lock. The visible result was a window whose title
+/// bar said "Not Responding" and a `+` button answering "cannot add a tab to an
+/// app that is not open", because `add_sub_tab` runs on the blocked main thread.
+///
+/// `is_visible()` was exactly that — `window_getter!` posts a message and blocks
+/// on `rx.recv()`. It cannot be removed from the API, so this test checks the
+/// property the type system cannot: inside the locked section, `list_tabs` calls
+/// nothing that dispatches to the event loop. It collects the surfaces there and
+/// asks them once the lock is released.
+#[cfg(test)]
+mod registry_lock_tests {
+  #[test]
+  fn reading_the_tab_registry_never_waits_on_the_event_loop() {
+    // The source is the only place the call graph is visible, and the bug is a
+    // single stray call, so the check is textual on purpose.
+    let src = include_str!("tabs.rs");
+    // The file is checked out with CRLF, so the search normalizes first: matching
+    // on `\n` silently found nothing and made this test fail for the wrong
+    // reason when it was first written.
+    let src = src.replace("\r\n", "\n");
+    // Anchored on the attribute line so the search cannot start inside this
+    // test's own text, which contains the very strings it forbids.
+    let start = src
+      .find("#[tauri::command]\npub fn list_tabs()")
+      .expect("list_tabs must exist");
+    let body = &src[start..];
+    // Cut at the first top-level closing brace after the signature, which is the
+    // end of the function: the rest of the file (including this test) follows.
+    let end = body.find("\n}\n").expect("list_tabs must end");
+    let body = &body[..end];
+
+    // The lock is held for the closure passed to `tabs(..)`. Everything before
+    // that first `let out` is inside it.
+    let locked = &body[..body.find("let out").expect("list_tabs builds `out`")];
+    for forbidden in [
+      ".is_visible()",     // dispatcher round trip
+      ".hwnd()",           // also a dispatcher round trip
+      ".title()",          // dispatcher round trip
+      ".url()",            // dispatcher round trip
+      ".inner_position()", // dispatcher round trip
+      ".outer_position()", // dispatcher round trip
+      ".scale_factor()",   // dispatcher round trip
+    ] {
+      assert!(
+        !locked.contains(forbidden),
+        "list_tabs calls {forbidden} while OPEN_TABS is held, which blocks on the \
+         event loop; that deadlocks against the main thread building a tab. \
+         Collect the window and query it after the lock is released."
+      );
+    }
+    // The windows must be collected under the lock and queried after it.
+    assert!(
+      body.contains("surfaces"),
+      "list_tabs must carry the surfaces out of the lock and read their \
+       visibility afterwards, instead of asking a window while the registry is held"
+    );
   }
 }
