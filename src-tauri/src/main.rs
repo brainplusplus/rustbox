@@ -762,6 +762,12 @@ fn main() {
                 });
                 let h = handle.clone();
                 main.on_window_event(move |e| {
+                    // Set before anything else: the quit that follows destroys the
+                    // tab windows, and their teardown must not rewrite the
+                    // remembered tabs with the shrinking list it leaves behind.
+                    if matches!(e, tauri::WindowEvent::CloseRequested { .. }) {
+                        tabs::begin_quit();
+                    }
                     if tabs::trace_focus() {
                         if let tauri::WindowEvent::Focused(focused) = e {
                             tabs::trace_line(&format!("trace focus main focused={focused}"));
@@ -848,6 +854,12 @@ fn main() {
                 // this only catches a change made inside the debounce window.
                 // It still matters: a clean quit is when a user expects their
                 // last tab to be exactly where they left it.
+                //
+                // Nothing is remembered from here on: by the time `Exit` fires the
+                // tab windows have been destroyed, so the registry no longer holds
+                // the tabs the user closed with. `flush` writes only what was
+                // already accumulated, never what teardown left behind.
+                tabs::begin_quit();
                 session::flush();
             }
         });

@@ -641,6 +641,33 @@ fn is_restoring(app_id: &str) -> bool {
     .any(|id| id == app_id)
 }
 
+/// Whether the app is on its way out.
+///
+/// Set the moment the main window is asked to close, and never cleared: the
+/// process is ending, so there is no later state worth recording.
+///
+/// This exists because closing RustBox normally destroys every tab window, and
+/// each of those runs the `Destroyed` cleanup that removes the tab from the
+/// registry and then redraws the strip. With the strip redraw also being the save
+/// point, a graceful quit walked the session down tab by tab and ended with the
+/// app gone — so the tabs came back only after a *forced* kill, which skips
+/// teardown, and vanished after a normal close, which is how people actually quit.
+/// Measured: two tabs before `WM_CLOSE`, one tab on disk after.
+///
+/// The tabs a user has when they close the app are the tabs they expect back, so
+/// nothing after this flag is set is allowed to overwrite the memory.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the app is closing, so teardown stops writing the session.
+pub fn begin_quit() {
+  QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether teardown has started.
+fn is_quitting() -> bool {
+  QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Drain queued tab opens. Must run on the main thread OUTSIDE any IPC
 /// handler (we get there by scheduling this as a fresh main-thread task
 /// after the handler returns).
@@ -1844,6 +1871,17 @@ fn app_by_id(handle: &tauri::AppHandle, app_id: &str) -> Option<App> {
   cfg.apps.iter().find(|a| a.id == app_id).cloned()
 }
 
+/// Whether the remembered tabs may be overwritten right now.
+///
+/// Pure so both refusal cases can be tested without an `AppHandle`. Two things
+/// make the current registry an unfaithful picture of what the user expects back:
+/// the app is quitting (every tab is being torn down, so the list is only ever
+/// shrinking), or this app is still being rebuilt (the list is only ever growing).
+/// Saving in either window records a half-truth as the final answer.
+fn may_remember(quitting: bool, restoring: bool) -> bool {
+  !quitting && !restoring
+}
+
 /// Remember an app's open tabs so they come back on the next launch.
 ///
 /// Called from every point that changes what the user would expect to find after
@@ -1860,7 +1898,10 @@ fn app_by_id(handle: &tauri::AppHandle, app_id: &str) -> Option<App> {
 /// loss; turning it into an error dialog or a failed tab open is a large, visible
 /// one, and the tab in front of the user is what matters at that moment.
 fn remember_tabs(handle: &tauri::AppHandle, app_id: &str) {
-  if is_restoring(app_id) {
+  // Closing the app tears down every tab window, and each teardown removes that
+  // tab from the registry. Saving then would record the shrinking list and lose
+  // exactly the tabs the user closed the app with.
+  if !may_remember(is_quitting(), is_restoring(app_id)) {
     return;
   }
   let (tabs, active) = saved_tabs_of(app_id);
@@ -2261,6 +2302,9 @@ fn app_name(handle: &tauri::AppHandle, app_id: &str) -> Option<String> {
 #[tauri::command]
 pub fn restart_after_runtime_swap(handle: tauri::AppHandle) {
   shell_log("restart confirmed by user to move to the new webview2 runtime");
+  // Same reason as a normal quit: the restart destroys every tab window, and
+  // their teardown must not record the emptied registry as the user's layout.
+  begin_quit();
   handle.restart();
 }
 
@@ -3263,7 +3307,7 @@ mod runtime_swap_tests {
 
 #[cfg(test)]
 mod restore_tests {
-  use super::{pick_saved, SavedRow};
+  use super::{may_remember, pick_saved, SavedRow};
 
   fn row(id: &str, url: &str, detached: bool) -> SavedRow {
     SavedRow {
@@ -3316,6 +3360,29 @@ mod restore_tests {
     ];
     let (_, active) = pick_saved(&rows, "t9");
     assert_eq!(active, 0);
+  }
+
+  /// The reported bug: closing RustBox normally lost the sub-tab, because the
+  /// teardown of each tab window rewrote the session with the shrinking list.
+  #[test]
+  fn closing_the_app_never_overwrites_the_remembered_tabs() {
+    assert!(
+      !may_remember(true, false),
+      "a quit destroys every tab window; saving then records an emptying list"
+    );
+  }
+
+  /// The other half-truth: a restore is incremental, so saving mid-flight records
+  /// "this app has one tab" and a crash there would make it permanent.
+  #[test]
+  fn a_restore_in_progress_is_not_saved_over() {
+    assert!(!may_remember(false, true));
+  }
+
+  /// The normal case must still save, or the feature would be a no-op.
+  #[test]
+  fn an_ordinary_change_is_remembered() {
+    assert!(may_remember(false, false));
   }
 
   /// The plain case the feature exists for: the pinned tab plus one sub-tab, with
