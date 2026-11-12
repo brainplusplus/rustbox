@@ -1400,9 +1400,16 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     // the OS is the only answer that does anything, and a chooser would be a
     // dialog with one real option.
     if !crate::external::is_web_scheme(url.as_str()) {
-      if let Err(e) = crate::external::open_in_default_browser(url.as_str()) {
-        emit_tab_error(&link_handle, &format!("could not open the link: {e}"));
-      }
+      // Off the callback, like every other hand-off: this runs inside WebView2's
+      // new-window dispatch, and `ShellExecuteW` blocks for a few hundred
+      // milliseconds while the shell starts the handler.
+      let h = link_handle.clone();
+      let target = url.to_string();
+      std::thread::spawn(move || {
+        if let Err(e) = crate::external::open_in_default_browser(&target) {
+          emit_tab_error(&h, &format!("could not open the link: {e}"));
+        }
+      });
       return NewWindowResponse::Deny;
     }
     match current_link_target(&link_handle, &link_app) {
@@ -1646,15 +1653,6 @@ fn show_link_chooser(handle: &tauri::AppHandle, app_id: &str, from_tab: &str, ur
 /// same deferred way the context menu is, for the same wry#583 reason.
 fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &str) {
   use tauri::Manager;
-  // One chooser at a time: a second link click replaces the first question
-  // rather than stacking dialogs the user has to dismiss one by one. Every
-  // label starts with the same prefix, so this sweeps up any that are still
-  // closing as well as the visible one.
-  for (label, win) in handle.webview_windows() {
-    if label.starts_with("link-choice") {
-      let _ = win.close();
-    }
-  }
   let Some(main) = handle.get_webview_window("main") else {
     return;
   };
@@ -1666,6 +1664,11 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
   let h0 = handle.clone();
   let app_id = app_id.to_string();
   let url = url.to_string();
+  // Timed because the user-visible cost of a link click is this window: nothing
+  // appears until the chooser is built, and a build is the one part of the path
+  // that cannot be made free. The number says whether the cost is the close of
+  // the previous chooser, the webview build, or neither.
+  let start = std::time::Instant::now();
   std::thread::spawn(move || {
     std::thread::sleep(std::time::Duration::from_millis(80));
     let h2 = h0.clone();
@@ -1673,6 +1676,22 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
       let Some(mwin) = h2.get_webview_window("main") else {
         return;
       };
+      // Closing the previous chooser is done here, on a fresh main-thread task,
+      // and not at the call site. `show_link_chooser` runs inside WebView2's
+      // new-window dispatch, and destroying a WebView2 controller from there
+      // re-enters the browser before it has answered — the same re-entrancy the
+      // `Same` branch above avoids by deferring. It showed up as a stall
+      // between clicking a link and the chooser appearing.
+      //
+      // One chooser at a time: a second click replaces the first question rather
+      // than stacking dialogs to dismiss one by one. Every label starts with the
+      // same prefix, so this sweeps up any that are still closing as well.
+      for (label, win) in h2.webview_windows() {
+        if label.starts_with("link-choice") {
+          let _ = win.close();
+        }
+      }
+      let closed_after = start.elapsed();
       // The URL travels in the query string rather than through a second IPC
       // round trip: the page needs it before it can lay itself out, and an
       // async fetch would show the dialog with a blank link line first.
@@ -1737,7 +1756,16 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
           let _ = win.set_focus();
           // Paired with the failure line below so a repro can tell "the click
           // never reached the handler" apart from "the chooser failed".
-          shell_log(&format!("link chooser {label} opened for {app_id}"));
+          // The timings say where the click-to-dialog delay goes: `close` is the
+          // previous chooser being torn down, `build` is the new webview. Both
+          // run on the main thread, so together they are the freeze the user
+          // sees after clicking a link.
+          shell_log(&format!(
+            "link chooser {label} opened for {app_id} \
+             (closed previous at {} ms, built at {} ms)",
+            closed_after.as_millis(),
+            start.elapsed().as_millis()
+          ));
         }
         Err(e) => {
           shell_log(&format!(
@@ -1790,7 +1818,13 @@ pub fn resolve_link_choice(
     target,
   );
   // The answer is delivered; the dialog has nothing left to say.
-  close_choice_window(&app_handle);
+  //
+  // Closed on a fresh main-thread task rather than right here. This command runs
+  // *inside* the chooser's own webview, so closing it synchronously destroys the
+  // WebView2 controller while it is still executing the IPC call that asked for
+  // the close — the same re-entrancy that made the dialog feel frozen on the way
+  // in. Deferring lets the reply reach the page first.
+  close_choice_window_deferred(&app_handle);
   Ok(())
 }
 
@@ -1801,7 +1835,10 @@ pub fn dismiss_link_choice(id: Option<u64>, app_handle: tauri::AppHandle) -> Res
     let mut queue = PENDING_LINKS.lock().unwrap();
     queue.retain(|p| p.id != id);
   }
-  close_choice_window(&app_handle);
+  // Deferred for the same reason as the answered case: this runs inside the
+  // chooser's own webview, and closing it here would destroy the controller
+  // serving the call.
+  close_choice_window_deferred(&app_handle);
   Ok(())
 }
 
@@ -1857,6 +1894,20 @@ fn close_choice_window(handle: &tauri::AppHandle) {
       let _ = win.close();
     }
   }
+}
+
+/// Tear down the chooser after the current IPC call has been answered.
+///
+/// Used from `resolve_link_choice`/`dismiss_link_choice`, which are invoked *by*
+/// the chooser webview: destroying its controller inside that call re-enters
+/// WebView2 before it has returned, which is the kind of re-entrancy the comment
+/// above the `Same` branch warns about.
+fn close_choice_window_deferred(handle: &tauri::AppHandle) {
+  let h = handle.clone();
+  std::thread::spawn(move || {
+    let h2 = h.clone();
+    let _ = h.run_on_main_thread(move || close_choice_window(&h2));
+  });
 }
 
 /// Forget one parked question by id.
@@ -1934,9 +1985,19 @@ fn perform_link_action(
       // Nothing to do in the tab: the link leaves the app entirely. The launch
       // is fire-and-forget, so a browser that fails to start reports through the
       // error strip instead of silently eating the click.
-      if let Err(e) = crate::external::open_in_default_browser(url) {
-        emit_tab_error(handle, &format!("could not open the link: {e}"));
-      }
+      //
+      // On a thread of its own: `ShellExecuteW` hands the URL to another process
+      // and blocks until the shell has answered, which measured ~380 ms on a
+      // cold start. This runs inside a Tauri command, and a synchronous command
+      // runs on the main thread, so doing it inline froze the window at exactly
+      // the moment the user clicked a link.
+      let h = handle.clone();
+      let url = url.to_string();
+      std::thread::spawn(move || {
+        if let Err(e) = crate::external::open_in_default_browser(&url) {
+          emit_tab_error(&h, &format!("could not open the link: {e}"));
+        }
+      });
     }
     LinkTarget::Same => {
       // Navigating from inside WebView2's new-window dispatch re-enters the

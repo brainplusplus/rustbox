@@ -48,6 +48,13 @@ windows-sys = { version = "0.61", features = [
     # Reading the WebView2 `BrowserExecutableFolder` policy, so a runtime pin
     # never overrides a folder an administrator deliberately selected.
     "Win32_System_Registry",
+    # Handing a link to the OS default browser. `ShellExecuteW` takes the URL as
+    # one wide string and does no command-line re-parsing, which is what makes a
+    # URL containing `&` survive the trip. `cmd /C start` cannot: it re-parses
+    # the line itself (see `external::open_with_default`).
+    "Win32_UI_Shell",
+    # `SW_SHOWNORMAL`, plus the `SetWindowPos` raise used when a tab is shown.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

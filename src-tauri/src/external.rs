@@ -988,21 +988,102 @@ fn first_chromium_browser() -> Option<String> {
     None
 }
 
-/// Quote a URL so `cmd.exe` treats it as one argument.
+/// Check a URL before handing it to the OS as one plain string.
 ///
-/// `cmd /C start "" <url>` re-parses the command line itself, and Rust only
-/// quotes an argument when it contains a space. A URL with `&` therefore ended
-/// at the `&`, and `start` opened a truncated address while the rest of the URL
-/// ran as a second command. Wrapping the URL in quotes keeps `&` literal; a
-/// quote or a control character inside the URL would break out of that, so it is
-/// refused instead.
-pub(crate) fn windows_start_url(url: &str) -> Result<String, String> {
-    if url.contains('"') || url.chars().any(char::is_control) {
+/// [`ShellExecuteW`] receives the URL as a single wide string and performs no
+/// command-line parsing of its own, so `&`, `%`, `?` and `=` are literal and
+/// need no quoting at all. What is still refused is a control character: no
+/// real link contains one, and a value that does came from something other than
+/// a URL.
+///
+/// This used to wrap the URL in quotes for `cmd /C start`. That was wrong in a
+/// way the test suite did not catch: Rust escapes an argument's embedded quotes
+/// for `CreateProcess`, so `cmd.exe` received `\"https://…\"`. `cmd` has no
+/// backslash escape, so `start` was handed a path beginning with `\` and
+/// answered "The system cannot find the file \https://…", while `&` split the
+/// query string off as a second command. Dropping `cmd` removes the whole
+/// re-parsing layer rather than trying to quote through it.
+///
+/// [`ShellExecuteW`]: https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shellexecutew
+pub(crate) fn windows_shell_url(url: &str) -> Result<&str, String> {
+    if url.chars().any(char::is_control) {
         return Err(format!(
-            "refusing to hand a URL with a quote or control character to the shell: {url}"
+            "refusing to hand a URL with a control character to the shell: {url}"
         ));
     }
-    Ok(format!("\"{url}\""))
+    Ok(url)
+}
+
+/// Encode a URL as the NUL-terminated UTF-16 string `ShellExecuteW` expects.
+///
+/// Split out so a test can assert the exact bytes the shell would receive:
+/// the previous hand-off was wrong in the encoding step, and a test that only
+/// looked at the output of a spawned process could not see it.
+pub(crate) fn windows_wide_url(url: &str) -> Vec<u16> {
+    url.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Build the exact string `ShellExecuteW` will receive for `url`.
+///
+/// This is the step the old hand-off got wrong, so it is one function that both
+/// the call and the test go through: a test of the pieces separately could pass
+/// while the composition still added quotes.
+pub(crate) fn windows_shell_payload(url: &str) -> Result<Vec<u16>, String> {
+    Ok(windows_wide_url(windows_shell_url(url)?))
+}
+
+/// Hand a URL to the OS default browser through `ShellExecuteW`.
+///
+/// The return value is a fake `HINSTANCE`: anything above 32 is success, and
+/// the values at or below it are `SE_ERR_*` codes, so a hand-off that quietly
+/// failed is reported instead of looking like it worked.
+#[cfg(target_os = "windows")]
+fn shell_execute_open(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide = windows_shell_payload(url)?;
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call; the three
+    // unused parameters are documented as optional and passed as null.
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = rc as isize;
+    if code <= 32 {
+        return Err(format!(
+            "the OS refused to open {url}: {}",
+            shell_execute_error(code)
+        ));
+    }
+    Ok(())
+}
+
+/// Name the `ShellExecuteW` failure code, so the message says what went wrong.
+#[cfg(target_os = "windows")]
+fn shell_execute_error(code: isize) -> &'static str {
+    match code {
+        0 => "out of memory",
+        2 => "the file was not found",
+        3 => "the path was not found",
+        5 => "access denied",
+        8 => "out of memory",
+        26 => "sharing violation",
+        27 => "the file association is incomplete or invalid",
+        28 => "the DDE transaction timed out",
+        29 => "the DDE transaction failed",
+        30 => "another program is using the file in an incompatible way",
+        31 => "no application is associated with this file type",
+        32 => "the required DLL was not found",
+        _ => "the shell reported an error",
+    }
 }
 
 fn open_with_default(url: &str) -> Result<(), String> {
@@ -1025,14 +1106,7 @@ fn open_with_default(url: &str) -> Result<(), String> {
     ));
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let quoted = windows_start_url(url)?;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &quoted])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        shell_execute_open(url)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1379,38 +1453,42 @@ mod tests {
     }
 
     #[test]
-    fn a_url_with_an_ampersand_is_quoted_for_cmd() {
-        // `&` is a command separator in `cmd.exe`, and Rust does not quote an
-        // argument that has no space in it. Unquoted, `cmd /C start "" <url>`
-        // opened `https://example.com/?a=1` and then ran `b=2` as a command.
-        assert_eq!(
-            windows_start_url("https://example.com/?a=1&b=2").as_deref(),
-            Ok("\"https://example.com/?a=1&b=2\"")
+    fn the_url_reaches_the_shell_byte_for_byte() {
+        // The bug this replaces: the URL used to be wrapped in quotes for
+        // `cmd.exe`, Rust escaped those quotes for `CreateProcess`, and `cmd`
+        // handed `start` a path beginning with `\`, so Windows answered "The
+        // system cannot find the file \https://…". The query string then ran as
+        // a second command. `ShellExecuteW` takes the URL as one string, so the
+        // invariant is equality, not "contains the query".
+        let url = "https://example.com/?a=1&b=2";
+        // Goes through the same composition the real call uses, so a quote
+        // added back at either step fails here.
+        let wide = windows_shell_payload(url).expect("payload");
+        assert_eq!(wide.last(), Some(&0), "not NUL-terminated");
+        let decoded = String::from_utf16(&wide[..wide.len() - 1]).expect("utf-16");
+        assert_eq!(decoded, url, "the shell would receive a different URL");
+        assert!(
+            !decoded.contains('"') && !decoded.contains('\\'),
+            "the URL was quoted or escaped again: {decoded:?}"
         );
     }
 
     #[test]
     fn a_url_that_would_break_out_of_the_quotes_is_refused() {
-        assert!(windows_start_url("https://x/?a=\"b\"").is_err());
-        assert!(windows_start_url("https://x/\r\ncalc").is_err());
+        // A quote is now legal (nothing parses it), but a control character is
+        // still a sign the value did not come from a URL.
+        assert!(windows_shell_url("https://x/?a=\"b\"").is_ok());
+        assert!(windows_shell_url("https://x/\r\ncalc").is_err());
+        assert!(windows_shell_url("https://x/\0").is_err());
     }
 
-    /// Runs `cmd` for real: the quoting is only correct if `cmd.exe` agrees.
-    /// `echo` stands in for `start` so no browser window opens during a test.
-    #[cfg(target_os = "windows")]
     #[test]
-    fn cmd_keeps_a_quoted_url_in_one_piece() {
-        let url = "https://example.com/?a=1&b=2";
-        let quoted = windows_start_url(url).expect("quoted");
-        let out = std::process::Command::new("cmd")
-            .args(["/C", "echo", "", &quoted])
-            .output()
-            .expect("cmd runs");
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            text.contains("a=1&b=2"),
-            "cmd split the URL instead of passing it through: {text:?}"
-        );
+    fn a_url_is_passed_through_without_adding_quotes() {
+        // `&` used to be the failure case because `cmd.exe` treated it as a
+        // command separator. Nothing may be added around the URL.
+        let url = "https://drive.google.com/file/d/1KC6bZ2?usp=sharing&x=1";
+        assert_eq!(windows_shell_url(url), Ok(url));
+        assert!(!windows_shell_url(url).unwrap().contains('"'));
     }
 
     #[test]
