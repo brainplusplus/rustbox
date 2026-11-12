@@ -3023,9 +3023,6 @@ function hideStrip() {
 
 $('#tab-error-close').addEventListener('click', () => {
   hideStrip();
-  // Dismissing the runtime-swap prompt has to drop the held-back tab too,
-  // otherwise the next click would silently reuse a stale request.
-  invoke('dismiss_runtime_swap').catch(() => {});
 });
 $('#btn-cancel').addEventListener('click', closeModal);
 $('#btn-save').addEventListener('click', saveModal);
@@ -3171,31 +3168,24 @@ document.addEventListener('keydown', (e) => { if (e.key === 'F12') invoke('open_
     const text = String(event.payload || 'The tab could not be opened.');
     showStrip(text, 'error');
   });
-  // Windows updated the WebView2 runtime while RustBox was running, so the app
-  // cannot create the tab the user just asked for. The backend has already held
-  // that request back; this asks what to do instead of failing with an HRESULT
-  // the user cannot act on.
+  // Windows updated the WebView2 runtime while RustBox was running. This is
+  // informational: RustBox is pinned to the runtime it started on, so the tab
+  // that triggered this opens normally and every later one will too. The only
+  // thing a restart buys is moving to the newer runtime.
   listen('runtime-swap', (event) => {
     const p = event.payload || {};
     const name = p.appName || p.appId || 'this app';
+    const running = p.pinned || p.from;
     showStrip(
-      `Could not open ${name}. Windows updated its WebView2 runtime to ${p.to} ` +
-        `while RustBox was running on ${p.from}, and a running app cannot switch ` +
-        `to the new one. Restarting fixes it: your apps reopen, and logins are ` +
-        `kept, but extra tabs inside an app start over.`,
-      'warn',
+      `Windows updated its WebView2 runtime to ${p.to}. RustBox keeps running ` +
+        `on ${running}, so ${name} and every other tab still open normally. ` +
+        `Restart when convenient to move to ${p.to}: apps reopen and logins ` +
+        `are kept, but extra tabs inside an app start over.`,
+      'info',
       [
         {
-          label: 'Restart RustBox',
-          primary: true,
+          label: 'Restart now',
           run: () => invoke('restart_after_runtime_swap').catch(() => {}),
-        },
-        {
-          // Kept because the detection is a guess about the filesystem: if it is
-          // wrong, this tab opens normally and the user is not blocked by a false
-          // alarm. If it is right, they get the real error and can restart.
-          label: 'Open anyway',
-          run: () => invoke('open_blocked_tab').catch(() => {}),
         },
       ],
     );

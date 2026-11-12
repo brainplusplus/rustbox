@@ -59,7 +59,9 @@ pub struct App {
   win is not "Chromium instead of Chromium" — Windows already has Chromium
   through WebView2 — but escaping the WebView2 runtime-skew failure class
   (`RPC_E_DISCONNECTED`, `webview2_skew.rs`) and presenting a plain Chromium
-  identity rather than Edge.
+  identity rather than Edge. ADR 0006 reduces the urgency of the first half: that
+  failure class is now handled by pinning the runtime, so CEF no longer has to
+  justify itself on stability alone.
 - macOS ships as **two dmgs (arm64, x64)**, not one universal dmg: a universal
   binary cannot carry a `lipo`-merged CEF framework (decided 2026-11-10).
 

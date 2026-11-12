@@ -649,6 +649,21 @@ fn main() {
     // against the runtime this process actually started on, not against "now".
     webview2_skew::mark_started();
 
+    // Freeze the runtime choice before the first webview exists. Without this,
+    // every later `CreateCoreWebView2EnvironmentWithOptions` resolves the newest
+    // folder on disk, so a runtime Windows installs mid-session makes the next
+    // tab ask a live browser process for a version it is not running and fail
+    // with RPC_E_DISCONNECTED. Pinned, tabs keep opening on the version this
+    // process started with; the UI offers a restart to move to the new one.
+    #[cfg(windows)]
+    match webview2_skew::pin_runtime_to_startup_version() {
+        Some(pin) => eprintln!(
+            "[rustbox] webview2 runtime pinned to {}",
+            pin.version
+        ),
+        None => eprintln!("[rustbox] webview2 runtime not pinned: letting the loader choose"),
+    }
+
     tauri::Builder::default()
         .manage(AppState::new(config_path))
         .invoke_handler(tauri::generate_handler![
@@ -691,8 +706,6 @@ fn main() {
             tabs::emit_ctx_action,
             tabs::resize_tabs,
             tabs::restart_after_runtime_swap,
-            tabs::open_blocked_tab,
-            tabs::dismiss_runtime_swap,
             favicon::fetch_favicon,
             mcp_state,
             set_mcp_enabled,

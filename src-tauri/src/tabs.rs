@@ -550,7 +550,7 @@ pub fn sync_all_tabs(handle: &tauri::AppHandle) {
 }
 
 /// What a queued open is for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OpenKind {
   /// The app's pinned first tab.
   Main,
@@ -566,10 +566,6 @@ enum OpenKind {
 /// A named type rather than a five-tuple because the four floats are
 /// indistinguishable at the call site, and mixing up `width` and `height` there
 /// is a bug that renders as a mis-sized window rather than an error.
-///
-/// `Clone` because the runtime-swap pre-flight has to park the request while the
-/// user decides, and still build it if they say yes.
-#[derive(Clone)]
 struct PendingOpen {
   app: App,
   kind: OpenKind,
@@ -592,19 +588,14 @@ struct PendingOpen {
 /// deferred `run_on_main_thread` task (safe context, same as app setup).
 static PENDING_OPENS: Mutex<Vec<PendingOpen>> = Mutex::new(Vec::new());
 
-/// The open the runtime-swap prompt is holding back.
+/// Whether the runtime-update notice has been shown in this session.
 ///
-/// Kept so the user's answer can act on the exact request that was refused,
-/// instead of re-deriving it from the app id and guessing.
-static BLOCKED_OPEN: Mutex<Option<PendingOpen>> = Mutex::new(None);
-
-/// Set while replaying a parked open, so the pre-flight lets it through.
-///
-/// A one-shot flag rather than a parameter because the check sits in
-/// `build_tab_window`, which every open path funnels through; threading an
-/// "already asked" argument through all of them would put the decision in nine
-/// places instead of one.
-static SWAP_BYPASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Once per session, not once per tab: the news does not change between tabs,
+/// and repeating it on every open would train the user to ignore it. The notice
+/// is informational — tabs open regardless — so there is nothing to act on more
+/// than once.
+static SWAP_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// Drain queued tab opens. Must run on the main thread OUTSIDE any IPC
 /// handler (we get there by scheduling this as a fresh main-thread task
@@ -640,26 +631,31 @@ fn schedule_open(handle: &tauri::AppHandle, pending: PendingOpen) {
 }
 
 
-/// Whether an open request should be held back and asked about.
+/// Whether this open should be the one that mentions a pending runtime update.
 ///
-/// Pure so the cases can be tested without an `AppHandle`: these inputs are the
-/// whole decision, and getting any of them wrong either blocks a working tab (a
-/// false alarm the user cannot explain) or lets a doomed build run.
-fn hold_for_skew(reveals_existing: bool, bypass: bool, warm: bool, skew_present: bool) -> bool {
-  // Revealing an app that is already open creates no webview, so it cannot be
-  // affected by a swap and must never prompt.
+/// Pure so the cases can be tested without an `AppHandle`. The notice is not a
+/// gate — the tab opens either way — so the only cost of getting this wrong is
+/// noise: telling the user about an update they cannot act on right now, or
+/// never telling them at all.
+fn should_announce_swap(
+  reveals_existing: bool,
+  already_announced: bool,
+  warm: bool,
+  skew_present: bool,
+) -> bool {
+  // Revealing an app that is already open creates no webview, so it has nothing
+  // to do with the runtime and must stay silent.
   if reveals_existing {
     return false;
   }
-  // The user was already asked and said to go ahead.
-  if bypass {
+  // Said once per session: repeating it on every tab is what makes a notice
+  // invisible.
+  if already_announced {
     return false;
   }
-  // A warm build is speculative: it exists so the first click on an app feels
-  // instant, and nobody asked for it. Prompting here would fire once per app at
-  // startup, and the prompt that survived would name an app the user never
-  // clicked while "Open anyway" opened that same unwanted tab. The app they do
-  // click arrives through the non-warm path and asks then.
+  // A warm build is speculative: it runs at startup for apps nobody clicked.
+  // The notice names the app the user just opened, so announcing here would
+  // point at the wrong one. Their real click arrives through the non-warm path.
   if warm {
     return false;
   }
@@ -673,7 +669,7 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     url: requested,
     rect: (x, y, width, height),
     warm,
-  } = pending.clone();
+  } = pending;
   if app.engine != Engine::OsWebview || !app.enabled {
     return;
   }
@@ -683,34 +679,41 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     *CONTENT_RECT.lock().unwrap() = (x, y, width, height);
   }
 
-  // Ask before building when the runtime was swapped under this process.
+  // The pin names a folder on disk, and Windows may have deleted that version
+  // since launch. Checking before the build — rather than after it fails — keeps
+  // the tab from ever reaching a WebView2 call that would fail, and avoids a
+  // retry that would have to re-register the same window label.
+  #[cfg(windows)]
+  if crate::webview2_skew::pinned_folder_missing() {
+    crate::webview2_skew::clear_runtime_pin();
+    shell_log(&format!(
+      "pinned webview2 runtime is gone; {app_id} falls back to the installed one"
+    ));
+  }
+
+  // Mention a runtime update once, then build anyway.
   //
-  // The build would fail with a bare `HRESULT(0x80010108)` that says nothing
-  // about the real cause, so the check runs *before* the attempt and the request
-  // is parked rather than dropped. The prompt names the app the user clicked and
-  // offers the two answers that exist: restart now, or try this tab anyway.
+  // This used to withhold the tab and ask whether to restart. That was the wrong
+  // trade: the restart is the only way to *use* the new runtime, not a
+  // precondition for opening a tab, and holding the request hostage turned an
+  // informational event into a blocker. The pin (see `webview2_skew`) already
+  // keeps this build on the version the process started with, so the notice is
+  // the only thing left to do here.
   //
-  // Nothing restarts on its own. The user may be mid-task in another app, and a
-  // window that vanishes and reappears by itself reads as a crash.
-  //
-  // Revealing an app that is already open creates no webview, so it is exempt:
-  // that path keeps working during a swap and prompting there would be noise.
-  // Placed before the tab id is minted, so a parked open cannot burn a sub-tab
-  // number that never became a window.
+  // Revealing an app that is already open creates no webview, so it is exempt.
   let reveals_existing = kind == OpenKind::Main && tabs(|m| m.contains_key(&app_id));
-  let bypass = SWAP_BYPASS.swap(false, std::sync::atomic::Ordering::SeqCst);
-  // Reading three directory entries once per open is negligible, and fetching it
-  // unconditionally keeps `hold_for_skew` the single authority on the decision.
+  let already_announced = SWAP_NOTICE_SHOWN.load(std::sync::atomic::Ordering::SeqCst);
+  // Reading a few directory entries once per open is negligible, and fetching it
+  // unconditionally keeps `should_announce_swap` the single authority.
   let skew = crate::webview2_skew::current_skew();
-  if hold_for_skew(reveals_existing, bypass, warm, skew.is_some())
+  if should_announce_swap(reveals_existing, already_announced, warm, skew.is_some())
     && let Some(skew) = skew
   {
+    SWAP_NOTICE_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
     // The log gets the sentence, not just the versions: whoever reads it later
-    // needs to know why the tab was withheld, not only which versions were seen.
-    shell_log(&format!("tab for {app_id} not built: {}", skew.explanation()));
-    park_blocked_open(pending.clone());
+    // needs to know which runtime is in use and which one is waiting.
+    shell_log(&format!("runtime update waiting: {}", skew.explanation()));
     emit_runtime_swap(handle, &app_id, &skew);
-    return;
   }
 
   // Decide the tab id and label.
@@ -1156,9 +1159,10 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
       tauri_runtime_wry::set_webview_profile_name(&label, None);
       // `RPC_E_DISCONNECTED` on webview creation has one dominant cause that is
       // not a bug in this app: Windows swapped the WebView2 runtime while this
-      // process was running, so the COM objects it holds are gone. Say that,
-      // with the versions, instead of handing the user a bare HRESULT — the fix
-      // is a restart, and they cannot guess that from the error code.
+      // process was running. That is now only reachable when pinning was skipped
+      // (an admin policy, or no runtime to pin to), because the pin keeps every
+      // build on the version this process started with — so the truthful hint is
+      // the one that says a restart is due.
       let message = match runtime_swap_explanation() {
         Some(why) => format!("could not open the tab: {why}"),
         None => format!("could not open the tab: {e}"),
@@ -1880,12 +1884,12 @@ fn emit_tab_error(handle: &tauri::AppHandle, message: &str) {
   let _ = handle.emit("tab-error", message.to_string());
 }
 
-/// Ask the user what to do about a WebView2 runtime swap.
+/// Tell the UI that a WebView2 runtime update is waiting for a restart.
 ///
-/// Names the app the user just tried to open, because a prompt about a runtime
-/// they never asked about reads as noise. Nothing disruptive happens until they
-/// answer: the restart can only be whole-process, and a window that restarts
-/// itself mid-task reads as a crash.
+/// Names the app the user just opened, because a message about a runtime they
+/// never asked about reads as noise. Informational only: the tab opens on the
+/// pinned runtime either way, and nothing restarts until the user says so — a
+/// window that vanishes mid-task reads as a crash.
 fn emit_runtime_swap(
   handle: &tauri::AppHandle,
   app_id: &str,
@@ -1898,8 +1902,11 @@ fn emit_runtime_swap(
     "appName": name,
     "from": skew.from,
     "to": skew.to,
+    // What the process is actually running, so the message can promise that
+    // tabs keep opening rather than assuming the pin exists.
+    "pinned": crate::webview2_skew::pinned().map(|p| p.version),
   });
-  shell_log(&format!("runtime swap prompt for {app_id}"));
+  shell_log(&format!("runtime update notice for {app_id}"));
   let _ = handle.emit("runtime-swap", payload);
 }
 
@@ -1915,79 +1922,19 @@ fn app_name(handle: &tauri::AppHandle, app_id: &str) -> Option<String> {
     .map(|a| a.name.clone())
 }
 
-/// Restart RustBox because Windows swapped the WebView2 runtime underneath it.
+/// Restart RustBox so it moves to the WebView2 runtime Windows installed.
 ///
-/// Whole-process on purpose, and the prompt says so. WebView2 runs one browser
-/// process per user-data folder, and every RustBox app shares one folder (each
-/// app gets a named profile *inside* it), so there is no per-app or per-tab
-/// repair to offer — retiring one app's windows would leave the same dead
-/// browser process serving the rest. Promising a narrower restart would be a
-/// promise the runtime cannot keep.
-///
-/// Nothing calls this on its own. A window that restarts itself mid-task reads as
-/// a crash, so the user answers first; open tabs are restored from the config on
-/// the way back up, which is what makes accepting cheap.
+/// Offered by the update notice, never done on its own: a window that vanishes
+/// and reappears mid-task reads as a crash. Whole-process because WebView2 runs
+/// one browser process per user-data folder and every RustBox app shares one
+/// folder (each app gets a named profile *inside* it), so no narrower restart
+/// would actually switch runtimes. Open apps come back from the config on the
+/// way up, which is what makes accepting cheap.
 #[tauri::command]
 pub fn restart_after_runtime_swap(handle: tauri::AppHandle) {
-  shell_log("restart confirmed by user after webview2 runtime swap");
+  shell_log("restart confirmed by user to move to the new webview2 runtime");
   handle.restart();
 }
-
-/// Park a request while the user decides what to do about the swap.
-///
-/// Only the newest request is kept: the prompt names one app, so holding a queue
-/// would mean the answer applied to a tab the user has already forgotten.
-fn park_blocked_open(pending: PendingOpen) {
-  *BLOCKED_OPEN.lock().unwrap() = Some(pending);
-}
-
-/// Take the parked request and arm the one-shot bypass for its replay.
-///
-/// Split out from the command so "exactly once" is testable. The bypass has to be
-/// consumed by that one replay: leaving it armed would make the *next* open skip
-/// the check even though the user only ever approved the parked one, and a tab
-/// that silently fails again is worse than being asked twice.
-fn take_blocked_open() -> Result<PendingOpen, String> {
-  let parked = BLOCKED_OPEN
-    .lock()
-    .unwrap()
-    .take()
-    .ok_or_else(|| "there is no held-back tab to open".to_string())?;
-  SWAP_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
-  Ok(parked)
-}
-
-/// Drop the parked request, because the user closed the prompt.
-fn clear_blocked_open() {
-  *BLOCKED_OPEN.lock().unwrap() = None;
-  // Disarming matters as much as dropping the request: a bypass left set would
-  // make the next open skip the check even though nothing was approved.
-  SWAP_BYPASS.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Build the tab that was held back, despite the detected runtime swap.
-///
-/// Exists because the detection is a filesystem heuristic and could be wrong — a
-/// runtime folder can be rewritten without the running browser process caring.
-/// Without this escape hatch a false positive would leave tabs unopenable until
-/// the user restarted for no reason.
-#[tauri::command]
-pub fn open_blocked_tab(handle: tauri::AppHandle) -> Result<(), String> {
-  let parked = take_blocked_open()?;
-  shell_log(&format!(
-    "user chose to open {} despite the detected runtime swap",
-    parked.app.id
-  ));
-  schedule_open(&handle, parked);
-  Ok(())
-}
-
-/// Forget the held-back tab because the user dismissed the prompt.
-#[tauri::command]
-pub fn dismiss_runtime_swap() {
-  clear_blocked_open();
-}
-
 
 /// Dev hook behind `RB_PROBE_OPEN=1`: open every enabled embedded app so a
 /// script can inspect the resulting WebView2 environments without driving the
@@ -2889,16 +2836,8 @@ mod link_choice_tests {
 
 #[cfg(test)]
 mod runtime_swap_tests {
-  use super::{
-    clear_blocked_open, hold_for_skew, park_blocked_open, take_blocked_open, OpenKind,
-    PendingOpen, BLOCKED_OPEN, SWAP_BYPASS,
-  };
+  use super::{should_announce_swap, OpenKind, PendingOpen};
   use crate::config::{App, Engine, ProfileMode};
-
-  /// `BLOCKED_OPEN` and `SWAP_BYPASS` are process-wide, and `cargo test` runs
-  /// these in parallel: without a lock one test's reset disarms another's fixture
-  /// mid-assertion.
-  static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
   fn parked(kind: OpenKind) -> PendingOpen {
     PendingOpen {
@@ -2928,107 +2867,50 @@ mod runtime_swap_tests {
     }
   }
 
-  /// The whole feature is a decision not to act, so the negative cases matter as
-  /// much as the positive one: a prompt on every open would train the user to
-  /// dismiss it, and a prompt on an app that is already open would be a lie.
+  /// The notice must fire for the case it was written for: a tab the user asked
+  /// for, on a process whose runtime changed since launch.
   #[test]
-  fn only_a_new_tab_during_a_swap_is_held_back() {
+  fn a_new_tab_during_an_update_is_announced() {
     assert!(
-      hold_for_skew(false, false, false, true),
-      "new tab, swap: hold"
-    );
-    assert!(
-      !hold_for_skew(false, false, false, false),
-      "no swap: never hold"
-    );
-    assert!(
-      !hold_for_skew(true, false, false, true),
-      "revealing an open app builds no webview: no prompt"
-    );
-    assert!(
-      !hold_for_skew(false, true, false, true),
-      "the user already said to go ahead"
+      should_announce_swap(false, false, false, true),
+      "new tab, update waiting: announce"
     );
   }
 
-  /// Preloading the workspace at startup must never raise the prompt. Twenty warm
-  /// opens would otherwise stack twenty questions the user never asked, and the
-  /// one left standing would name an app they never clicked — so "Open anyway"
-  /// would open the wrong tab.
+  /// Silence when there is nothing to say. A notice on every open would be
+  /// ignored, which is the same as not showing one.
   #[test]
-  fn preloading_the_workspace_never_prompts() {
-    assert!(
-      !hold_for_skew(false, false, true, true),
-      "a warm build is speculative, not a request"
-    );
+  fn silence_when_there_is_no_update() {
+    assert!(!should_announce_swap(false, false, false, false));
   }
 
-  /// Parking must not consume the bypass: the answer has not been given yet, so a
-  /// flag set here would let the next open skip the check with nothing approved.
+  /// Revealing an app that is already open creates no webview, so the runtime is
+  /// irrelevant to it and the message would be misleading.
   #[test]
-  fn parking_a_request_does_not_arm_the_bypass() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    clear_blocked_open();
-    park_blocked_open(parked(OpenKind::Main));
-    assert!(BLOCKED_OPEN.lock().unwrap().is_some());
-    assert!(
-      !SWAP_BYPASS.load(std::sync::atomic::Ordering::SeqCst),
-      "nothing was approved yet"
-    );
-    clear_blocked_open();
+  fn revealing_an_open_app_is_never_announced() {
+    assert!(!should_announce_swap(true, false, false, true));
   }
 
-  /// "Open anyway" replays the exact request the user made, so a sub-tab keeps
-  /// its own URL instead of falling back to the app's start page.
+  /// Once per session: the news does not change between tabs.
   #[test]
-  fn taking_the_parked_request_preserves_what_was_asked_for() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    clear_blocked_open();
-    park_blocked_open(parked(OpenKind::Sub));
-    let taken = take_blocked_open().expect("the parked request");
-    assert_eq!(taken.url.as_deref(), Some("https://example.com/sub"));
-    assert_eq!(taken.app.id, "app-test");
-    assert!(SWAP_BYPASS.load(std::sync::atomic::Ordering::SeqCst));
-    clear_blocked_open();
+  fn the_notice_is_shown_only_once() {
+    assert!(!should_announce_swap(false, true, false, true));
   }
 
-  /// The bypass is one-shot. If it survived, the next tab would skip detection and
-  /// fail with the raw HRESULT instead of being asked about.
+  /// Startup preloading opens every app speculatively. Announcing there would
+  /// name an app nobody clicked, and fire before the user is even looking.
   #[test]
-  fn the_bypass_covers_one_replay_only() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    clear_blocked_open();
-    park_blocked_open(parked(OpenKind::Main));
-    take_blocked_open().expect("the parked request");
-    // This is exactly what `build_tab_window` does on entry.
-    let first = SWAP_BYPASS.swap(false, std::sync::atomic::Ordering::SeqCst);
-    let second = SWAP_BYPASS.swap(false, std::sync::atomic::Ordering::SeqCst);
-    assert!(first, "the replay is allowed through once");
-    assert!(!second, "a later open is checked again");
-    clear_blocked_open();
+  fn preloading_the_workspace_never_announces() {
+    assert!(!should_announce_swap(false, false, true, true));
   }
 
-  /// A second click on "open anyway" has nothing to act on, and must say so rather
-  /// than build a tab from a stale request.
+  /// A sub-tab keeps its own URL through the queue, so the open that finally
+  /// runs is the one the user asked for rather than the app's start page.
   #[test]
-  fn taking_twice_fails_the_second_time() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    clear_blocked_open();
-    park_blocked_open(parked(OpenKind::Main));
-    assert!(take_blocked_open().is_ok());
-    assert!(take_blocked_open().is_err());
-    clear_blocked_open();
-  }
-
-  /// Dismissing has to disarm the bypass too: otherwise closing the prompt would
-  /// silently approve the next open, which is the opposite of dismissing.
-  #[test]
-  fn dismissing_drops_the_request_and_the_bypass() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    park_blocked_open(parked(OpenKind::Main));
-    SWAP_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
-    clear_blocked_open();
-    assert!(BLOCKED_OPEN.lock().unwrap().is_none());
-    assert!(!SWAP_BYPASS.load(std::sync::atomic::Ordering::SeqCst));
+  fn a_pending_open_carries_what_the_user_asked_for() {
+    let pending = parked(OpenKind::Sub);
+    assert_eq!(pending.url.as_deref(), Some("https://example.com/sub"));
+    assert_eq!(pending.app.id, "app-test");
+    assert_eq!(pending.kind, OpenKind::Sub);
   }
 }
