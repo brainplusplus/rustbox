@@ -59,6 +59,19 @@ impl Surface {
 
   fn set_focus(&self) {
     if let Some(w) = self.as_window() {
+      // `set_focus` alone is not enough on Windows: it maps to
+      // `SetForegroundWindow`, which the OS is allowed to refuse without
+      // reporting an error (the foreground lock), and which only changes the
+      // *active* window rather than the stacking order. Tabs are owned windows at
+      // the same rect, so the one that must be visible has to be raised
+      // explicitly — otherwise a tab created later keeps covering it.
+      //
+      // Symptom this fixes: the address bar and the highlighted chip show the tab
+      // you picked, while the page on screen is still the one behind it. Switching
+      // to another app and back appeared to fix it because `show_only` ran again
+      // with a different window already in front.
+      #[cfg(windows)]
+      raise_window(w);
       let _ = w.set_focus();
     }
   }
@@ -80,6 +93,42 @@ impl Surface {
       .as_window()
       .and_then(|w| w.is_visible().ok())
       .unwrap_or(false)
+  }
+}
+
+/// Raise a window to the top of its z-order band without changing focus.
+///
+/// `BringWindowToTop` also tries to activate the window, which fights the tab
+/// strip's focus and lets the OS refuse the whole call. `SetWindowPos` with
+/// `SWP_NOACTIVATE` moves only the stacking order, which is exactly what a tab
+/// overlay needs: the window is already the one the user is reading, and the
+/// chrome (address bar, chips) lives in a different window that must keep focus.
+///
+/// `HWND_TOP` is right here rather than `HWND_TOPMOST`: these are owned windows,
+/// so the top of the owned band is above the main window and still below any real
+/// topmost surface such as the link chooser.
+#[cfg(windows)]
+fn raise_window(window: &WebviewWindow) {
+  use windows_sys::Win32::Foundation::HWND;
+  use windows_sys::Win32::UI::WindowsAndMessaging::{
+    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SetWindowPos,
+  };
+  let Ok(raw) = window.hwnd() else {
+    return;
+  };
+  // SAFETY: `raw` is the live HWND Tauri created for this window, and the flags
+  // tell the API to touch nothing but the stacking order — size and position are
+  // therefore never read from the zeroed arguments.
+  unsafe {
+    SetWindowPos(
+      raw.0 as HWND,
+      HWND_TOP,
+      0,
+      0,
+      0,
+      0,
+      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+    );
   }
 }
 
@@ -111,7 +160,18 @@ struct AppTabs {
   /// cannot be resurrected by a later tab that happens to land on its id.
   next: u32,
   /// The sub-tab currently stretched over the content rect.
+  ///
+  /// Strictly "what the user is looking at". A hidden window must never be
+  /// recorded here, or the tab strip and address bar name one page while a
+  /// different one fills the screen.
   active: String,
+  /// Where a reveal should land, when it differs from `active`.
+  ///
+  /// Set by a preload, which builds a tab hidden so a whole workspace can come up
+  /// without flashing over the app being read. The user is not looking at it yet,
+  /// so it cannot be `active`; it only becomes the active tab once the app is
+  /// revealed and the window is actually shown.
+  restore_to: Option<String>,
   tabs: Vec<SubTab>,
 }
 
@@ -120,6 +180,7 @@ impl AppTabs {
     Self {
       next: 2,
       active: "main".to_string(),
+      restore_to: None,
       tabs: Vec::new(),
     }
   }
@@ -530,6 +591,8 @@ fn show_only(handle: &tauri::AppHandle, app_id: &str, tab_id: &str) {
   tabs(|m| {
     if let Some(a) = m.get_mut(app_id) {
       a.active = tab_id.to_string();
+      // The intent a preload recorded has now been carried out.
+      a.restore_to = None;
     }
   });
   let _ = handle;
@@ -621,7 +684,14 @@ static SWAP_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
 /// not show anything — it would flash every app over the one the user is reading
 /// — but the app still has to remember which tab it was on, so that revealing it
 /// later lands where the user left off.
-static RESTORE_SHOW: Mutex<Vec<(String, usize, bool)>> = Mutex::new(Vec::new());
+/// The tab a finished restore should end on, per app.
+///
+/// Stored as the URL the remembered active tab had, not as an index into the
+/// strip: an index is only meaningful while the strip still matches what was
+/// queued, and the user may open or close tabs while the restore is building.
+/// Resolving by URL afterwards names the tab that actually came back, and simply
+/// finds nothing if it never arrived.
+static RESTORE_SHOW: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
 
 /// Apps whose tabs are in the middle of being rebuilt.
 ///
@@ -668,6 +738,26 @@ fn is_quitting() -> bool {
   QUITTING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Abandon any restore still pending for this app, because the user just asked
+/// for a tab themselves.
+///
+/// Their request is newer than anything remembered, and the restore's tabs are
+/// built hidden (`warm`). Raising one of those over the tab they just opened is
+/// what made a new sub-tab look like it blanked the whole app: the visible window
+/// became a hidden one, and nothing reappeared until switching apps and back ran
+/// `show_only` again with the real active tab.
+///
+/// Dropping the entry here is enough — `finish_restore` only raises what is still
+/// in the list, and the strip keeps whatever the user's own open leaves active.
+fn abandon_restore(app_id: &str) {
+  if let Ok(mut guard) = RESTORE_SHOW.lock() {
+    guard.retain(|(id, _, _)| id != app_id);
+  }
+  if let Ok(mut guard) = RESTORING.lock() {
+    guard.retain(|id| id != app_id);
+  }
+}
+
 /// Drain queued tab opens. Must run on the main thread OUTSIDE any IPC
 /// handler (we get there by scheduling this as a fresh main-thread task
 /// after the handler returns).
@@ -699,7 +789,7 @@ fn restore_queue(
   handle: &tauri::AppHandle,
   app_id: &str,
   tabs: &[crate::session::SavedTab],
-  shown: Option<usize>,
+  shown: Option<&crate::session::SavedTab>,
   rect: (f64, f64, f64, f64),
   reveal: bool,
 ) {
@@ -725,11 +815,11 @@ fn restore_queue(
       });
     }
   }
-  if let Some(index) = shown {
+  if let Some(tab) = shown {
     RESTORE_SHOW
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .push((app_id.to_string(), index, reveal));
+      .push((app_id.to_string(), tab.url.clone(), reveal));
   }
   // Marked before the builds run, so none of them overwrites the memory with the
   // half-built strip. Cleared by `finish_restore` once they are all there.
@@ -781,21 +871,29 @@ fn finish_restore(handle: &tauri::AppHandle) {
     }
     guard.clear();
   }
+  // The restore is over; nothing is left to abandon.
+  let _ = &pending;
   let mut revealed = false;
-  for (app_id, index, reveal) in pending {
-    // Ids are minted in build order, and the restored tabs are built in the
-    // order they were queued, so the tab at `index` among them is the one to
-    // show. Looked up through the registry rather than computed from a pattern,
-    // so a build that failed and skipped an id cannot show the wrong page.
+  for (app_id, want_url, reveal) in pending {
+    // Resolved by the URL the remembered active tab had. An index would be wrong
+    // the moment the user opens or closes a tab while the restore is still
+    // building, which is exactly what happens when they click "+" during it.
     let target = tabs(|m| {
-      m.get(&app_id).and_then(|a| {
-        a.tabs
+      m.get(&app_id).map(|a| {
+        let rows: Vec<SavedRow> = a
+          .tabs
           .iter()
-          .filter(|t| !t.detached && !t.pinned)
-          .nth(index)
-          .map(|t| t.id.clone())
+          .map(|t| SavedRow {
+            id: t.id.clone(),
+            url: t.url.clone(),
+            title: t.title.clone(),
+            detached: t.detached,
+          })
+          .collect();
+        resolve_restore_target(&rows, &want_url)
       })
-    });
+    })
+    .flatten();
     let Some(tab_id) = target else {
       continue;
     };
@@ -803,11 +901,16 @@ fn finish_restore(handle: &tauri::AppHandle) {
       show_only(handle, &app_id, &tab_id);
       revealed = true;
     } else {
-      // Preloaded: nobody is looking, so only the bookkeeping moves. The tab is
-      // recorded as active so revealing the app later shows the right one.
+      // Preloaded: nobody is looking, and the window is hidden. Record which tab
+      // *would* be shown and which one is actually on screen separately, so the
+      // chip and the page cannot disagree.
+      //
+      // `active` is who the user is looking at, so it must not move to a hidden
+      // window; `restore_to` remembers the intent for the next reveal.
       tabs(|m| {
         if let Some(a) = m.get_mut(&app_id) {
-          a.active = tab_id;
+          a.restore_to = Some(tab_id.clone());
+          let _ = &tab_id;
         }
       });
     }
@@ -941,10 +1044,18 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
   // link must produce two tabs the way a browser does.
   let (tab_id, label) = match kind {
     OpenKind::Main => {
-      // Reopening an app restores the tab it was last showing, not always its
-      // first one: an app with three tabs left open on tab 3 must come back to
-      // tab 3, or the user's place is lost every time they visit the catalog.
-      let existing = tabs(|m| m.get(&app_id).map(|a| a.active.clone()));
+      // Reopening an app shows the tab it was last on, not always its first one:
+      // an app with three tabs left open on tab 3 must come back to tab 3, or the
+      // user's place is lost every time they visit the catalog.
+      //
+      // `restore_to` is consulted first because a preloaded app was built hidden:
+      // `active` still names whatever was visible, while `restore_to` is where the
+      // user actually was. Revealing is what makes that intent real, so it is
+      // consumed here.
+      let existing = tabs(|m| {
+        m.get_mut(&app_id)
+          .map(|a| a.restore_to.take().unwrap_or_else(|| a.active.clone()))
+      });
       if let Some(id) = existing {
         // A warm open of an app that is already built is a no-op: showing it
         // would steal the screen from the tab the user is on.
@@ -981,8 +1092,11 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         // right now; among the queued remainder it is `active - 1`. Zero means
         // the tab already being built is the one to show, so nothing is raised
         // at the end.
-        let shown = (active > 0).then(|| active - 1);
-        restore_queue(handle, &app_id, &saved[1..], shown, rect, !warm);
+        let shown = active
+          .checked_sub(1)
+          .and_then(|i| saved.get(i + 1))
+          .cloned();
+        restore_queue(handle, &app_id, &saved[1..], shown.as_ref(), rect, !warm);
         // The tab being built right now is the remembered active one when
         // `active` is 0. It is already the default, so nothing to raise — but a
         // preload must not mark it visible, and that needs no action either.
@@ -1323,7 +1437,15 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
           url: target_url.clone(),
           title: shown_title,
         });
-        if !detached {
+        // A popup floats over the page rather than becoming the page, and a warm
+        // build is deliberately hidden. Neither may claim "this is what the user
+        // is looking at": the visible window is still whatever was on screen.
+        //
+        // Claiming it anyway is what produced a chip and an address bar pointing
+        // at one tab while a different page filled the window, and a new sub-tab
+        // that only appeared after switching apps and back — that switch was the
+        // next thing to call `show_only` with a tab that was actually visible.
+        if becomes_active(detached, warm) {
           a.active = tab_id.clone();
         }
       });
@@ -1871,6 +1993,22 @@ fn app_by_id(handle: &tauri::AppHandle, app_id: &str) -> Option<App> {
   cfg.apps.iter().find(|a| a.id == app_id).cloned()
 }
 
+/// Whether a tab that just finished building should become the app's active tab.
+///
+/// Only a window the user can actually see may claim that. Two kinds cannot:
+///
+/// - a popup (`detached`) floats over the page; switching to it is not a thing
+///   the tab strip offers;
+/// - a warm build is created hidden on purpose, so a whole workspace can come up
+///   without flashing over the app being read.
+///
+/// Marking either one active made the tab strip and address bar name a tab while
+/// a different page filled the window, and made a freshly opened tab look like it
+/// had not appeared until switching apps and back.
+fn becomes_active(detached: bool, warm: bool) -> bool {
+  !detached && !warm
+}
+
 /// Whether the remembered tabs may be overwritten right now.
 ///
 /// Pure so both refusal cases can be tested without an `AppHandle`. Two things
@@ -1916,6 +2054,17 @@ fn remember_tabs(handle: &tauri::AppHandle, app_id: &str) {
       .unwrap_or_default();
     crate::session::remember(app_id, &base, &tabs, active);
   }
+}
+
+/// Which open tab a finished restore should raise, given the URL it remembered.
+///
+/// Returns `None` when that tab never arrived, which is the honest answer: the
+/// caller then leaves the strip alone rather than raising something else.
+fn resolve_restore_target(tabs: &[SavedRow], want_url: &str) -> Option<String> {
+  tabs
+    .iter()
+    .find(|t| !t.detached && t.url == want_url)
+    .map(|t| t.id.clone())
 }
 
 /// One app's open tabs as the session store wants them, plus the active index.
@@ -2086,6 +2235,9 @@ pub fn schedule_sub_tab(
   url: Option<String>,
 ) -> Result<(), String> {
   let rect = *CONTENT_RECT.lock().unwrap();
+  // Recorded before queueing, because this is the moment the user's intent
+  // becomes newer than anything a restore staged.
+  abandon_restore(&app.id);
   schedule_open(
     &app_handle,
     PendingOpen {
@@ -3036,6 +3188,11 @@ pub fn list_tabs() -> Result<serde_json::Value, String> {
               // can switch to; saying so keeps a caller from activating it.
               "popup": t.detached,
               "active": t.id == a.active,
+              // Whether the window is actually on screen. Distinct from `active`:
+              // a tab can be the active one and still be hidden, which is a bug
+              // in whatever hid it — and the only way to see that from a script
+              // instead of guessing from the UI.
+              "visible": t.surface.is_visible(),
               "console": { "cursor": console.0, "buffered": console.1 },
               "network": { "cursor": network.0, "buffered": network.1 },
             })
@@ -3307,7 +3464,31 @@ mod runtime_swap_tests {
 
 #[cfg(test)]
 mod restore_tests {
-  use super::{may_remember, pick_saved, SavedRow};
+  use super::{becomes_active, may_remember, pick_saved, resolve_restore_target, SavedRow};
+
+  /// The reported bug: a sub-tab opened normally must become the active one, or
+  /// the strip disagrees with the page on screen.
+  #[test]
+  fn an_ordinary_tab_becomes_active() {
+    assert!(becomes_active(false, false));
+  }
+
+  /// A hidden build must never claim to be what the user is looking at. This is
+  /// the case that produced "the active chip says Example, the page shows
+  /// WhatsApp", because a preloaded or restored tab is created hidden.
+  #[test]
+  fn a_hidden_build_never_becomes_active() {
+    assert!(
+      !becomes_active(false, true),
+      "a warm tab is invisible, so it cannot be the one on screen"
+    );
+  }
+
+  /// A popup floats over the page; it is not a tab the strip can switch to.
+  #[test]
+  fn a_popup_never_becomes_active() {
+    assert!(!becomes_active(true, false));
+  }
 
   fn row(id: &str, url: &str, detached: bool) -> SavedRow {
     SavedRow {
@@ -3383,6 +3564,47 @@ mod restore_tests {
   #[test]
   fn an_ordinary_change_is_remembered() {
     assert!(may_remember(false, false));
+  }
+
+  /// The tab a restore ends on is resolved by URL, not by position. A position
+  /// is wrong the moment the user opens a tab while the restore is still
+  /// building, which is the reported case: click "+", and the restore raised a
+  /// hidden tab over the new one.
+  #[test]
+  fn the_restore_target_is_found_by_url_not_by_position() {
+    let rows = [
+      row("main", "https://app.test", false),
+      row("t2", "https://restored.test", false),
+      row("t3", "https://user-just-opened.test", false),
+    ];
+    // The remembered tab is now second-from-the-end, not the second tab.
+    assert_eq!(
+      resolve_restore_target(&rows, "https://restored.test").as_deref(),
+      Some("t2")
+    );
+  }
+
+  /// If the remembered tab never arrived (its build failed), the caller must get
+  /// no answer and leave the strip alone rather than raise a different page.
+  #[test]
+  fn a_missing_restore_target_resolves_to_nothing() {
+    let rows = [row("main", "https://app.test", false)];
+    assert_eq!(resolve_restore_target(&rows, "https://gone.test"), None);
+  }
+
+  /// A popup that happens to share the URL must not be chosen: raising it would
+  /// put a floating window where a tab belongs.
+  #[test]
+  fn a_popup_is_never_the_restore_target() {
+    let rows = [
+      row("main", "https://app.test", false),
+      row("t2", "https://wanted.test", true),
+      row("t3", "https://wanted.test", false),
+    ];
+    assert_eq!(
+      resolve_restore_target(&rows, "https://wanted.test").as_deref(),
+      Some("t3")
+    );
   }
 
   /// The plain case the feature exists for: the pinned tab plus one sub-tab, with
