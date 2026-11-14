@@ -1,6 +1,6 @@
 [package]
 name = "rustbox"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Two binaries live here (the app and the MCP shim). Without this, `cargo tauri
 # build` cannot tell which one is the product and refuses to bundle.
