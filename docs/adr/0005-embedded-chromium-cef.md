@@ -2,7 +2,8 @@
 
 **Status:** Proposed — nothing implemented.
 **Date:** 2026-11-10.
-**Relates to:** ADR 0001 (engine list), ADR 0002 (isolation + proxy, reused unchanged).
+**Relates to:** ADR 0001 (engine list), ADR 0002 (isolation + proxy: same rules,
+different mechanism — see §6 and §6.1).
 
 ## 1. Problem
 
@@ -220,12 +221,48 @@ green.
 - **Storage:** `paths::embedded_profile(&app_id)` becomes CEF's `cache_path` on a
   per-app `CefRequestContext`. Same folder semantics as `data_directory`, so
   `reset_app_profile` and `purge_app_data` keep working.
-- **Proxy:** Chromium's `--proxy-server`; `Proxy::normalized_scheme` already emits
-  the `http` / `socks5` forms Chromium accepts. Per request context, so it cannot
-  leak between apps.
+- **Proxy:** per app, through the request context's preference manager (the
+  `proxy` preference on `CefRequestContext`); `Proxy::normalized_scheme` already
+  emits the `http` / `socks5` forms Chromium accepts. **Not** `--proxy-server`:
+  that switch is command line, and one CEF client process serves every app, so a
+  switch set there applies to all of them at once and leaks one app's proxy into
+  another's. `--user-agent` and `--lang` have the same problem, which is why the
+  per-app UA must also travel as a context setting rather than a switch. Whether
+  the preference manager honours per-context proxy on the CEF version we ship is
+  an **M0 gate, not an assumption** — it is the one part of this plan that can
+  turn out to be impossible without a process per app (see §6.1).
 - **UI:** one more `<option>` in a new "Embedded backend" picker, shown only when
   the engine is `os-webview`. The browser picker stays disabled for both embedded
   backends, because neither launches an external program.
+
+### 6.1 What `ProfileMode` means under CEF
+
+`ProfileMode` was designed around WebView2, where `Isolated` means *a browser
+environment of its own* — its own process tree, GPU process and crash domain. CEF
+has no equivalent: one CEF client is one process tree, however many browsers run
+inside it. What CEF can separate per app is a `CefRequestContext` — cookies,
+localStorage, IndexedDB, HTTP cache — and nothing above that.
+
+| Mode | Windows (WebView2) | macOS (WKWebView) | Linux (WebKitGTK) | CEF, all three |
+| --- | --- | --- | --- | --- |
+| `Light` — data apart, runtime shared | named profile | not available, degrades to `Isolated` | not available, degrades to `Isolated` | `CefRequestContext` + `cache_path` |
+| `Isolated` — data *and* process apart | own environment | named data store, macOS 14+ | own `WebsiteDataManager` | **not available**: data apart, process shared |
+
+Two consequences, both of which reach the UI:
+
+1. CEF brings `Light` to the two platforms that do not have it today, and removes
+   macOS's 14+ requirement, because `cache_path` works on every version CEF
+   supports.
+2. Under CEF the two modes collapse into the same mechanism, so a picker that
+   still offered both would describe a difference that no longer exists. The
+   honest form is a single "storage separated" mode for CEF, plus a line saying
+   the browser process is shared with the other apps — exposed through
+   `platform_info` the way `light_profiles` and `named_data_stores` already are
+   (`src-tauri/src/main.rs:584`).
+
+Real `Isolated` would come back only with a separate CEF client process per app,
+which §4 rules out: the tab is a child view inside one shell window, and a
+separate process means a separate top-level window to keep positioned and focused.
 
 ## 7. Milestones and gates
 
@@ -234,7 +271,7 @@ I cannot verify macOS from this Windows machine and will not claim to.
 
 | # | Work | Gate | Where | Status |
 | --- | --- | --- | --- | --- |
-| M0 | Spike outside RustBox: `cef` crate, one windowed browser, one page, message pump from a plain loop | A or B decided; which distribution (`minimal` vs `standard`) is enough; startup cost measured | Mac | Windows done (§11); macOS open |
+| M0 | Spike outside RustBox: `cef` crate, one windowed browser, one page, message pump from a plain loop | A or B decided; startup cost measured; whether development needs the `standard` SDK (debug build, samples) | Mac | Windows done (§11); macOS open |
 | M1 | `Surface` seam, `System` only, no behaviour change | `cargo test --release` + `check-ui` green; no config can select CEF | Windows | Done, `021af33` |
 | M2 | `Surface::Chromium`: navigate, size, show/hide, close, title, URL | A CEF tab renders a page inside the RustBox window | Mac | Blocked on M0 macOS |
 | M3 | Per-app request context, proxy, user agent | Login survives a restart; proxy probe shows the request | Mac | Not started |
@@ -280,7 +317,8 @@ artefact.
 | CEF's loop fights tao's on macOS | High | M0 decides A vs B before code depends on it |
 | We take over Chromium's security cadence | High | Standing commitment: pinned version, rebuild on Chromium security releases. This never goes away |
 | Signing/notarization of framework + helpers | High | Needs a Developer ID; blocks M7 |
-| Download size 4x–11x | Medium | Accepted; per-arch dmg; `minimal` if it suffices |
+| Download size 4x–11x | Medium | Accepted; per-arch dmg. `minimal` does **not** rescue this: measured 281 MB `libcef.dll` (§11) |
+| Per-app proxy impossible without a process per app | High | M0 gate: prove `CefRequestContext` preferences apply the proxy per context. If they do not, CEF cannot keep ADR 0002's per-tab proxy rule, and the backend should not ship |
 | Two webview stacks, two crash surfaces | Medium | CEF keeps its own helper processes; verify a CEF crash cannot take the shell down (M2) |
 | Focus, IME, drag-drop regressions vs WebView2 | Medium | Explicit checks in M2/M4, not assumptions |
 | `tabs.rs` is 2969 lines and the seam touches its core | Medium | M1 first, behaviour-preserving, suite green |
@@ -289,12 +327,15 @@ artefact.
 ## 10. Open questions for M0
 
 1. Option A or Option B on macOS (run-loop coexistence)?
-2. Is the `minimal` distribution sufficient, or is `standard` needed for
-   PDF/printing/DRM?
+2. Is the `standard` SDK needed for development (debug `libcef`, `cefclient`,
+   symbol files), given that both distributions ship the same release runtime and
+   therefore the same installer contents (§12)?
 3. Startup-time and memory cost against WebView2 and WKWebView.
 4. Does CEF ever become the Windows default, or stay opt-in? (Stays opt-in until
    M5 evidence exists.)
 5. Developer ID availability, since M7 cannot ship without it.
+6. Does a per-context `proxy` preference actually apply per app inside one CEF
+   process? This is the gate that decides whether ADR 0002 survives CEF (§6.1).
 
 ## 11. M0 results (Windows, measured 2026-11-10)
 
@@ -377,6 +418,36 @@ use), `find_framework` (both bundle depths, plus the no-framework case), and
 `multi_threaded_supported` (the flag is refused where CEF lacks the feature).
 These run on Windows; the load they feed does not.
 
+## 12. Alternatives considered
+
+Recorded so this question is not re-opened from scratch. Sizes are what the
+project would add to an installer, not SDK archive sizes; the rows for the
+current engine are the numbers in today's releases.
+
+| Option | Added size | OS | `Light` (data apart, runtime shared) | `Isolated` (data **and** process apart) |
+| --- | --- | --- | --- | --- |
+| WebView2 Evergreen (today) | 0 MB | Windows 10 1803+/11, x64 & ARM64 | yes, named profile (needs this repo's `tauri-runtime-wry` patch) | yes, own environment |
+| WKWebView (today) | 0 MB | macOS, named store on 14+ | no, degrades to `Isolated` | yes on 14+; below that every app shares a store |
+| WebKitGTK (today) | 0 MB | Linux, x64 & ARM64 | no, degrades to `Isolated` | yes, own `WebsiteDataManager` |
+| WebView2 Fixed Version | ~150–180 MB | Windows only | yes | yes |
+| CEF `minimal` | runtime `libcef.dll` alone measured 281 MB (§11) | Windows / macOS / Linux, x64 + ARM64 | yes, request context + `cache_path` | **no**, data only (§6.1) |
+| CEF `standard` | same runtime; the extra is SDK-side | idem | idem | idem |
+| Ultralight 2.0 (free) | ~10 MB | Windows / macOS / Linux desktop | single process by design | data only, no sandbox, and the free build has **no JavaScript JIT and no media playback** — real web apps do not run |
+| Sciter (free) | ~4–8 MB (vendor) | Windows / macOS / Linux | single process | data only; own HTML/CSS engine that is explicitly not a browser, so third-party sites do not render |
+
+Two conclusions that shaped the decision:
+
+- **`minimal` vs `standard` is not a size decision for the product.** Both ship
+  the same release runtime; the difference is debug binaries, symbol files and
+  the sample/test apps in the SDK. The measured 281 MB `libcef.dll` is the same
+  either way, so `standard` is the better working setup and `minimal` saves only
+  developer disk.
+- **The only cheaper options are the ones that cannot render the pages this app
+  exists to render.** Ultralight and Sciter are smaller by two orders of
+  magnitude and both fail the same test: WhatsApp Web, Gmail, AliExpress. That is
+  not a licensing or effort trade-off, it is a capability gap, which is why they
+  are not on the milestone path.
+
 ## Consequences
 
 - A RustBox tab can be Chromium on macOS for the first time, and on Windows can
@@ -385,5 +456,8 @@ These run on Windows; the load they feed does not.
   of MB per platform, and a signing requirement that does not exist today.
 - ADR 0001's "Embedded engine: OS webview" becomes "OS webview by default,
   optionally bundled Chromium".
+- `ProfileMode` stops meaning the same thing on both backends: under CEF it is
+  storage isolation only, because one CEF client is one process tree (§6.1). The
+  UI has to say so rather than offering a choice that behaves identically.
 - Every future tab feature must be implemented for two backends or abstracted.
   That is the recurring cost, not the one-time work.

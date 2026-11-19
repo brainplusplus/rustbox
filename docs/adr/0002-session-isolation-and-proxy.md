@@ -2,11 +2,14 @@
 
 **Status:** Accepted (2026-10-20, supersedes rev.1 — Servo references removed per ADR 0001 rev.2)
 
-> Planned amendment (see `docs/adr/0005-embedded-chromium-cef.md`): if a `cef`
-> engine is added, a CEF tab would receive the same per-app storage folder and the
-> same proxy through a per-context setting instead of WebView2's data directory
-> and switches. The rules below — one store per app, per-tab proxy, immutable
-> while open — are unchanged.
+> Planned amendment (see `docs/adr/0005-embedded-chromium-cef.md`): if CEF is added
+> as a second embedded backend, a CEF tab would receive the same per-app storage
+> folder and the same proxy through a per-context setting instead of WebView2's
+> data directory and switches. The rules below — one store per app, per-tab proxy,
+> immutable while open — are unchanged. Caveat: per-context proxy inside one shared
+> CEF process is an M0 gate, not yet proven (ADR 0005 §6.1), and CEF cannot offer
+> process-level isolation at all, so `ProfileMode::Isolated` would mean storage
+> isolation only under that backend.
 
 ## Decision
 - Every app tab gets its own `Session` = isolated cookie/storage partition (one user-data folder per session id).
