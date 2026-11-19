@@ -301,8 +301,25 @@ fn escape(value: &str) -> String {
 ///
 /// Returns `None` when the OS cannot say (no `xdg-settings`, an unreadable
 /// registry key), so the UI keeps its plain label rather than guessing.
+///
+/// `async` because the answer is asked for while the link chooser is being
+/// drawn. A synchronous command runs on the main thread, and the macOS and Linux
+/// probes wait on a helper process, so answering inline froze the dialog at the
+/// exact moment it appeared. The wait is moved to a blocking thread; the page
+/// simply receives the name when it arrives.
 #[tauri::command]
-pub fn system_default_browser() -> Option<String> {
+pub async fn system_default_browser() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(default_browser_name)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The blocking probe behind [`system_default_browser`].
+///
+/// Only call this off the main thread: the macOS and Linux paths start a helper
+/// process and wait for it.
+fn default_browser_name() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         // LaunchServices keeps the https handler as a bundle id. The bundle id
@@ -317,17 +334,7 @@ pub fn system_default_browser() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let out = std::process::Command::new("reg")
-            .args([
-                "query",
-                r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
-                "/v",
-                "ProgId",
-            ])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        windows_prog_name(&text)
+        windows_default_browser()
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -338,6 +345,61 @@ pub fn system_default_browser() -> Option<String> {
         let desktop = String::from_utf8_lossy(&out.stdout).trim().to_string();
         linux_desktop_name(&desktop)
     }
+}
+
+/// Read the `https` handler's ProgId straight out of the user's registry.
+///
+/// In-process rather than through `reg.exe`: the chooser asks for this name as
+/// it opens, and starting a helper process costs tens of milliseconds even when
+/// nothing goes wrong. A security product that intercepts process creation can
+/// hold that spawn for seconds, which is exactly the "the dialog is frozen"
+/// report this replaced.
+#[cfg(target_os = "windows")]
+fn windows_default_browser() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    const SUBKEY: &str =
+        r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice";
+    const VALUE: &str = "ProgId";
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let subkey = wide(SUBKEY);
+    let value = wide(VALUE);
+    // A ProgId is a short key name, so this is far more room than one needs;
+    // the API reports the required size instead of truncating if it ever is not.
+    let mut data = [0u16; 256];
+    let mut bytes = std::mem::size_of_val(&data) as u32;
+    // SAFETY: both strings are NUL-terminated and outlive the call, and `bytes`
+    // is the size of the buffer `data` points at, as the API requires.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            data.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // A `REG_SZ` is NUL-terminated and its reported size counts that NUL.
+    let units = (bytes as usize / std::mem::size_of::<u16>())
+        .saturating_sub(1)
+        .min(data.len());
+    let prog = String::from_utf16_lossy(&data[..units]);
+    let prog = prog.trim();
+    if prog.is_empty() {
+        return None;
+    }
+    Some(windows_prog_name(prog))
 }
 
 /// Parse the `https` handler's bundle id out of `LSHandlers` plist text.
@@ -397,18 +459,13 @@ fn mac_app_name(bundle_id: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Pull the ProgId out of `reg query` output and make it readable.
+/// Make a registry ProgId readable.
 ///
 /// The ProgId is a registry key such as `ChromeHTML` or `MSEdgeHTM`, so only a
 /// known prefix maps to a name. Anything else is shown as the raw ProgId.
-pub(crate) fn windows_prog_name(reg_output: &str) -> Option<String> {
-    let prog = reg_output
-        .lines()
-        .find(|l| l.contains("ProgId"))?
-        .split_whitespace()
-        .last()?
-        .to_string();
-    let name = match prog.as_str() {
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) fn windows_prog_name(prog: &str) -> String {
+    match prog {
         p if p.starts_with("ChromeHTML") => "Google Chrome".to_string(),
         p if p.starts_with("MSEdgeHTM") => "Microsoft Edge".to_string(),
         p if p.starts_with("BraveHTML") => "Brave".to_string(),
@@ -416,8 +473,7 @@ pub(crate) fn windows_prog_name(reg_output: &str) -> Option<String> {
         p if p.starts_with("VivaldiHTM") => "Vivaldi".to_string(),
         p if p.starts_with("OperaStable") => "Opera".to_string(),
         p => p.to_string(),
-    };
-    Some(name)
+    }
 }
 
 /// Turn an XDG desktop file (`google-chrome.desktop`) into a readable name.
@@ -1102,7 +1158,7 @@ fn open_with_default(url: &str) -> Result<(), String> {
         .unwrap_or_default();
     crate::tabs::shell_log(&format!(
         "hand-off to the OS default browser ({}): {host}",
-        system_default_browser().unwrap_or_else(|| "unknown".to_string())
+        default_browser_name().unwrap_or_else(|| "unknown".to_string())
     ));
     #[cfg(target_os = "windows")]
     {
@@ -1333,14 +1389,10 @@ mod tests {
 
     #[test]
     fn windows_prog_id_maps_to_a_readable_name() {
-        let out = "\r\nHKEY_CURRENT_USER\\...\\UserChoice\r\n    ProgId    REG_SZ    ChromeHTML\r\n";
-        assert_eq!(windows_prog_name(out).as_deref(), Some("Google Chrome"));
-        let edge = "    ProgId    REG_SZ    MSEdgeHTM\r\n";
-        assert_eq!(windows_prog_name(edge).as_deref(), Some("Microsoft Edge"));
+        assert_eq!(windows_prog_name("ChromeHTML"), "Google Chrome");
+        assert_eq!(windows_prog_name("MSEdgeHTM"), "Microsoft Edge");
         // Unknown ProgIds are shown raw rather than guessed.
-        let other = "    ProgId    REG_SZ    SomeNewHTML\r\n";
-        assert_eq!(windows_prog_name(other).as_deref(), Some("SomeNewHTML"));
-        assert_eq!(windows_prog_name("nothing here"), None);
+        assert_eq!(windows_prog_name("SomeNewHTML"), "SomeNewHTML");
     }
 
     #[test]
