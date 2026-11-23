@@ -1427,7 +1427,7 @@ Under `tauri-runtime-cef` the equivalent is a different tree entirely:
 | `config.json`, `session.json` | **Yes.** Plain JSON, no engine involvement |
 | Tab URLs, window layout | **Yes**, via `session.json` |
 | Cookies, saved logins | **Cookies: yes, since 2026-11-22** (§25.1). Saved logins (`Login Data`) are not migrated. |
-| `localStorage`, IndexedDB, Cache Storage, service workers | **No** |
+| `localStorage`, IndexedDB | **Yes, since 2026-11-23** (§25.5): copied as files when the incoming profile has no session of its own. Cache Storage, service workers and Session Storage are not carried. |
 | Granted permissions | **No** |
 | `ProfileMode::Light` | **No equivalent.** CEF has no "named profile inside a shared environment"; it falls back to per-webview request contexts, i.e. `Isolated`, at roughly 2× the memory |
 
@@ -1459,12 +1459,13 @@ tracks the installed Edge runtime.
    switch is reversible and cannot corrupt the other engine's profile.
 3. **Switching used to mean signing in again, everywhere.** That warning was
    honest when it was written. Since 2026-11-22 the cookies are carried across at
-   startup, so most sign-ins survive a switch (§25.1); the stores that are *not*
-   carried are `localStorage`, IndexedDB and Cache Storage, so an app that keeps
-   its token there can still ask for a login. A CDP export/import
-   (`Network.getAllCookies` → `Network.setCookie`) would need a running webview on
-   both sides and would still miss those stores, which is why the migration
-   rewrites the jar instead.
+   startup, and since 2026-11-23 the two stores a chat app keeps its device
+   pairing in (`IndexedDB`, `Local Storage`) are carried with them (§25.5), so a
+   switch is usually invisible again. What is *not* carried is Cache Storage,
+   session storage and service-worker state - derived data the browser rebuilds.
+   A CDP export/import (`Network.getAllCookies` → `Network.setCookie`) would need
+   a running webview on both sides and would still miss those stores, which is
+   why the migration works on the files instead.
 4. **`ProfileMode::Light` has no CEF meaning.** The settings UI must hide or
    re-label it per engine rather than offering a choice that silently costs 2×
    memory.
@@ -1475,9 +1476,11 @@ Whether the CEF runtime's `data_directory` handling behaves identically for a
 profile written by a different CEF version on the same milestone. Nothing here
 was tested on macOS or Linux.
 
-Whether `localStorage`, IndexedDB and Cache Storage can be carried across engines
-at all (not attempted). A migrated cookie set is not the same as a migrated
-session for an app that keeps its token in one of those stores.
+Which apps keep their session somewhere the migration still does not carry. The
+site-storage copy (§25.5) is measured for WhatsApp only: it was a cookie-only
+switch that failed for that app, and it succeeds now. Whether a store written by
+one Chromium milestone is readable by a much older one is not established either;
+the two that were measured are 157 (WebView2) and 154 (CEF).
 
 ## 23. The download-on-demand design, and what it costs (2026-11-20)
 
@@ -1802,8 +1805,8 @@ key, re-encrypt with the target key (`v10` + 12-byte nonce + AES-256-GCM over
 key rejects the new blob.
 
 What is *not* encrypted - `localStorage`, IndexedDB, Cache Storage, service
-worker registrations - could be copied outright, but nothing reads across
-engines today.
+worker registrations - can be copied outright, because there is no key to
+translate; §25.5 is that copy, measured.
 
 **Consequence, and what the UI says:** a switch is normally a one-time login in
 the other engine. Each engine keeps its own stable profile (`profiles\<app>` /
@@ -1839,9 +1842,8 @@ verified against real engines and a local HTTP server:
 
 The row that the second test migrates is not hand-built: phase 1 lets WebView2
 write a cookie for a local page, and the test reuses that row's column values, so
-the only invented part is the key. `localStorage`, IndexedDB and Cache Storage
-are still not carried, so an app that keeps its session there can still ask for a
-login; nothing measured yet says which apps do.
+the only invented part is the key. Cookies are not the whole session for every
+app - see §25.5 for the stores that had to follow them.
 
 ### 25.2 Moving the data root: the pointer lives outside it
 
@@ -1869,6 +1871,83 @@ the locator for the settings page. Refusals are checked before scheduling, where
 the user can answer: not absolute, inside the current root, a parent of it, a
 file, not writable, or already holding files (merging two workspaces is not a
 move).
+
+**Scheduling used to write a second copy of the config and nothing else (fixed
+2026-11-23).** `schedule` re-read `config.json` from disk, set the field on that
+fresh parse and saved it, leaving the live `AppState::config` untouched. Two
+consequences, both user-visible:
+
+1. `data_move_state` reads the live struct, so the pane reported "nothing
+   queued" right after a successful save. The radios then fell back to "Default
+   folder", which reads as *"I picked a custom folder, saved, and it still points
+   at the default one."*
+2. Every unrelated save (`save_apps` after editing an app, `set_favorites`,
+   `bump_usage`, the settings form) serializes the whole live struct, so it
+   overwrote `config.json` and **erased the queued move**. The restart then
+   simply did nothing.
+
+`schedule` is now split: `plan(target)` does the filesystem checks and returns
+the target, `schedule(to, &mut cfg, path)` sets the field on the live config and
+saves. The lock is taken for the second call only - the checks include a write
+probe, which on a network share is not something to hold the config mutex
+across. The pane also treats a queued move as the user's answer, so the radio
+lands on "Custom folder" with the target filled in, instead of snapping back.
+
+**A move could also fail after the restart, with a message that named the wrong
+problem (fixed 2026-11-23).** The check at scheduling time was "writable", not
+"big enough". Measured: a 12.34 GiB data root was accepted for `F:\rustbox`, a
+drive with 7.00 GiB free; the copy wrote 0.76 GiB in 2,570 files and then died on
+`cef\<app>\Network\Cookies` with `os error 32` (sharing violation). Three
+separate defects hid behind that one error line:
+
+1. **No space check.** `probe_writable` writes two bytes and succeeds on a full
+   drive. `plan` now measures the tree and asks the target volume
+   (`GetDiskFreeSpaceExW`) whether it fits, with **2 GiB of headroom**, and
+   refuses with the numbers in the message ("needs 12 GB for the data plus 2.0 GB
+   of headroom, and that drive has 7.0 GB free (7.4 GB short)"). `move_root`
+   repeats the check, because free space can change between scheduling and the
+   next launch.
+   
+   The margin is 2 GiB rather than the megabytes a byte-for-byte copy needs, for
+   two reasons. A Chromium profile is a live database that grows while the user
+   browses: between picking the folder and the next start, a chat app can write
+   hundreds of megabytes of IndexedDB, so a move that fits by 50 MB at scheduling
+   time does not fit by then. And a drive filled to the last block is a broken
+   drive for everything else on it. Refusing with 2 GiB to spare costs a folder
+   choice; accepting and running out costs a half-copied tree on a full volume.
+2. **A half-copied tree was kept.** `free_for_use` refuses any target holding
+   files, so a failed move left a folder that made *every* retry answer "already
+   contains files" until the user deleted 0.76 GiB by hand. `move_root` now
+   rolls the target back to empty on failure, keeping only the locator.
+3. **A transient lock was treated as fatal.** The move runs at the start of the
+   next launch, but the previous instance may not have finished exiting - closing
+   the window does not wait for Chromium's ~50 child processes, and its profile
+   files stay open until they are gone. `copy_file` now retries a sharing or lock
+   violation (`os error 32`/`33`) for ~3.5 s before failing, and its error says
+   "another RustBox window still has the file open" instead of the bare errno.
+
+**The move is now all-or-nothing (2026-11-23).** The order was already the safe
+one - copy, verify, write the locator, and only then delete the source - but three
+paths could still leave the target holding files that the next attempt would be
+refused for. All three now roll back:
+
+- **A failed copy.** Covered above: `rollback(to)` empties the target.
+- **A failed locator write, after a successful copy.** The target was left full
+  and the source intact, so the *data* was safe, but every later attempt was
+  answered with "already contains files". `apply` now rolls the target back on
+  that path too, and on a failed config write.
+- **A source that was still being written to.** A new consistent-copy rule:
+  the tree is measured before the copy and again after. If the numbers moved, the
+  attempt is discarded and retried (3 attempts, 2 s apart), because a file count
+  that matches says nothing about *consistency*. Two leveldb files copied a
+  second apart can each be whole and still describe different moments.
+
+`rollback` keeps the locator, since it describes a location rather than being
+data. That is what makes the "move back to the default folder" retry work.
+
+`plan` also moved off the IPC thread (`spawn_blocking`), because measuring the
+tree walks 110k files and took 3.1 s here - a sync command would freeze the
+settings pane for that long.
 
 ### 25.3 The shell window has to be told, and Tauri only accepts one particular hook
 
@@ -1939,14 +2018,17 @@ Measured after the fix (`cef\<app>`, a direct child):
   both binaries installed or an optional Chromium download. It also ends the
   per-app engine choice: the runtime is per-process, so `Engine::Chromium`
   cannot be per-app.
-- **Switching engines carries cookies, and only cookies (§22.2, §25.1).**
+- **Switching engines carries the session: cookies, and since 2026-11-23 the
+  stores that hold a device pairing (§22.2, §25.1, §25.5).**
   `config.json` and `session.json` survive a switch, and so do cookies: on
   Windows, `cookie_migrate` re-encrypts every embedded app's rows into the
   incoming engine's jar at startup, verified in both directions against the real
-  engines (§25.1). Profiles must still never be shared between engines.
-  `localStorage`, IndexedDB, Cache Storage and granted permissions are *not*
-  carried, so an app that keeps its session there still asks for a login. The
-  rest of the platforms have no equivalent: the DPAPI/CNG path is Windows-only.
+  engines (§25.1). `IndexedDB` and `Local Storage` are copied as files, because a
+  chat app keeps its pairing there and a cookie-only switch left WhatsApp asking
+  for a QR code. Cache Storage, service-worker state and granted permissions are
+  *not* carried; they are derived data the browser rebuilds. Profiles must still
+  never be shared between engines. The rest of the platforms have no equivalent:
+  the DPAPI/CNG path is Windows-only.
 - **Each CEF app gets its own profile, as a direct child of `cef\` (§25.4).**
   A nested `cef\profiles\<app>` is refused by Chrome and silently shares
   `Default`, which would put every Chromium app in one cookie jar.
@@ -1996,6 +2078,113 @@ Measured after the fix (`cef\<app>`, a direct child):
   UI has to say so rather than offering a choice that behaves identically.
 - Every future tab feature must be implemented for two backends or abstracted.
   That is the recurring cost, not the one-time work.
+
+### 25.5 Carrying site storage, because cookies are not the whole session (2026-11-23)
+
+§25.1 carries the cookie jar and nothing else. That is enough for Gmail, whose
+login is a cookie, and **not** enough for WhatsApp, which keeps its device pairing
+in IndexedDB (`model-storage`, and the `wawc` / `wawc_db_enc` databases) and asks
+for a QR code when it finds them empty. The user hit exactly that: Gmail came
+across signed in, WhatsApp did not.
+
+Measured on this machine, one app (`app-mvixi8yk-ck5w5`):
+
+| Store | WebView2 profile | CEF profile before the copy |
+| --- | --- | --- |
+| `IndexedDB` | 403,004,098 B / 310 files (WhatsApp origin 385.8 MB + 10.4 MB blob) | 449,857 B |
+| `Local Storage` | 417,727 B / 11 files | 2,452 B |
+| `Service Worker` | 517,663,664 B / 3,896 files | - |
+
+The CEF IndexedDB log said it plainly: `existing version for the database:
+model-storage is null`, i.e. the site built its database from scratch. After
+copying `IndexedDB` + `Local Storage` and nothing else, the same log shows a
+21,604-key compaction and the app came up signed in - verified through its own
+MCP bridge, `{"title":"(81) WhatsApp","qr":false,"pane":true}`, 81 unread.
+
+**These stores need no key.** Unlike the jar, they are LevelDB the browser reads
+as-is, so the copy is a file copy; the Chromium milestone difference (157 on
+WebView2, 154 on CEF) did not matter, because the database names and versions the
+site checks are the site's own.
+
+**What is copied:** `IndexedDB` (both the `.leveldb` and `.blob` directories - the
+records point at the blob store, so one without the other is a database pointing
+at nothing) and `Local Storage`.
+
+**What is not, and why:** `Cache`, `Code Cache`, `GPUCache`, `Service Worker`,
+`Shared Dictionary` are derived data that the browser rebuilds; copying them would
+add 518 MB per WhatsApp profile and buy nothing. `Session Storage` is cleared when
+the browser closes, so it carries nothing across the restart a switch requires.
+
+**When it refuses.** The copy runs per store, and only when the incoming engine's
+store is not worth keeping: `target_bytes > 16 KB && target_bytes * 4 >=
+source_bytes`. A directory that holds Chromium's scaffolding, or the small
+database a site writes when it finds no session (449 KB against a 386 MB source),
+is a stub and is **replaced**, not merged - two leveldbs cannot be merged by
+copying files, and the stub is what produced the QR code. A target of comparable
+size is a session the user has been using on the new engine, and overwriting it
+would sign them out to fix a problem they may no longer have. That also makes the
+switch back safe: returning to WebView2 finds its own 403 MB store intact and
+leaves it alone.
+
+`src-tauri/src/cookie_migrate.rs` implements this (`carry_site_storage`,
+`worth_keeping`), runs it from the same startup hook as the cookies, and reports
+what it did in the same note. Eight unit tests cover the cases that matter: an
+empty target is filled, a stub is replaced, a comparable target is untouched,
+scaffolding does not block the copy, nested leveldb directories keep their shape,
+an unknown profile root is skipped rather than guessed, and the size boundary.
+
+### 25.6 Unmeasured
+
+Whether the copy helps an app other than WhatsApp; it was measured for one. Whether
+a store written by a much newer Chromium is readable by a much older one (157 →
+154 is fine; 160 → 140 is not established). Whether an interrupted copy - power
+loss mid-`copy_tree` - leaves a profile the browser accepts; the copy is per
+directory and a torn leveldb is normally recovered by LevelDB's own log replay,
+but that was not tested.
+
+### 25.7 A "logged out" app that was never logged out (2026-11-23)
+
+After the switch to CEF, all three Gmail apps opened on Google's account chooser,
+which reads as "the migration lost my sessions". It had not. The cookies were
+intact and byte-identical to the WebView2 jar: `SID`, `HSID`, `SSID`, `APISID`,
+`SAPISID` and all four `__Secure-*PSID*` rows decrypt to the same values on both
+sides, all `v10`, all unexpired, and Google answers `301 -> /mail/` for them.
+Pointing one app back at `mail.google.com` showed `Inbox (47,624)` with no
+sign-in at all.
+
+The real cause was **session restore**: a tab had been remembered while it sat on
+`accounts.google.com/v3/signin/accountchooser?continue=...`, and that URL was
+restored on every launch. The chooser does not navigate on its own - it waits for
+a click - so the app came back on a page that says "choose an account" and stayed
+there. Saving it again made the state permanent. `session::settle` now rewrites a
+sign-in page back to the page it was returning to (`continue` for Google,
+`redirectTo` for better-auth, `next`/`return_to`/`followup` for the rest), on both
+the save and the restore path, so an existing profile repairs itself on the next
+launch. A sign-in page with no return target is left alone.
+
+Three checks worth keeping, because each one rules out a different theory:
+
+- **Not app-bound encryption.** Every cookie is `v10`; `v20` (App-Bound) never
+  appears, so `read_key`'s DPAPI path is the right one for both engines.
+- **Not DBSC.** CEF creates a `Device Bound Sessions` SQLite file and WebView2
+  does not, but its `dbsc_session_tbl` is empty: nothing was ever bound.
+- **Not the migration.** The rows' `creation_utc`/`last_update_utc` are identical
+  across engines, which is only true if they were copied rather than reissued.
+
+The apps that *were* genuinely signed out (`9Router`, `Vault`, four `dtakah`
+staff accounts) were signed out on WebView2 as well, with the same tokens:
+`dtakah`'s own `better-auth` recorded `{"trigger":"signout"}` on 2026-11-14, nine
+days before the switch. Nothing was lost there and nothing was recoverable from
+the old profile - the old profile holds the same dead token. The one account that
+still worked (`superadmin@kemhan.go.id`) proves the domain was reachable, not
+that the engine was at fault.
+
+### 25.8 Unmeasured
+
+Whether `settle` is the right rule for a site whose sign-in page *is* the page the
+user wants to keep (a deliberate "log in as someone else" tab). It is rewritten to
+the destination, so that tab comes back signed-in-or-redirected rather than on the
+form. Whether other engines' auth flows use a parameter outside the five listed.
 
 ## 26. Shipping it: one installer, two executables (2026-11-23)
 
@@ -2097,3 +2286,113 @@ root (`RB_DATA_ROOT`) holding a payload-only engine directory and a stand-in
 into `engines\cef\154.0.34\` with the sibling's content and no download - the exact
 transition that was previously impossible. The user's real engine directory was
 left untouched by that test.
+
+## 27. Disk, after the engine switch: what it was, and the two changes that came out of it (2026-11-23)
+
+The report was "disk C: is busy, I am worried about the SSD". Measured instead of
+guessed, and the shape of the answer is worth recording because most of it was
+*not* something to fix in code.
+
+Attribute, over a 240-300 s window, by diffing file fingerprints under the data
+root while sampling `\PhysicalDisk(1 c:)\Disk Write Bytes/sec` in parallel:
+
+| State | Disk C: writes | RustBox share |
+|---|---|---|
+| WhatsApp visible | 4.7-10.9 MB/s (peak 27) | 66 % |
+| WhatsApp navigated to `about:blank` | 0.98 MB/s | - |
+| Reloaded | 6.2 MB/s | - |
+
+The decisive test is the first two rows: unloading *one* app, without touching
+anything else, divides total disk writes by ten. Edge (96 processes, 12 tabs)
+was the other large writer at ~5.7 MB/s, so RustBox was not the only cause.
+
+The storm is WhatsApp's IndexedDB under CEF, not the engine generally:
+
+| | WebView2 | CEF |
+|---|---|---|
+| `https_web.whatsapp.com_0.indexeddb.leveldb` | 94.6 MB, 53 `.ldb` | 203 MB, 98-129 `.ldb` |
+| `MANIFEST` | 940 KB | 17.8 MB |
+| `Compacting` lines in `LOG` | 132 | 1,204 |
+| `Generated table` lines | 483 | 7,446 |
+
+Two other suspects were ruled out by measurement. Cookie-jar flushes are 18
+events / 120 s across 22 profiles (~24 KB/s at 160 KB each). The 3,322 files with
+an mtime in **2097** are not rewrites: Chromium stamps extension assets with a
+far-future mtime as an anti-tamper marker, so a naive "files with mtime newer than
+T" scan counts them as written on every pass. Excluding them is what made the
+attribution in the table above trustworthy.
+
+SSD: C: is a TEAM TM8FPK001T (1 TB, Phison E21, Micron 176L TLC, 600 TBW).
+`Wear = 0`, `HealthStatus = Healthy`, 50-53 °C against a 90 °C maximum. At the
+measured 3 MB/s sustained (~250 GiB/day) that is years, not months; at 10 MB/s
+24/7 (~860 GiB/day) it falls to roughly two years. Worth stopping, not an
+emergency.
+
+### 27.1 D - external extensions were installing themselves into every profile
+
+Every CEF profile contained the same seven Web Store extensions, 22 copies each,
+2.97 GB total. All seven carried `disable_reasons = 8192`
+(`DISABLE_EXTERNAL_EXTENSION`), i.e. already inert. Their `location` split 6 / 1
+between `EXTERNAL_PREF_DOWNLOAD` and `EXTERNAL_REGISTRY`, which looked like an
+`external_extensions.json`; there is none. The source is the Windows registry that
+Chromium reads before the profile exists:
+
+- `HKLM\SOFTWARE\WOW6432Node\Google\Chrome\Extensions` - four keys with only
+  `update_url` (Avira Password Manager, Avira Safe Shopping, Adobe Acrobat, one
+  unknown).
+- `HKCU\SOFTWARE\Google\Chrome\Extensions` - three keys, one of which carries a
+  `path` to `ChromeExtensionCache\autoclaw-chrome-0.1.6.crx`.
+
+The registry/`location` correlation is exact: the six `update_url`-only keys are
+the six `EXTERNAL_PREF_DOWNLOAD` entries, and the one key with a `path` is the
+`EXTERNAL_REGISTRY` entry. `--disable-external-extensions` does not exist in this
+CEF build (`libcef.dll` carries `disable-extensions-except` and
+`allowlisted-extension-id`, and the latter only *adds* permission allowlist
+entries - it cannot block anything), so the only lever is the source.
+
+Applied: both key sets exported to
+`%LOCALAPPDATA%\rustbox\backup-ext-registry-<stamp>\*.reg`, the seven keys
+removed, and the 22x7 directories deleted with the app closed. `%LOCALAPPDATA%\rustbox\cef`
+went from 4.10 GB to 1.17 GB. Re-launched and re-checked: zero extension
+directories came back. The removal covers Chrome as well, but every one of the
+seven was already `disable_reasons = 8192` in the user's Chrome profiles, so
+nothing functional was lost; the `.reg` backup makes it reversible.
+
+### 27.2 E - a ceiling on the HTTP disk cache
+
+Chromium has no upper bound on its HTTP disk cache; it grows to ~320 MiB per cache
+backend and stays there, and RustBox gives every app its own backend. `engine.rs`
+now appends `--disk-cache-size=134217728` (128 MiB) for the CEF build only. It is
+deliberately not in `webview_args::BASE`: that constant is mirrored into
+`tauri.conf.json` and pinned by a test, and WebView2 already caps its own budget.
+
+128 MiB is a ceiling, not a target - measured profiles average ~14 MB and peak
+near 98 MB, so a healthy profile is untouched. Two tests pin it: the switch must
+not appear in `BASE`, and the value must be below Chromium's default (or it would
+never apply) and above 64 MiB (or eviction would write more, not less).
+`--media-cache-size` is *not* used: `findstr` shows it absent from this
+`libcef.dll`.
+
+### 27.3 What D and E do not do
+
+Neither stops the WhatsApp storm. D reclaimed disk that was already inert; E bounds
+a cache that is not the churning store. The storm is a site IndexedDB, and it only
+stops by giving that site a fresh database (re-link WhatsApp) or moving the data
+root to another disk.
+
+### 27.4 Unmeasured
+
+Whether CEF applies `--disk-cache-size` per request context rather than only to the
+default backend. The switch is browser-process-only, so it does not appear in any
+child `CommandLine`, and `Browser.getBrowserCommandLine` refuses without
+`--enable-automation`; the value is therefore verified in code and by the two
+tests, not read back from the running process. Whether the seven registry keys
+reappear when Avira/Adobe/NordVPN installers run again. Whether removing them
+removes the extensions from Chrome profiles or merely stops future provisioning.
+
+One thing that is *not* a regression from D or E, checked because three Gmail apps
+came back on `accounts.google.com/v3/signin/accountchooser`: their Google cookies
+are present, decrypt to the same 153-byte values as the WebView2 jars, and expire
+in 371 days. Google reports the accounts as "Signed out", which is a server-side
+invalidation, the same class as 25.7. Removing extension directories and registry
+keys cannot touch a cookie jar.
