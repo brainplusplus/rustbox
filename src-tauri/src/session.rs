@@ -174,6 +174,7 @@ impl Session {
         }
     }
 
+
     /// Remember every tab of `app_id`, in strip order.
     ///
     /// `base_url` is the app's configured start page at the time of saving, and
@@ -192,7 +193,7 @@ impl Session {
             .enumerate()
             .map(|(i, (url, title))| SavedTab {
                 position: i,
-                url: url.clone(),
+                url: settle(url),
                 title: title.clone(),
             })
             .collect();
@@ -226,9 +227,16 @@ impl Session {
         }
         let mut tabs = saved.tabs.clone();
         tabs.sort_by_key(|t| t.position);
+        // A file written before [`settle`] existed can still hold a dead
+        // sign-in URL, so the same rewrite is applied on the way out.
+        for tab in tabs.iter_mut() {
+            tab.url = settle(&tab.url);
+        }
         // The stored index refers to the file's own order, so resolve it against
         // the sorted list by the tab it actually named rather than by number.
-        let active_url = saved.tabs.get(saved.active).map(|t| t.url.clone());
+        // That name has to be settled too, or the two sides never compare equal
+        // once the URL was rewritten.
+        let active_url = saved.tabs.get(saved.active).map(|t| settle(&t.url));
         let mut active = active_url
             .and_then(|url| tabs.iter().position(|t| t.url == url))
             .unwrap_or(0);
@@ -271,6 +279,54 @@ impl Session {
             }
         }
         Some(active.min(tabs.len().saturating_sub(1))).map(|active| (tabs, active))
+    }
+}
+
+/// Rewrite a sign-in page back to the page it was asking to return to.
+///
+/// A tab that lands on a sign-in page is not proof of a lost session: the page
+/// is what Google shows while it still holds the cookie, and
+/// `/v3/signin/accountchooser` never moves on by itself - it waits for a click.
+/// Remembering that URL meant every later launch restored a chooser that sits
+/// there forever, which reads as "logged out" while the session is untouched.
+/// Measured: all three Gmail apps were parked on `accountchooser` and showed
+/// their inbox (`Inbox (47,624)`) the moment they were pointed back at
+/// `mail.google.com`, with no new sign-in.
+///
+/// The return target is in the URL itself, so it is recovered rather than
+/// guessed: Google writes `continue`, better-auth writes `redirectTo`, the rest
+/// use `next`/`return_to`/`followup`. A sign-in page with no target is left
+/// alone - there is nothing better to put in its place.
+fn settle(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    // Only pages that are asking for a sign-in. Not `auth/` on its own: an
+    // OAuth callback lives there too, and rewriting *that* would break it.
+    let sign_in = ["signin", "sign-in", "sign_in", "accountchooser", "login", "log-in"]
+        .iter()
+        .any(|needle| parsed.path().to_ascii_lowercase().contains(needle));
+    if !sign_in {
+        return url.to_string();
+    }
+    const TARGETS: [&str; 5] = ["continue", "redirectTo", "next", "return_to", "followup"];
+    let target = TARGETS.iter().find_map(|name| {
+        parsed
+            .query_pairs()
+            .find(|(key, _)| key == *name)
+            .map(|(_, value)| value.to_string())
+    });
+    let Some(target) = target else {
+        return url.to_string();
+    };
+    // Resolved against the sign-in origin, since better-auth encodes a path
+    // (`%2Faccount`) while Google writes a whole URL.
+    match parsed.join(&target) {
+        Ok(mut target) if target.scheme() == "https" || target.scheme() == "http" => {
+            target.set_fragment(None);
+            target.to_string()
+        }
+        _ => url.to_string(),
     }
 }
 
@@ -611,6 +667,57 @@ mod tests {
         let (tabs, _) = session.restore_plan("app-f", "https://base.test").unwrap();
         assert_eq!(tabs[0].url, "https://base.test");
         assert_eq!(tabs[1].url, "https://second.test");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The bug this exists for: a tab parked on Google's account chooser was
+    /// remembered as `accounts.google.com/...accountchooser`, and every launch
+    /// restored that dead page. The session was never lost - the chooser just
+    /// waits for a click - so the app looked logged out while it was not.
+    #[test]
+    fn a_remembered_sign_in_page_becomes_the_page_it_was_returning_to() {
+        let chooser = "https://accounts.google.com/v3/signin/accountchooser\
+                       ?continue=https://mail.google.com/mail/u/0/&emr=1&flowName=GlifWebSignIn\
+                       &service=mail&dsh=S-701902042:1795413897382106";
+        assert_eq!(settle(chooser), "https://mail.google.com/mail/u/0/");
+
+        // better-auth writes the destination as an encoded path, not a URL.
+        let better_auth = "https://dtakahv2.kemhan.go.id/auth/sign-in?redirectTo=%2Faccount";
+        assert_eq!(
+            settle(better_auth),
+            "https://dtakahv2.kemhan.go.id/account"
+        );
+
+        // A sign-in page with nothing to return to is a page like any other:
+        // guessing a destination for it would lose where the user was.
+        assert_eq!(
+            settle("https://dtakahv2.kemhan.go.id/auth/sign-in"),
+            "https://dtakahv2.kemhan.go.id/auth/sign-in"
+        );
+        // And a normal page is untouched, including one with a `next` that is
+        // not a sign-in at all.
+        assert_eq!(settle("https://mail.google.com/mail/u/0/#inbox"),
+                   "https://mail.google.com/mail/u/0/#inbox");
+        assert_eq!(settle("https://9r.aliyun.biz.id/login"),
+                   "https://9r.aliyun.biz.id/login");
+    }
+
+    /// The same rewrite has to happen on the way *out*, because the file on disk
+    /// already holds the dead URL. Rewriting only on save would leave every
+    /// existing profile stuck until the user clicked something.
+    #[test]
+    fn a_stored_sign_in_url_is_repaired_on_restore() {
+        let path = temp_path("stale-signin");
+        std::fs::write(
+            &path,
+            r#"{"apps":{"app-g":{"base_url":"https://mail.google.com","tabs":[
+                {"position":0,"url":"https://accounts.google.com/v3/signin/accountchooser?continue=https://mail.google.com/mail/u/0/"}]}}}"#,
+        )
+        .unwrap();
+        let session = Session::load(&path);
+        let (tabs, _) = session.restore_plan("app-g", "https://mail.google.com").unwrap();
+        assert_eq!(tabs[0].url, "https://mail.google.com/mail/u/0/");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
