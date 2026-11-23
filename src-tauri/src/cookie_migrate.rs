@@ -1,9 +1,18 @@
-//! Carrying an app's cookies across an engine switch.
+//! Carrying an app's session across an engine switch.
 //!
 //! Switching between the OS webview and Chromium changes which directory holds
 //! the app's profile, so the session does not follow on its own: the user lands
-//! on a login page. This module copies the cookies across, once, at the start of
-//! the first launch on the new engine.
+//! on a login page. This module copies it across, once, at the start of the
+//! first launch on the new engine.
+//!
+//! Two different things have to move, and they fail differently:
+//!
+//! * **Cookies** are encrypted with a key from each engine's own `Local State`,
+//!   so they are decrypted and re-encrypted rather than copied.
+//! * **Site storage** (`IndexedDB`, `Local Storage`) is not encrypted at all, so
+//!   it is copied as files. This is what a chat app keeps its device pairing in,
+//!   and without it a cookie-only migration leaves WhatsApp asking for a QR code
+//!   while Gmail, which lives on cookies, comes across signed in.
 //!
 //! Why it has to be at startup, and why it is a copy rather than a move: a
 //! running browser holds the cookie database open, and copying an open SQLite
@@ -77,6 +86,13 @@ pub struct Report {
     pub copied: usize,
     /// Rows the source key could not open, so they were left behind.
     pub unreadable: usize,
+    /// Site-storage directories copied (IndexedDB, Local Storage).
+    pub stores: usize,
+    /// Bytes those directories hold, so the cost is not a surprise.
+    pub store_bytes: u64,
+    /// Apps whose site storage was left alone because the target already had
+    /// some. A profile that is in use is never overwritten.
+    pub stores_kept: usize,
     /// Apps that could not be migrated, with the reason.
     pub failures: Vec<String>,
 }
@@ -90,6 +106,20 @@ impl Report {
             engine_label(to),
             self.apps
         );
+        if self.stores > 0 {
+            line.push_str(&format!(
+                "; plus {} site-storage director{} ({} MB), which is what a chat app keeps its device pairing in",
+                self.stores,
+                if self.stores == 1 { "y" } else { "ies" },
+                self.store_bytes / (1024 * 1024)
+            ));
+        }
+        if self.stores_kept > 0 {
+            line.push_str(&format!(
+                "; {} app(s) already had site storage on the new engine, so theirs was left untouched",
+                self.stores_kept
+            ));
+        }
         if self.unreadable > 0 {
             line.push_str(&format!(
                 "; {} cookie(s) could not be read with the old engine's key and were left behind",
@@ -110,10 +140,15 @@ fn engine_label(runtime: Runtime) -> &'static str {
     }
 }
 
-/// The two files that make up one engine's cookie storage for one app.
+/// The two files that make up one engine's cookie storage for one app, plus the
+/// directory its site storage lives in.
 struct Jar {
     cookies: PathBuf,
     local_state: PathBuf,
+    /// Root of the app's site storage: `IndexedDB`, `Local Storage`, and the
+    /// rest hang off it. `None` when the layout is not known for the mode, so a
+    /// missing answer can never be mistaken for "empty".
+    site_root: Option<PathBuf>,
 }
 
 fn wry_jar(app_id: &str, mode: crate::config::ProfileMode) -> Jar {
@@ -125,6 +160,7 @@ fn wry_jar(app_id: &str, mode: crate::config::ProfileMode) -> Jar {
             Jar {
                 cookies: env.join("Default").join("Network").join("Cookies"),
                 local_state: env.join("Local State"),
+                site_root: Some(env.join("Default")),
             }
         }
         // A `Light` profile is a named profile inside the shell's own user-data
@@ -135,18 +171,19 @@ fn wry_jar(app_id: &str, mode: crate::config::ProfileMode) -> Jar {
                 .join("Network")
                 .join("Cookies"),
             local_state: crate::paths::root().join("EBWebView").join("Local State"),
+            site_root: Some(crate::paths::light_profile(app_id)),
         },
     }
 }
 
 fn cef_jar(app_id: &str) -> Jar {
+    let profile = crate::paths::cef_profile(app_id);
     Jar {
-        cookies: crate::paths::cef_profile(app_id)
-            .join("Network")
-            .join("Cookies"),
+        cookies: profile.join("Network").join("Cookies"),
         // One key for the whole engine root: CEF keeps a single `Local State`,
         // unlike WebView2, which keeps one per user-data directory.
         local_state: crate::paths::cef_root().join("Local State"),
+        site_root: Some(profile),
     }
 }
 
@@ -178,7 +215,12 @@ pub fn startup(config_path: &Path) -> Option<String> {
     let mut notes = Vec::new();
     if previous != now {
         let report = migrate(&config, previous, now);
-        if report.copied > 0 || !report.failures.is_empty() || report.unreadable > 0 {
+        if report.copied > 0
+            || report.stores > 0
+            || report.stores_kept > 0
+            || !report.failures.is_empty()
+            || report.unreadable > 0
+        {
             notes.push(report.describe(previous, now));
         }
         if !report.failures.is_empty() {
@@ -202,7 +244,8 @@ pub fn startup(config_path: &Path) -> Option<String> {
     }
 }
 
-/// Copy every embedded app's cookies from `from`'s jar to `to`'s.
+/// Copy every embedded app's cookies from `from`'s jar to `to`'s, and carry the
+/// site storage a chat app keeps its pairing in.
 fn migrate(config: &Config, from: Runtime, to: Runtime) -> Report {
     let mut report = Report::default();
 
@@ -214,20 +257,185 @@ fn migrate(config: &Config, from: Runtime, to: Runtime) -> Report {
         }
         let source = jar(from, &app.id, app.profile_mode);
         let target = jar(to, &app.id, app.profile_mode);
-        if !source.cookies.exists() {
-            continue;
-        }
-        match copy_app(&source, &target, to == Runtime::OsWebview) {
-            Ok((copied, unreadable)) => {
-                report.apps += 1;
-                report.copied += copied;
-                report.unreadable += unreadable;
+        if source.cookies.exists() {
+            match copy_app(&source, &target, to == Runtime::OsWebview) {
+                Ok((copied, unreadable)) => {
+                    report.apps += 1;
+                    report.copied += copied;
+                    report.unreadable += unreadable;
+                }
+                Err(e) => report.failures.push(format!("{}: {e}", app.name)),
             }
-            Err(e) => report.failures.push(format!("{}: {e}", app.name)),
+        }
+        // Independent of the cookies: an app whose jar is gone can still have
+        // the storage that holds its login.
+        match carry_site_storage(&source, &target) {
+            Ok(Carried::Copied { dirs, bytes }) => {
+                report.stores += dirs;
+                report.store_bytes += bytes;
+            }
+            Ok(Carried::TargetInUse) => report.stores_kept += 1,
+            Ok(Carried::Nothing) => {}
+            Err(e) => report
+                .failures
+                .push(format!("{} site storage: {e}", app.name)),
         }
     }
 
     report
+}
+
+/// What carrying one app's site storage did.
+enum Carried {
+    /// Directories copied and the bytes they hold.
+    Copied { dirs: usize, bytes: u64 },
+    /// The destination already had storage of its own, so nothing was touched.
+    TargetInUse,
+    /// The source had nothing to carry.
+    Nothing,
+}
+
+/// The directories a site keeps its session in, and nothing else.
+///
+/// Deliberately short, and only what was measured. `Cache`, `Code Cache`,
+/// `GPUCache`, `Service Worker` and `Shared Dictionary` are derived data:
+/// copying them costs hundreds of megabytes and buys nothing, because the
+/// browser rebuilds them on the next load. Measured on this machine, one
+/// WhatsApp profile was 386 MB of IndexedDB plus **518 MB of Service Worker
+/// cache** — the second half is what makes a naive "copy the whole profile"
+/// approach feel like a mistake. `Session Storage` is cleared when the browser
+/// closes, so it carries nothing across a restart.
+const SITE_STORES: [&str; 2] = [
+    // IndexedDB and its blob side table are separate directories: the leveldb
+    // holds the records, the blob store holds the bytes they point at, so a copy
+    // of one without the other is a database pointing at nothing.
+    "IndexedDB",
+    "Local Storage",
+];
+
+/// Copy an app's site storage into the incoming engine, unless it has a session
+/// of its own there.
+///
+/// # Why this is safe
+///
+/// These stores are **not** encrypted per engine, unlike the cookie jar: they are
+/// LevelDB the browser reads as-is. Measured across WebView2 157 and CEF 154 —
+/// different Chromium milestones and different keys — one WhatsApp profile
+/// carried its `IndexedDB` across and came up signed in (`qr: false`,
+/// `pane: true`, 81 unread), while a fresh profile asked for a QR code. The
+/// database names and versions the site checks (`model-storage` v217) are the
+/// site's own, so they agree whenever the site is the same site.
+///
+/// # Why it refuses to overwrite
+///
+/// A target that already holds storage belongs to a session the user has been
+/// using on the new engine. Replacing it would sign them *out* to fix a problem
+/// they may no longer have, so a copy only fills what is empty.
+fn carry_site_storage(source: &Jar, target: &Jar) -> Result<Carried, String> {
+    let (Some(from), Some(to)) = (&source.site_root, &target.site_root) else {
+        return Ok(Carried::Nothing);
+    };
+    // Same tree on both sides cannot happen (the two engines never share a
+    // profile root), but copying a directory onto itself is not something to
+    // find out the hard way.
+    if from == to {
+        return Ok(Carried::Nothing);
+    }
+    let mut dirs = 0;
+    let mut bytes = 0;
+    let mut kept = 0;
+    for name in SITE_STORES {
+        let src = from.join(name);
+        if !src.is_dir() {
+            continue;
+        }
+        let src_bytes = tree_bytes(&src);
+        if src_bytes <= MIN_STORE_BYTES {
+            continue;
+        }
+        let dst = to.join(name);
+        if worth_keeping(tree_bytes(&dst), src_bytes) {
+            kept += 1;
+            continue;
+        }
+        // A stub the site created when it found nothing is replaced, not merged:
+        // two leveldbs cannot be merged by copying files, and the stub is the
+        // thing that made the user see a QR code.
+        if dst.exists() {
+            std::fs::remove_dir_all(&dst)
+                .map_err(|e| format!("could not clear {}: {e}", dst.display()))?;
+        }
+        copy_tree(&src, &dst)?;
+        dirs += 1;
+        bytes += tree_bytes(&dst);
+    }
+    Ok(match (dirs, kept) {
+        (0, 0) => Carried::Nothing,
+        (0, _) => Carried::TargetInUse,
+        _ => Carried::Copied { dirs, bytes },
+    })
+}
+
+/// Whether a target store already holds something worth protecting.
+///
+/// Size, not existence: Chromium creates these directories on first launch and
+/// writes a `CURRENT`, a `LOCK` and a `MANIFEST` before the site has stored
+/// anything, and a site that found no session writes a small database of its own
+/// (measured: 449 KB for WhatsApp) while the real one is hundreds of megabytes.
+/// A quarter of the source is the line between "a session someone has been
+/// using" and "a stub", and it is deliberately generous to the target: a real
+/// session is never a small fraction of the one it replaced.
+fn worth_keeping(target_bytes: u64, source_bytes: u64) -> bool {
+    target_bytes > MIN_STORE_BYTES && target_bytes * 4 >= source_bytes
+}
+
+/// Below this, a store directory holds Chromium's own scaffolding (a `CURRENT`,
+/// a `LOCK`, an empty `MANIFEST`) rather than a session.
+const MIN_STORE_BYTES: u64 = 16 * 1024;
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => total += tree_bytes(&path),
+            Ok(t) if t.is_file() => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => {}
+        }
+    }
+    total
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("could not create {}: {e}", dst.display()))?;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("could not read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("could not read {}: {e}", src.display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("could not stat {}: {e}", from.display()))?;
+        if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| {
+                format!(
+                    "could not copy {} to {}: {e}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+        // Anything else (a junction, a device node) is not part of a LevelDB and
+        // is skipped rather than followed.
+    }
+    Ok(())
 }
 
 /// Move one app's rows from `source` to `target`.
@@ -981,10 +1189,12 @@ mod tests {
         let source_jar = Jar {
             cookies: dir.join("source").join("Cookies"),
             local_state: dir.join("source").join("Local State"),
+            site_root: None,
         };
         let target_jar = Jar {
             cookies: dir.join("target").join("Cookies"),
             local_state: dir.join("target").join("Local State"),
+            site_root: None,
         };
 
         let source_key = [11u8; 32];
@@ -1045,10 +1255,12 @@ mod tests {
         let source_jar = Jar {
             cookies: dir.join("source").join("Cookies"),
             local_state: dir.join("source").join("Local State"),
+            site_root: None,
         };
         let target_jar = Jar {
             cookies: dir.join("target").join("Cookies"),
             local_state: dir.join("target").join("Local State"),
+            site_root: None,
         };
 
         write_key(&source_jar.local_state, &[21u8; 32]).unwrap();
@@ -1080,11 +1292,13 @@ mod tests {
         let source_jar = Jar {
             cookies: dir.join("source").join("Cookies"),
             local_state: dir.join("source").join("Local State"),
+            site_root: None,
         };
         jar_at(&source_jar.cookies, false);
         let target_jar = Jar {
             cookies: dir.join("target").join("Cookies"),
             local_state: dir.join("target").join("Local State"),
+            site_root: None,
         };
         let err = copy_app(&source_jar, &target_jar, true).unwrap_err();
         assert!(err.contains("no cookie key"), "{err}");
@@ -1109,5 +1323,231 @@ mod tests {
     fn a_missing_local_state_has_no_key_and_is_not_an_error() {
         let dir = scratch("absent");
         assert_eq!(read_key(&dir.join("Local State")).unwrap(), None);
+    }
+
+    /// A jar whose cookie files are irrelevant to a storage test, plus the
+    /// profile root the stores hang off.
+    fn storage_jar(root: &Path) -> Jar {
+        Jar {
+            cookies: root.join("Network").join("Cookies"),
+            local_state: root.join("Local State"),
+            site_root: Some(root.to_path_buf()),
+        }
+    }
+
+    /// One file of `bytes` bytes at `path`, parents created.
+    fn store_file(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![7u8; bytes]).unwrap();
+    }
+
+    /// The store a real app writes: a leveldb directory with one large table.
+    fn whatsapp_store(profile: &Path, bytes: usize) -> PathBuf {
+        let dir = profile
+            .join("IndexedDB")
+            .join("https_web.whatsapp.com_0.indexeddb.leveldb");
+        store_file(&dir.join("000003.log"), bytes);
+        dir
+    }
+
+    /// The case the feature exists for: the new engine has nothing, so the old
+    /// engine's store is copied whole.
+    #[test]
+    fn an_empty_target_receives_the_sites_storage() {
+        let dir = scratch("store-absent");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        whatsapp_store(&dir.join("source"), 200 * 1024);
+
+        match carry_site_storage(&source, &target).unwrap() {
+            Carried::Copied { dirs, bytes } => {
+                assert_eq!(dirs, 1, "one store was carried");
+                assert_eq!(bytes, 200 * 1024, "the size reported is the copy's");
+            }
+            Carried::TargetInUse => panic!("an empty target cannot be in use"),
+            Carried::Nothing => panic!("the source had a store to carry"),
+        }
+        let copied = dir
+            .join("target")
+            .join("IndexedDB")
+            .join("https_web.whatsapp.com_0.indexeddb.leveldb")
+            .join("000003.log");
+        assert_eq!(std::fs::read(&copied).unwrap().len(), 200 * 1024);
+    }
+
+    /// Chromium creates the directories before the site writes anything, and a
+    /// site that found no session writes a small database of its own. That stub
+    /// is what made the user see a QR code, so it is replaced rather than
+    /// protected.
+    #[test]
+    fn a_stub_target_is_replaced_instead_of_protected() {
+        let dir = scratch("store-stub");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        whatsapp_store(&dir.join("source"), 200 * 1024);
+        let stub = whatsapp_store(&dir.join("target"), 4096);
+        store_file(&stub.join("stale.ldb"), 1024);
+
+        match carry_site_storage(&source, &target).unwrap() {
+            Carried::Copied { dirs, .. } => assert_eq!(dirs, 1),
+            _ => panic!("a stub must not count as a session"),
+        }
+        assert_eq!(
+            std::fs::read(stub.join("000003.log")).unwrap().len(),
+            200 * 1024,
+            "the stub's file was replaced by the real store"
+        );
+        assert!(
+            !stub.join("stale.ldb").exists(),
+            "the stub is replaced, not merged: two leveldbs cannot be merged by \
+             copying files"
+        );
+    }
+
+    /// A target of comparable size is a session the user has been using on the
+    /// new engine. Overwriting it would sign them out to fix a problem they may
+    /// no longer have.
+    #[test]
+    fn a_target_of_comparable_size_is_left_alone() {
+        let dir = scratch("store-in-use");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        whatsapp_store(&dir.join("source"), 200 * 1024);
+        let in_use = whatsapp_store(&dir.join("target"), 180 * 1024);
+        let before = std::fs::read(in_use.join("000003.log")).unwrap();
+
+        assert!(matches!(
+            carry_site_storage(&source, &target).unwrap(),
+            Carried::TargetInUse
+        ));
+        assert_eq!(
+            std::fs::read(in_use.join("000003.log")).unwrap(),
+            before,
+            "the target's own storage was not touched"
+        );
+    }
+
+    /// A profile that holds nothing but scaffolding is not a session, so the
+    /// copy still runs. This is the state CEF leaves behind after one launch.
+    #[test]
+    fn scaffolding_alone_does_not_block_the_copy() {
+        let dir = scratch("store-scaffold");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        whatsapp_store(&dir.join("source"), 200 * 1024);
+        let scaffold = dir
+            .join("target")
+            .join("IndexedDB")
+            .join("https_web.whatsapp.com_0.indexeddb.leveldb");
+        std::fs::create_dir_all(&scaffold).unwrap();
+        for name in ["CURRENT", "LOCK", "MANIFEST-000001"] {
+            std::fs::write(scaffold.join(name), b"x").unwrap();
+        }
+
+        assert!(matches!(
+            carry_site_storage(&source, &target).unwrap(),
+            Carried::Copied { dirs: 1, .. }
+        ));
+    }
+
+    /// The leveldb lives one directory down and the blob store beside it, so the
+    /// copy has to keep the shape, not flatten it.
+    #[test]
+    fn nested_store_directories_keep_their_shape() {
+        let dir = scratch("store-nested");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        let leveldb = dir
+            .join("source")
+            .join("IndexedDB")
+            .join("https_site_0.indexeddb.leveldb");
+        store_file(&leveldb.join("000005.ldb"), 64 * 1024);
+        store_file(&leveldb.join("nested").join("deep.ldb"), 64 * 1024);
+        store_file(
+            &dir.join("source")
+                .join("IndexedDB")
+                .join("https_site_0.indexeddb.blob")
+                .join("1")
+                .join("0"),
+            64 * 1024,
+        );
+
+        assert!(matches!(
+            carry_site_storage(&source, &target).unwrap(),
+            Carried::Copied { dirs: 1, .. }
+        ));
+        let copied = dir.join("target").join("IndexedDB");
+        assert_eq!(
+            std::fs::read(copied.join("https_site_0.indexeddb.leveldb").join("000005.ldb"))
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+        assert_eq!(
+            std::fs::read(
+                copied
+                    .join("https_site_0.indexeddb.leveldb")
+                    .join("nested")
+                    .join("deep.ldb")
+            )
+            .unwrap()
+            .len(),
+            64 * 1024
+        );
+        assert_eq!(
+            std::fs::read(
+                copied
+                    .join("https_site_0.indexeddb.blob")
+                    .join("1")
+                    .join("0")
+            )
+            .unwrap()
+            .len(),
+            64 * 1024
+        );
+    }
+
+    /// Nothing to carry is not a failure, and it must not report a copy.
+    #[test]
+    fn a_source_without_stores_carries_nothing() {
+        let dir = scratch("store-empty");
+        let source = storage_jar(&dir.join("source"));
+        let target = storage_jar(&dir.join("target"));
+        std::fs::create_dir_all(dir.join("source")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        assert!(matches!(
+            carry_site_storage(&source, &target).unwrap(),
+            Carried::Nothing
+        ));
+    }
+
+    /// A jar whose site root is unknown is skipped rather than guessed at: a
+    /// wrong path would copy someone else's profile.
+    #[test]
+    fn an_unknown_site_root_is_not_guessed() {
+        let dir = scratch("store-unknown");
+        let mut source = storage_jar(&dir.join("source"));
+        source.site_root = None;
+        let target = storage_jar(&dir.join("target"));
+        whatsapp_store(&dir.join("source"), 200 * 1024);
+        assert!(matches!(
+            carry_site_storage(&source, &target).unwrap(),
+            Carried::Nothing
+        ));
+    }
+
+    /// The boundary the "is this a session or a stub" decision rests on.
+    #[test]
+    fn worth_keeping_draws_the_line_at_a_quarter_of_the_source() {
+        let min = MIN_STORE_BYTES;
+        // Scaffolding only, whatever the source looks like.
+        assert!(!worth_keeping(0, 1_000_000));
+        assert!(!worth_keeping(min, 1_000_000), "at the floor is still empty");
+        // Exactly a quarter is a session; a byte less is a stub.
+        assert!(worth_keeping(min + 1, 4 * (min + 1)));
+        assert!(!worth_keeping(min + 1, 4 * (min + 1) + 1));
+        // The measured pair: 449 KB in a 386 MB source is a stub.
+        assert!(!worth_keeping(449 * 1024, 386 * 1024 * 1024));
     }
 }
