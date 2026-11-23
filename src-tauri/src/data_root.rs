@@ -162,7 +162,18 @@ fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
 /// caller should hold the config lock only for the write. Holding it across the
 /// probe would stall every other command, including the one that opens a tab.
 pub fn plan(target: Option<&str>) -> Result<PathBuf, String> {
-    let from = crate::paths::root();
+    plan_in(&crate::paths::root(), target)
+}
+
+/// [`plan`] against an explicit source folder.
+///
+/// The source is a parameter because [`plan`] has to size the data folder it is
+/// moving, and sizing the real one made the tests depend on this machine's data
+/// root existing: the first CI run of these tests failed with `os error 3` on a
+/// runner where that folder had never been created. Nothing else changes - the
+/// real caller still passes [`crate::paths::root`].
+fn plan_in(from: &Path, target: Option<&str>) -> Result<PathBuf, String> {
+    let from = from.to_path_buf();
     let to = match target.map(|t| t.trim().trim_matches('"')) {
         None | Some("") => crate::paths::default_root(),
         Some(text) => PathBuf::from(text),
@@ -184,7 +195,7 @@ pub fn plan(target: Option<&str>) -> Result<PathBuf, String> {
     // half-copied tree discovered at the next start, where the user cannot
     // answer. Measured: a 12.34 GB root was accepted for a drive with 7.00 GB
     // free, copied 0.76 GB, then died on a locked file.
-    let needed = manifest(&from)?.bytes;
+    let needed = if from.is_dir() { manifest(&from)?.bytes } else { 0 };
     if let Some(why) = room_error(needed, free_bytes(&to), &to) {
         return Err(why);
     }
@@ -848,12 +859,15 @@ mod tests {
     #[test]
     fn a_scheduled_move_lives_in_the_live_config_not_only_on_disk() {
         let base = scratch("schedule");
+        let from = base.join("from");
+        fs::create_dir_all(&from).unwrap();
         let target = base.join("new-root");
         let config_path = base.join("config.json");
         fs::write(&config_path, br#"{"version":5,"apps":[]}"#).unwrap();
         let mut cfg = Config::load(&config_path).unwrap();
 
-        let to = plan(Some(target.to_str().unwrap())).expect("an empty folder is a valid target");
+        let to = plan_in(&from, Some(target.to_str().unwrap()))
+            .expect("an empty folder is a valid target");
         let note = schedule(to.clone(), &mut cfg, &config_path).unwrap();
         assert!(note.contains(&to.display().to_string()), "{note}");
         assert_eq!(
@@ -879,11 +893,13 @@ mod tests {
     #[test]
     fn cancelling_a_move_clears_it_where_the_app_reads_it() {
         let base = scratch("cancel");
+        let from = base.join("from");
+        fs::create_dir_all(&from).unwrap();
         let target = base.join("new-root");
         let config_path = base.join("config.json");
         fs::write(&config_path, br#"{"version":5,"apps":[]}"#).unwrap();
         let mut cfg = Config::load(&config_path).unwrap();
-        let to = plan(Some(target.to_str().unwrap())).unwrap();
+        let to = plan_in(&from, Some(target.to_str().unwrap())).unwrap();
         schedule(to, &mut cfg, &config_path).unwrap();
 
         cancel(&mut cfg, &config_path).unwrap();
@@ -896,11 +912,27 @@ mod tests {
     #[test]
     fn a_folder_with_files_is_refused_before_a_move_is_recorded() {
         let base = scratch("plan-busy");
+        let from = base.join("from");
+        fs::create_dir_all(&from).unwrap();
         let target = base.join("busy");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("keep.txt"), b"x").unwrap();
-        let err = plan(Some(target.to_str().unwrap())).unwrap_err();
+        let err = plan_in(&from, Some(target.to_str().unwrap())).unwrap_err();
         assert!(err.contains("already contains files"), "{err}");
+    }
+
+    /// The CI failure this pins: `plan` sized the *real* data root, and on a
+    /// runner where RustBox had never run, that folder did not exist, so the
+    /// whole call failed with `os error 3` and the two queued-move tests died.
+    /// A root that is not there holds nothing, so it needs no room.
+    #[test]
+    fn a_source_root_that_does_not_exist_yet_is_not_an_error() {
+        let base = scratch("plan-fresh");
+        let missing = base.join("never-created");
+        let target = base.join("new-root");
+        let to = plan_in(&missing, Some(target.to_str().unwrap()))
+            .expect("a first run has nothing to move");
+        assert_eq!(to, target);
     }
 
     /// The measured case: a 12.39 GiB data folder offered a drive with 6.97 GiB
