@@ -41,6 +41,11 @@ Diagnostics go to `%LOCALAPPDATA%\rustbox\mcp.log` (release builds have no conso
 knowing: `tauri-build` validates the sidecar path (`binaries/rustbox-mcp-<triple>.exe`)
 while compiling the app crate, so the shim has to exist before the app is built.
 
+The Windows installer ships a **second** sidecar, `rustbox-cef.exe` — the Chromium
+build. The engine cannot be a run-time switch (`libcef.dll` is a load-time import, see
+ADR 0005 §26.1), so the launcher hands off to this second executable when the config
+asks for Chromium. It is built and staged by the same script, into its own target dir.
+
 `scripts/build-installer.mjs` handles the order. Use it instead of calling
 `cargo tauri build` directly:
 
@@ -48,9 +53,22 @@ while compiling the app crate, so the shim has to exist before the app is built.
 node scripts/build-installer.mjs
 ```
 
-It builds the shim, stages it under the triple-suffixed name, then runs
-`cargo tauri build --bundles nsis`. `src-tauri/binaries/` is generated output and is
-git-ignored. The same script is wired up as `npm run build:installer`.
+It builds the shim, stages it under the triple-suffixed name, builds `rustbox-cef`,
+stages that too, then runs `cargo tauri build --bundles nsis`. `src-tauri/binaries/`
+is generated output and is git-ignored. The same script is wired up as
+`npm run build:installer`.
+
+Two prerequisites on Windows, both checked by the script with an explicit message:
+
+- `CEF_PATH` must point at an extracted CEF 154.0.34 distribution.
+- The shell must have the MSVC environment loaded (`INCLUDE` non-empty) — run from a
+  "Developer PowerShell for VS", because the Chromium build compiles C++ through CMake,
+  which reads the toolchain paths from the environment.
+
+The Chromium build also uses a short target dir (`<temp>/rustbox-cef-target`, overridable
+with `RB_CEF_TARGET`) rather than `src-tauri/target/cef`: MSVC objects under a deep
+checkout exceed `MAX_PATH` and fail with a misleading `Cannot open compiler generated
+file: ''` (ADR 0005 §26.3).
 
 ## Client configuration
 

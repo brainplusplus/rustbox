@@ -1,10 +1,16 @@
 //! Chrome DevTools Protocol bridge to the embedded tab webviews.
 //!
-//! Every tab rustbox opens is a real WebView2 instance with its own profile, so
-//! it already speaks CDP. WebView2 exposes that through
-//! `ICoreWebView2::CallDevToolsProtocolMethod` plus a matching event receiver
-//! per event name — no `--remote-debugging-port` needed, and therefore no
-//! unauthenticated debugging port on the machine.
+//! Every tab rustbox opens is a real browser instance that already speaks CDP.
+//! How that protocol is reached depends on the engine this build links:
+//!
+//! * **WebView2** (default build, Windows) exposes it through
+//!   `ICoreWebView2::CallDevToolsProtocolMethod` plus a matching event receiver
+//!   per event name — no `--remote-debugging-port` needed, and therefore no
+//!   unauthenticated debugging port on the machine.
+//! * **CEF** (opt-in build, every platform) exposes it through the host's
+//!   DevTools message transport: one JSON message out, one observer in.
+//! * **WebKit** (default build, macOS/Linux) has no CDP binding in this app, so
+//!   the bridge reports that instead of pretending.
 //!
 //! # Why this is not a straight `await`
 //!
@@ -22,14 +28,15 @@
 //! - [`ConsoleBuffer`], [`NetworkBuffer`] — event streams, capped and read by
 //!   cursor so an agent can ask "what happened since N".
 //! - [`logs`] — the ring buffers, keyed by app id.
-//!
-//! Everything here is Windows-only; the WebView2 API is the reason CDP is
-//! reachable at all. Other platforms have no equivalent binding in this app, so
-//! the bridge reports that instead of pretending.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+/// Chromium side of the transport: pending replies and the shared observer.
+#[cfg(feature = "cef")]
+#[path = "cdp_cef.rs"]
+mod cef_transport;
 
 /// How long a CDP call may take before the bridge gives up.
 ///
@@ -346,6 +353,7 @@ pub fn unwrap_evaluate_result(result: &serde_json::Value) -> serde_json::Value {
 /// for `Page.captureScreenshot` it is `{"data": "<base64>"}`. There is no
 /// `{"id":…, "result":…}` envelope to unwrap, so this returns the payload as
 /// given; callers read the fields their own command defines.
+#[cfg(any(feature = "wry", test))]
 pub fn cdp_result(raw: &str) -> Result<serde_json::Value, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("browser returned invalid JSON: {e}"))?;
@@ -371,7 +379,7 @@ pub fn cdp_result(raw: &str) -> Result<serde_json::Value, String> {
 /// the caller, never the main thread, is the whole point: the completion
 /// handler runs on the main thread's message pump, so waiting for it from
 /// inside the pump would deadlock.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 pub fn call(
     win: &tauri::WebviewWindow,
     method: &str,
@@ -387,7 +395,14 @@ pub fn call(
     let sync_tx = tx.clone();
 
     let _ = win.with_webview(move |platform| {
-        let core = match unsafe { platform.controller().CoreWebView2() } {
+        let wv = match platform.downcast_ref::<tauri_runtime_wry::Webview>() {
+            Some(wv) => wv,
+            None => {
+                let _ = sync_tx.send((Err("tab is not a WebView2 webview".to_string()), String::new()));
+                return;
+            }
+        };
+        let core = match unsafe { wv.controller().CoreWebView2() } {
             Ok(core) => core,
             Err(e) => {
                 let _ = sync_tx.send((Err(format!("tab has no WebView2 core: {e}")), String::new()));
@@ -425,15 +440,70 @@ pub fn call(
     }
 }
 
-/// Non-Windows: there is no CDP binding for WebKit through Tauri.
-#[cfg(not(windows))]
+/// Chromium: one JSON message out, one observer in.
+///
+/// Unlike WebView2 there is no per-call completion handler. Every caller shares
+/// one native request-id space, and a reply is matched by the `id` the observer
+/// sees come back. The id therefore comes from
+/// [`allocate_devtools_message_id`], not from this module: a self-incremented id
+/// would collide with a request another caller (or the runtime itself) already
+/// sent, and one of the two replies would be delivered to the wrong waiter.
+///
+/// The observer is installed once per webview and dispatches by id. Installing
+/// one per call would leak an observer per call: CEF has no way to unregister
+/// one short of destroying the browser.
+#[cfg(feature = "cef")]
+pub fn call(
+    win: &tauri::WebviewWindow,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    cef_transport::ensure_observer(win)?;
+
+    let id = tauri_runtime_cef::allocate_devtools_message_id()
+        .map_err(|e| format!("no free CDP message id: {e}"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<serde_json::Value, String>>();
+    cef_transport::pending()
+        .lock()
+        .unwrap()
+        .insert(id, tx);
+
+    let request = serde_json::json!({ "id": id, "method": method, "params": params });
+    if let Err(e) = tauri_runtime_cef::WebviewCefExt::send_dev_tools_message(
+        win,
+        request.to_string().as_bytes(),
+    ) {
+        cef_transport::pending().lock().unwrap().remove(&id);
+        return Err(format!("CDP call rejected: {e}"));
+    }
+
+    let reply = rx.recv_timeout(CALL_TIMEOUT);
+    // Whatever the outcome, the entry must not outlive the call: a late reply
+    // would otherwise be sent into a closed channel forever.
+    cef_transport::pending().lock().unwrap().remove(&id);
+
+    match reply {
+        Ok(reply) => reply,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{method} got no reply within {}s; the tab may be unresponsive",
+            CALL_TIMEOUT.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("{method} was dropped: the tab went away"))
+        }
+    }
+}
+
+/// WebKit: there is no CDP binding for WebView2's transport in this build.
+#[cfg(all(feature = "wry", not(windows)))]
 pub fn call(
     _win: &tauri::WebviewWindow,
     method: &str,
     _params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     Err(format!(
-        "{method} is unavailable: only the Windows WebView2 backend exposes CDP"
+        "{method} is unavailable: this build runs the OS webview, which exposes no CDP. \
+         Install the Chromium engine and switch to it for CDP-backed features."
     ))
 }
 
@@ -490,7 +560,7 @@ pub fn mark_unsubscribed(app_id: &str) {
 // alive, so these must be kept. They are COM objects bound to the UI thread,
 // which is why they live in a thread-local instead of a static: every access
 // happens inside a `with_webview` closure, and those run on the main thread.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 thread_local! {
     static RECEIVERS: std::cell::RefCell<
         std::collections::HashMap<
@@ -500,13 +570,13 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Install console + network receivers for a tab.
+/// Install console + network receivers for a tab (WebView2).
 ///
 /// The domains are *not* enabled here. Receivers are cheap and idle until
 /// `Runtime.enable` / `Network.enable` is sent, so registering them at tab
 /// creation means an agent that attaches later still sees the very next event,
 /// while a tab nobody inspects pays nothing.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 pub fn subscribe(win: &tauri::WebviewWindow, app_id: String) {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DevToolsProtocolEventReceivedEventArgs;
     use webview2_com::take_pwstr;
@@ -514,7 +584,10 @@ pub fn subscribe(win: &tauri::WebviewWindow, app_id: String) {
     use windows_core::{HSTRING, PWSTR};
 
     let _ = win.with_webview(move |platform| {
-        let core = match unsafe { platform.controller().CoreWebView2() } {
+        let Some(wv) = platform.downcast_ref::<tauri_runtime_wry::Webview>() else {
+            return;
+        };
+        let core = match unsafe { wv.controller().CoreWebView2() } {
             Ok(core) => core,
             Err(_) => return,
         };
@@ -566,19 +639,40 @@ pub fn subscribe(win: &tauri::WebviewWindow, app_id: String) {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(feature = "wry", not(windows)))]
 pub fn subscribe(_win: &tauri::WebviewWindow, _app_id: String) {}
 
+/// Chromium: install the one protocol observer this webview will ever need.
+///
+/// The observer carries both halves of the protocol — method results for
+/// [`call`] and events for the console/network buffers — because CEF offers no
+/// way to remove one short of destroying the browser. Registering it once per
+/// tab, at creation, is what keeps that single registration honest.
+#[cfg(feature = "cef")]
+pub fn subscribe(win: &tauri::WebviewWindow, app_id: String) {
+    cef_transport::install(win, app_id);
+}
+
 /// Drop a tab's receivers. Must run on the main thread, before the window dies.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 pub fn detach(app_id: &str) {
     RECEIVERS.with(|map| {
         map.borrow_mut().remove(app_id);
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(feature = "wry", not(windows)))]
 pub fn detach(_app_id: &str) {}
+
+/// Forget the observer registry entry for a tab that is going away.
+///
+/// The observer itself dies with the browser; what must not survive is the
+/// bookkeeping that says this label is already covered, or a reopened tab with
+/// the same label would never register one.
+#[cfg(feature = "cef")]
+pub fn detach(app_id: &str) {
+    cef_transport::forget(app_id);
+}
 
 /// Whether console/network capture is switched on.
 ///
@@ -603,13 +697,16 @@ pub fn capture_enabled() -> bool {
 /// Separate from [`subscribe`] because the receivers are always installed but the
 /// domains are only enabled when capture is on: enabling a domain twice is
 /// harmless, enabling it when nobody reads the buffers is not.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 pub fn enable_domains(win: &tauri::WebviewWindow) {
     use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
     use windows_core::HSTRING;
 
     let _ = win.with_webview(move |platform| {
-        let core = match unsafe { platform.controller().CoreWebView2() } {
+        let Some(wv) = platform.downcast_ref::<tauri_runtime_wry::Webview>() else {
+            return;
+        };
+        let core = match unsafe { wv.controller().CoreWebView2() } {
             Ok(core) => core,
             Err(_) => return,
         };
@@ -626,8 +723,26 @@ pub fn enable_domains(win: &tauri::WebviewWindow) {
     });
 }
 
-#[cfg(not(windows))]
+#[cfg(all(feature = "wry", not(windows)))]
 pub fn enable_domains(_win: &tauri::WebviewWindow) {}
+
+/// Chromium: enabling a domain is the same DevTools message a page would send.
+///
+/// `Log.enable` is included because CEF reports renderer-side warnings (a
+/// refused CSP, a blocked mixed-content request) there rather than through
+/// `Runtime.consoleAPICalled`, which is where a WebView2 build happens to put
+/// them.
+#[cfg(feature = "cef")]
+pub fn enable_domains(win: &tauri::WebviewWindow) {
+    use tauri_runtime_cef::WebviewCefExt;
+    for domain in ["Runtime.enable", "Network.enable", "Log.enable"] {
+        let Some(id) = tauri_runtime_cef::allocate_devtools_message_id().ok() else {
+            continue;
+        };
+        let message = serde_json::json!({ "id": id, "method": domain, "params": {} });
+        let _ = win.send_dev_tools_message(message.to_string().as_bytes());
+    }
+}
 
 /// Route one CDP event into the right buffer.
 pub fn record(app_id: &str, event: &str, params: &serde_json::Value) {

@@ -23,7 +23,7 @@ use tauri_runtime::webview::ScrollBarStyle;
 use tauri_runtime::{
   Cookie, DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Icon,
   ProgressBarState, ProgressBarStatus, Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs,
-  UserAttentionType, UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch, WindowEventId,
+  RuntimeInitAttrs, UserAttentionType, UserEvent, WebviewDispatch, WindowDispatch,
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
   webview::{DetachedWebview, DownloadEvent, PendingWebview, WebviewIpcHandler},
@@ -78,11 +78,9 @@ use tao::{
     UserAttentionType as TaoUserAttentionType,
   },
 };
-#[cfg(target_os = "macos")]
-use tauri_utils::TitleBarStyle;
 use tauri_utils::config::PreventOverflowConfig;
 use tauri_utils::{
-  Theme,
+  Theme, TitleBarStyle,
   config::{Color, WindowConfig},
 };
 use url::Url;
@@ -97,6 +95,70 @@ pub use tao;
 pub use tao::window::{Window, WindowBuilder as TaoWindowBuilder, WindowId as TaoWindowId};
 pub use wry;
 pub use wry::webview_version;
+
+/// JNI types used by the [`android_binding!`] macro.
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+pub mod prelude {
+  pub use wry::prelude::{JClass, JNIEnv, JString};
+}
+
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+pub use wry::android_setup;
+
+/// Sets up the JNI bindings that start the Android app with the wry runtime.
+///
+/// This is used by `#[tauri::mobile_entry_point]` and is not meant to be invoked directly.
+#[cfg(target_os = "android")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! android_binding {
+  ($domain:ident, $app_name:ident, $main:ident) => {
+    use $crate::{
+      android_setup,
+      prelude::{JClass, JNIEnv, JString},
+    };
+
+    $crate::wry::android_binding!($domain, $app_name, $crate::wry);
+
+    $crate::tao::android_binding!($domain, $app_name, Rust, android_setup, $main, $crate::tao);
+
+    // be careful when renaming this, the `Java_app_tauri_plugin_PluginManager_handlePluginResponse` symbol is checked by the CLI
+    $crate::tao::platform::android::prelude::android_fn!(
+      app_tauri,
+      plugin,
+      PluginManager,
+      handlePluginResponse,
+      [i32, JString, JString],
+    );
+    $crate::tao::platform::android::prelude::android_fn!(
+      app_tauri,
+      plugin,
+      PluginManager,
+      sendChannelData,
+      [i64, JString],
+    );
+
+    // this function is a glue between PluginManager.kt > handlePluginResponse and Rust
+    #[allow(non_snake_case)]
+    pub fn handlePluginResponse(
+      mut env: JNIEnv,
+      _: JClass,
+      id: i32,
+      success: JString,
+      error: JString,
+    ) {
+      ::tauri::handle_android_plugin_response(&mut env, id, success, error);
+    }
+
+    // this function is a glue between PluginManager.kt > sendChannelData and Rust
+    #[allow(non_snake_case)]
+    pub fn sendChannelData(mut env: JNIEnv, _: JClass, id: i64, data: JString) {
+      ::tauri::send_channel_data(&mut env, id, data);
+    }
+  };
+}
 
 #[cfg(windows)]
 use wry::WebViewExtWindows;
@@ -160,8 +222,76 @@ mod webview;
 mod webview_permissions;
 mod window;
 
+mod tauri_ext;
+pub use tauri_ext::*;
+
 pub use webview::Webview;
 use window::WindowExt as _;
+
+/// Information about the webview that initiated a new window request.
+#[derive(Debug)]
+pub struct NewWindowOpener {
+  /// The instance of the webview that initiated the new window request.
+  ///
+  /// This must be set as the related view of the new webview.
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+  ))]
+  pub webview: webkit2gtk::WebView,
+  /// The instance of the webview that initiated the new window request.
+  ///
+  /// The target webview environment **MUST** match the environment of the opener webview.
+  #[cfg(windows)]
+  pub webview: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+  #[cfg(windows)]
+  pub environment: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+  /// The instance of the webview that initiated the new window request.
+  #[cfg(target_os = "macos")]
+  pub webview: objc2::rc::Retained<objc2_web_kit::WKWebView>,
+  /// Configuration of the target webview.
+  ///
+  /// This **MUST** be used when creating the target webview.
+  #[cfg(target_os = "macos")]
+  pub target_configuration: objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>,
+}
+
+// opener is only used on the main thread
+unsafe impl Send for NewWindowOpener {}
+unsafe impl Sync for NewWindowOpener {}
+
+/// The wry-specific webview attributes, set through
+/// [`WebviewWindowBuilderWryExt`](crate::WebviewWindowBuilderWryExt).
+#[derive(Default)]
+pub struct WryWebviewAttributes {
+  /// The environment of the webview.
+  /// Useful if you need to share the same environment, for instance when using the [`PendingWebview::new_window_handler`].
+  #[cfg(windows)]
+  pub environment: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment>,
+
+  /// A webview sharing the same web process with the created webview.
+  /// Useful if you need to link a webview to another, for instance when using the [`PendingWebview::new_window_handler`].
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+  ))]
+  pub related_view: Option<webkit2gtk::WebView>,
+
+  /// The webview configuration.
+  /// Useful if you need to use a predefined webview configuration, for instance when using the [`PendingWebview::new_window_handler`].
+  #[cfg(target_os = "macos")]
+  pub webview_configuration: Option<objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>>,
+}
+
+// attributes are only used on the main thread
+unsafe impl Send for WryWebviewAttributes {}
+unsafe impl Sync for WryWebviewAttributes {}
 
 #[derive(Debug)]
 pub struct WebContext {
@@ -173,11 +303,6 @@ pub struct WebContext {
 }
 
 pub type WebContextStore = Arc<Mutex<HashMap<Option<PathBuf>, WebContext>>>;
-// window
-pub type WindowEventHandler = Box<dyn Fn(&WindowEvent) + Send>;
-pub type WindowEventListeners = Arc<Mutex<HashMap<WindowEventId, WindowEventHandler>>>;
-pub type WebviewEventHandler = Box<dyn Fn(&WebviewEvent) + Send>;
-pub type WebviewEventListeners = Arc<Mutex<HashMap<WebviewEventId, WebviewEventHandler>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct WindowIdStore(Arc<Mutex<HashMap<TaoWindowId, WindowId>>>);
@@ -240,8 +365,6 @@ pub struct Context<T: UserEvent> {
   plugins: Arc<Mutex<Vec<Box<dyn Plugin<T> + Send>>>>,
   next_window_id: Arc<AtomicU32>,
   next_webview_id: Arc<AtomicU32>,
-  next_window_event_id: Arc<AtomicU32>,
-  next_webview_event_id: Arc<AtomicU32>,
   webview_runtime_installed: bool,
 }
 
@@ -286,35 +409,28 @@ impl<T: UserEvent> Context<T> {
   fn next_webview_id(&self) -> WebviewId {
     self.next_webview_id.fetch_add(1, Ordering::Relaxed)
   }
-
-  fn next_window_event_id(&self) -> u32 {
-    self.next_window_event_id.fetch_add(1, Ordering::Relaxed)
-  }
-
-  fn next_webview_event_id(&self) -> u32 {
-    self.next_webview_event_id.fetch_add(1, Ordering::Relaxed)
-  }
 }
 
 impl<T: UserEvent> Context<T> {
   fn create_window<F: Fn(RawWindow) + Send + 'static>(
     &self,
-    pending: PendingWindow<T, Wry<T>>,
+    pending: PendingWindow<T, WryRuntime<T>>,
     after_window_creation: Option<F>,
-  ) -> Result<DetachedWindow<T, Wry<T>>> {
+  ) -> Result<DetachedWindow<T, WryRuntime<T>>> {
     let label = pending.label.clone();
     let context = self.clone();
     let window_id = self.next_window_id();
-    let (webview_id, use_https_scheme) = pending
+    let (webview_id, use_https_scheme, devtools) = pending
       .webview
       .as_ref()
       .map(|w| {
         (
           Some(context.next_webview_id()),
           w.webview_attributes.use_https_scheme,
+          w.webview_attributes.devtools,
         )
       })
-      .unwrap_or((None, false));
+      .unwrap_or((None, false, None));
 
     let (tx, rx) = channel();
     self.send_user_message(Message::CreateWindow(
@@ -351,6 +467,7 @@ impl<T: UserEvent> Context<T> {
       DetachedWindowWebview {
         webview,
         use_https_scheme,
+        devtools,
       }
     });
 
@@ -365,8 +482,8 @@ impl<T: UserEvent> Context<T> {
   fn create_webview(
     &self,
     window_id: WindowId,
-    pending: PendingWebview<T, Wry<T>>,
-  ) -> Result<DetachedWebview<T, Wry<T>>> {
+    pending: PendingWebview<T, WryRuntime<T>>,
+  ) -> Result<DetachedWebview<T, WryRuntime<T>>> {
     let label = pending.label.clone();
     let context = self.clone();
 
@@ -1103,8 +1220,14 @@ impl WindowBuilder for WindowBuilderWrapper {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn transient_for(mut self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
-    self.inner = self.inner.with_transient_for(parent);
+  fn transient_for(mut self, parent: *mut std::ffi::c_void) -> Self {
+    use gtk::glib::translate::FromGlibPtrFull;
+
+    // SAFETY: `transient_for` receives the parent as transfer full, so the wrapper adopts the
+    // reference and releases it when it is dropped at the end of this function - tao's
+    // `with_transient_for` takes its own reference.
+    let parent = unsafe { gtk::Window::from_glib_full(parent as *mut gtk::ffi::GtkWindow) };
+    self.inner = self.inner.with_transient_for(&parent);
     self
   }
 
@@ -1260,7 +1383,7 @@ impl WindowBuilder for WindowBuilderWrapper {
   target_os = "netbsd",
   target_os = "openbsd"
 ))]
-pub struct GtkWindow(pub gtk::ApplicationWindow);
+pub struct GtkWindow(pub *mut std::ffi::c_void);
 #[cfg(any(
   target_os = "linux",
   target_os = "dragonfly",
@@ -1278,7 +1401,7 @@ unsafe impl Send for GtkWindow {}
   target_os = "netbsd",
   target_os = "openbsd"
 ))]
-pub struct GtkBox(pub gtk::Box);
+pub struct GtkBox(pub *mut std::ffi::c_void);
 #[cfg(any(
   target_os = "linux",
   target_os = "dragonfly",
@@ -1304,7 +1427,6 @@ pub enum ApplicationMessage {
 }
 
 pub enum WindowMessage {
-  AddEventListener(WindowEventId, Box<dyn Fn(&WindowEvent) + Send>),
   // Getters
   ScaleFactor(Sender<f64>),
   InnerPosition(Sender<Result<PhysicalPosition<i32>>>),
@@ -1397,7 +1519,7 @@ pub enum WindowMessage {
   SetBadgeLabel(Option<String>),
   SetOverlayIcon(Option<TaoIcon>),
   SetProgressBar(ProgressBarState),
-  SetTitleBarStyle(tauri_utils::TitleBarStyle),
+  SetTitleBarStyle(TitleBarStyle),
   SetTrafficLightPosition(Position),
   SetTheme(Option<Theme>),
   SetBackgroundColor(Option<Color>),
@@ -1423,7 +1545,6 @@ impl From<SynthesizedWindowEvent> for WindowEventWrapper {
 }
 
 pub enum WebviewMessage {
-  AddEventListener(WebviewEventId, Box<dyn Fn(&WebviewEvent) + Send>),
   #[cfg(not(all(feature = "tracing", not(target_os = "android"))))]
   EvaluateScript(String),
   #[cfg(all(feature = "tracing", not(target_os = "android")))]
@@ -1524,7 +1645,7 @@ impl<T: UserEvent> Clone for Message<T> {
   }
 }
 
-/// The Tauri [`WebviewDispatch`] for [`Wry`].
+/// The Tauri [`WebviewDispatch`] for [`WryRuntime`].
 #[derive(Debug, Clone)]
 pub struct WryWebviewDispatcher<T: UserEvent> {
   window_id: Arc<Mutex<WindowId>>,
@@ -1533,52 +1654,68 @@ pub struct WryWebviewDispatcher<T: UserEvent> {
 }
 
 impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
-  type Runtime = Wry<T>;
+  type Runtime = WryRuntime<T>;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
     self.context.send_user_message(Message::Task(Box::new(f)))
   }
 
-  fn on_webview_event<F: Fn(&WebviewEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
-    let id = self.context.next_webview_event_id();
-    let _ = self.context.proxy.send_event(Message::Webview(
-      *self.window_id.lock().unwrap(),
-      self.webview_id,
-      WebviewMessage::AddEventListener(id, Box::new(f)),
-    ));
-    id
-  }
-
-  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+  fn with_webview<F: FnOnce(Webview) + Send + 'static>(&self, f: F) -> Result<()> {
     self.context.send_user_message(Message::Webview(
       *self.window_id.lock().unwrap(),
       self.webview_id,
-      WebviewMessage::WithWebview(Box::new(move |webview| f(Box::new(webview)))),
+      WebviewMessage::WithWebview(Box::new(f)),
     ))
   }
 
-  #[cfg(any(debug_assertions, feature = "devtools"))]
-  fn open_devtools(&self) {
-    let _ = self.context.send_user_message(Message::Webview(
-      *self.window_id.lock().unwrap(),
-      self.webview_id,
-      WebviewMessage::OpenDevTools,
-    ));
+  #[cfg(target_os = "ios")]
+  fn with_ios_webview<F: FnOnce(tauri_runtime::webview::IosWebviewHandle) + Send + 'static>(
+    &self,
+    f: F,
+  ) -> Result<()> {
+    self.with_webview(move |webview| {
+      f(tauri_runtime::webview::IosWebviewHandle {
+        webview: webview.inner(),
+        manager: webview.controller(),
+        view_controller: webview.view_controller(),
+      })
+    })
   }
 
-  #[cfg(any(debug_assertions, feature = "devtools"))]
+  fn open_devtools(&self) {
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    {
+      let _ = self.context.send_user_message(Message::Webview(
+        *self.window_id.lock().unwrap(),
+        self.webview_id,
+        WebviewMessage::OpenDevTools,
+      ));
+    }
+    #[cfg(not(any(debug_assertions, feature = "devtools")))]
+    log::warn!("devtools are not available: enable the `devtools` feature of `tauri-runtime-wry`");
+  }
+
   fn close_devtools(&self) {
-    let _ = self.context.send_user_message(Message::Webview(
-      *self.window_id.lock().unwrap(),
-      self.webview_id,
-      WebviewMessage::CloseDevTools,
-    ));
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    {
+      let _ = self.context.send_user_message(Message::Webview(
+        *self.window_id.lock().unwrap(),
+        self.webview_id,
+        WebviewMessage::CloseDevTools,
+      ));
+    }
   }
 
   /// Gets the devtools window's current open state.
-  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn is_devtools_open(&self) -> Result<bool> {
-    webview_getter!(self, WebviewMessage::IsDevToolsOpen)
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    {
+      webview_getter!(self, WebviewMessage::IsDevToolsOpen)
+    }
+    #[cfg(not(any(debug_assertions, feature = "devtools")))]
+    {
+      Ok(false)
+    }
   }
 
   // Getters
@@ -1615,6 +1752,26 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
       self.webview_id,
       WebviewMessage::Reload,
     ))
+  }
+
+  fn go_back(&self) -> Result<()> {
+    // TODO: implement this
+    Err(Error::FailedToSendMessage)
+  }
+
+  fn can_go_back(&self) -> Result<bool> {
+    // TODO: implement this
+    Err(Error::FailedToSendMessage)
+  }
+
+  fn go_forward(&self) -> Result<()> {
+    // TODO: implement this
+    Err(Error::FailedToSendMessage)
+  }
+
+  fn can_go_forward(&self) -> Result<bool> {
+    // TODO: implement this
+    Err(Error::FailedToSendMessage)
   }
 
   fn print(&self) -> Result<()> {
@@ -1823,7 +1980,7 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
   }
 }
 
-/// The Tauri [`WindowDispatch`] for [`Wry`].
+/// The Tauri [`WindowDispatch`] for [`WryRuntime`].
 #[derive(Debug, Clone)]
 pub struct WryWindowDispatcher<T: UserEvent> {
   window_id: WindowId,
@@ -1841,20 +1998,11 @@ fn get_raw_window_handle<T: UserEvent>(
 }
 
 impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
-  type Runtime = Wry<T>;
+  type Runtime = WryRuntime<T>;
   type WindowBuilder = WindowBuilderWrapper;
 
   fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
     self.context.send_user_message(Message::Task(Box::new(f)))
-  }
-
-  fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId {
-    let id = self.context.next_window_event_id();
-    let _ = self.context.proxy.send_event(Message::Window(
-      self.window_id,
-      WindowMessage::AddEventListener(id, Box::new(f)),
-    ));
-    id
   }
 
   // Getters
@@ -1970,7 +2118,7 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
+  fn gtk_window(&self) -> Result<*mut std::ffi::c_void> {
     window_getter!(self, WindowMessage::GtkWindow).map(|w| w.0)
   }
 
@@ -1981,7 +2129,7 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn default_vbox(&self) -> Result<gtk::Box> {
+  fn default_vbox(&self) -> Result<*mut std::ffi::c_void> {
     window_getter!(self, WindowMessage::GtkBox).map(|w| w.0)
   }
 
@@ -2339,7 +2487,7 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
     ))
   }
 
-  fn set_title_bar_style(&self, style: tauri_utils::TitleBarStyle) -> Result<()> {
+  fn set_title_bar_style(&self, style: TitleBarStyle) -> Result<()> {
     self.context.send_user_message(Message::Window(
       self.window_id,
       WindowMessage::SetTitleBarStyle(style),
@@ -2374,7 +2522,6 @@ pub struct WebviewWrapper {
   id: WebviewId,
   inner: Rc<WebView>,
   context_store: WebContextStore,
-  webview_event_listeners: WebviewEventListeners,
   // the key of the WebContext if it's not shared
   context_key: Option<PathBuf>,
   bounds: Arc<Mutex<Option<WebviewBounds>>>,
@@ -2445,7 +2592,6 @@ pub struct WindowWrapper {
   // or it's just a container for a single webview
   has_children: AtomicBool,
   webviews: Vec<WebviewWrapper>,
-  window_event_listeners: WindowEventListeners,
   #[cfg(windows)]
   background_color: Option<tao::window::RGBA>,
   #[cfg(windows)]
@@ -2504,15 +2650,35 @@ pub trait Plugin<T: UserEvent> {
   ) -> bool;
 }
 
+/// Selects and configures the wry runtime.
+///
+/// Pass it to `tauri::Builder::runtime` to run the application with wry:
+///
+/// ```rust,no_run
+/// tauri::Builder::default().runtime(tauri_runtime_wry::Wry::default());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Wry {}
+
+impl<T: UserEvent> RuntimeInitAttrs<T> for Wry {
+  type Runtime = WryRuntime<T>;
+}
+
+impl<T: UserEvent> From<Wry> for tauri_runtime::dynamic::DynRuntimeInitAttrs<T> {
+  fn from(attrs: Wry) -> Self {
+    Self::new(attrs)
+  }
+}
+
 /// A Tauri [`Runtime`] wrapper around wry.
-pub struct Wry<T: UserEvent> {
+pub struct WryRuntime<T: UserEvent = tauri::EventLoopMessage> {
   context: Context<T>,
   event_loop: EventLoop<Message<T>>,
 }
 
-impl<T: UserEvent> fmt::Debug for Wry<T> {
+impl<T: UserEvent> fmt::Debug for WryRuntime<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("Wry")
+    f.debug_struct("WryRuntime")
       .field("main_thread_id", &self.context.main_thread_id)
       .field("event_loop", &self.event_loop)
       .field("windows", &self.context.main_thread.windows)
@@ -2560,7 +2726,8 @@ impl<T: UserEvent> WryHandle<T> {
     Ok(())
   }
 
-  pub fn plugin<P: PluginBuilder<T> + 'static>(&mut self, plugin: P)
+  /// Registers a wry runtime plugin.
+  pub fn plugin<P: PluginBuilder<T> + 'static>(&self, plugin: P)
   where
     <P as PluginBuilder<T>>::Plugin: Send,
   {
@@ -2574,7 +2741,7 @@ impl<T: UserEvent> WryHandle<T> {
 }
 
 impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
-  type Runtime = Wry<T>;
+  type Runtime = WryRuntime<T>;
 
   fn create_proxy(&self) -> EventProxy<T> {
     EventProxy(self.context.proxy.clone())
@@ -2601,6 +2768,25 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
       .proxy
       .send_event(Message::RequestExit(code))
       .map_err(|_| Error::FailedToSendMessage)
+  }
+
+  /// Returns the URL for a custom scheme.
+  ///
+  /// On Windows and Android, custom schemes use `http://<scheme>.localhost` or `https://<scheme>.localhost`.
+  /// On other platforms, custom schemes use `<scheme>://localhost`.
+  fn custom_scheme_url(&self, scheme: &str, _https: bool) -> String {
+    if cfg!(any(windows, target_os = "android")) {
+      format!(
+        "{}://{scheme}.localhost",
+        if _https { "https" } else { "http" }
+      )
+    } else {
+      format!("{scheme}://localhost")
+    }
+  }
+
+  fn webview_version(&self) -> Result<String> {
+    wry::webview_version().map_err(|e| Error::WebviewVersion(Box::new(e)))
   }
 
   // Creates a window by dispatching a message to the event loop.
@@ -2731,10 +2917,10 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
   }
 }
 
-impl<T: UserEvent> Wry<T> {
+impl<T: UserEvent> WryRuntime<T> {
   fn init_with_builder(
     mut event_loop_builder: EventLoopBuilder<Message<T>>,
-    #[allow(unused_variables)] args: RuntimeInitArgs,
+    #[allow(unused_variables)] args: RuntimeInitArgs<Wry>,
   ) -> Result<Self> {
     #[cfg(windows)]
     if let Some(hook) = args.msg_hook {
@@ -2757,6 +2943,17 @@ impl<T: UserEvent> Wry<T> {
   }
 
   fn init(event_loop: EventLoop<Message<T>>) -> Result<Self> {
+    // tao builds its windows on GTK 3, so the GTK pointers this runtime hands out are GTK 3
+    // objects no matter which bindings the `tauri` crate was compiled against.
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    tauri_runtime::gtk::declare_version(tauri_runtime::gtk::Version::V3);
+
     let main_thread_id = current_thread().id();
     let web_context = WebContextStore::default();
 
@@ -2778,8 +2975,6 @@ impl<T: UserEvent> Wry<T> {
       plugins: Default::default(),
       next_window_id: Default::default(),
       next_webview_id: Default::default(),
-      next_window_event_id: Default::default(),
-      next_webview_event_id: Default::default(),
       webview_runtime_installed: wry::webview_version().is_ok(),
     };
 
@@ -2790,14 +2985,18 @@ impl<T: UserEvent> Wry<T> {
   }
 }
 
-impl<T: UserEvent> Runtime<T> for Wry<T> {
+impl<T: UserEvent> Runtime<T> for WryRuntime<T> {
   type WindowDispatcher = WryWindowDispatcher<T>;
   type WebviewDispatcher = WryWebviewDispatcher<T>;
   type Handle = WryHandle<T>;
 
   type EventLoopProxy = EventProxy<T>;
+  type RuntimeWebviewAttributes = WryWebviewAttributes;
+  type RuntimeInitAttrs = Wry;
+  type WindowOpener = NewWindowOpener;
+  type Webview = Webview;
 
-  fn new(args: RuntimeInitArgs) -> Result<Self> {
+  fn new(args: RuntimeInitArgs<Wry>) -> Result<Self> {
     Self::init_with_builder(EventLoopBuilder::<Message<T>>::with_user_event(), args)
   }
   #[cfg(any(
@@ -2807,7 +3006,7 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn new_any_thread(args: RuntimeInitArgs) -> Result<Self> {
+  fn new_any_thread(args: RuntimeInitArgs<Wry>) -> Result<Self> {
     use tao::platform::unix::EventLoopBuilderExtUnix;
     let mut event_loop_builder = EventLoopBuilder::<Message<T>>::with_user_event();
     event_loop_builder.with_any_thread(true);
@@ -2815,7 +3014,7 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
   }
 
   #[cfg(windows)]
-  fn new_any_thread(args: RuntimeInitArgs) -> Result<Self> {
+  fn new_any_thread(args: RuntimeInitArgs<Wry>) -> Result<Self> {
     use tao::platform::windows::EventLoopBuilderExtWindows;
     let mut event_loop_builder = EventLoopBuilder::<Message<T>>::with_user_event();
     event_loop_builder.with_any_thread(true);
@@ -2839,16 +3038,17 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
   ) -> Result<DetachedWindow<T, Self>> {
     let label = pending.label.clone();
     let window_id = self.context.next_window_id();
-    let (webview_id, use_https_scheme) = pending
+    let (webview_id, use_https_scheme, devtools) = pending
       .webview
       .as_ref()
       .map(|w| {
         (
           Some(self.context.next_webview_id()),
           w.webview_attributes.use_https_scheme,
+          w.webview_attributes.devtools,
         )
       })
-      .unwrap_or((None, false));
+      .unwrap_or((None, false, None));
 
     let window = create_window(
       window_id,
@@ -2884,6 +3084,7 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
       DetachedWindowWebview {
         webview,
         use_https_scheme,
+        devtools,
       }
     });
 
@@ -3111,11 +3312,12 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
 fn make_event_handler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static>(
   context: Context<T>,
   mut callback: F,
-) -> impl FnMut(Event<'_, Message<T>>, &EventLoopWindowTarget<Message<T>>, &mut ControlFlow) {
-  let windows = context.main_thread.windows;
-  let window_id_map = context.window_id_map;
-  let web_context = context.main_thread.web_context;
-  let plugins = context.plugins;
+) -> impl FnMut(Event<'_, Message<T>>, &EventLoopWindowTarget<Message<T>>, &mut ControlFlow) + use<T, F>
+{
+  let windows = context.main_thread.windows.clone();
+  let window_id_map = context.window_id_map.clone();
+  let web_context = context.main_thread.web_context.clone();
+  let plugins = context.plugins.clone();
 
   #[cfg(feature = "tracing")]
   let active_tracing_spans = context.main_thread.active_tracing_spans;
@@ -3221,23 +3423,11 @@ fn handle_user_message<T: UserEvent>(
           w.inner.clone(),
           w.webviews.clone(),
           w.has_children.load(Ordering::Relaxed),
-          w.window_event_listeners.clone(),
           focused_webview,
         )
       });
-      if let Some((
-        Some(window),
-        webviews,
-        has_children,
-        window_event_listeners,
-        _focused_webview,
-      )) = w
-      {
+      if let Some((Some(window), webviews, has_children, _focused_webview)) = w {
         match window_message {
-          WindowMessage::AddEventListener(id, listener) => {
-            window_event_listeners.lock().unwrap().insert(id, listener);
-          }
-
           // Getters
           WindowMessage::ScaleFactor(tx) => tx.send(window.scale_factor()).unwrap(),
           WindowMessage::InnerPosition(tx) => tx
@@ -3320,7 +3510,12 @@ fn handle_user_message<T: UserEvent>(
             target_os = "netbsd",
             target_os = "openbsd"
           ))]
-          WindowMessage::GtkWindow(tx) => tx.send(GtkWindow(window.gtk_window().clone())).unwrap(),
+          WindowMessage::GtkWindow(tx) => {
+            use gtk::glib::translate::ToGlibPtr;
+
+            let ptr: *mut gtk::ffi::GtkApplicationWindow = window.gtk_window().to_glib_full();
+            tx.send(GtkWindow(ptr as *mut std::ffi::c_void)).unwrap()
+          }
           #[cfg(any(
             target_os = "linux",
             target_os = "dragonfly",
@@ -3328,9 +3523,12 @@ fn handle_user_message<T: UserEvent>(
             target_os = "netbsd",
             target_os = "openbsd"
           ))]
-          WindowMessage::GtkBox(tx) => tx
-            .send(GtkBox(window.default_vbox().unwrap().clone()))
-            .unwrap(),
+          WindowMessage::GtkBox(tx) => {
+            use gtk::glib::translate::ToGlibPtr;
+
+            let ptr: *mut gtk::ffi::GtkBox = window.default_vbox().unwrap().to_glib_full();
+            tx.send(GtkBox(ptr as *mut std::ffi::c_void)).unwrap()
+          }
           #[cfg(target_os = "android")]
           WindowMessage::ActivityName(tx) => {
             tx.send(window.activity_name()).unwrap();
@@ -3651,14 +3849,6 @@ fn handle_user_message<T: UserEvent>(
           WebviewMessage::WebviewEvent(_) => { /* already handled */ }
           WebviewMessage::SynthesizedWindowEvent(_) => { /* already handled */ }
           WebviewMessage::Reparent(_window_id, _tx) => { /* already handled */ }
-          WebviewMessage::AddEventListener(id, listener) => {
-            webview
-              .webview_event_listeners
-              .lock()
-              .unwrap()
-              .insert(id, listener);
-          }
-
           #[cfg(all(feature = "tracing", not(target_os = "android")))]
           WebviewMessage::EvaluateScript(script, tx, span) => {
             let _span = span.entered();
@@ -3897,7 +4087,7 @@ fn handle_user_message<T: UserEvent>(
               target_os = "openbsd"
             ))]
             {
-              f(webview.webview());
+              f(Webview::new(webview.webview()));
             }
             #[cfg(target_os = "macos")]
             {
@@ -3905,11 +4095,11 @@ fn handle_user_message<T: UserEvent>(
               let platform_webview = webview.webview();
               let manager = webview.manager();
               let ns_window = webview.ns_window();
-              f(Webview {
-                webview: Retained::as_ptr(&platform_webview).cast_mut() as *mut std::ffi::c_void,
-                manager: Retained::as_ptr(&manager).cast_mut() as *mut std::ffi::c_void,
-                ns_window: Retained::as_ptr(&ns_window).cast_mut() as *mut std::ffi::c_void,
-              });
+              f(Webview::new(
+                Retained::as_ptr(&platform_webview).cast(),
+                Retained::as_ptr(&manager).cast(),
+                Retained::as_ptr(&ns_window).cast(),
+              ));
             }
             #[cfg(target_os = "ios")]
             {
@@ -3917,22 +4107,19 @@ fn handle_user_message<T: UserEvent>(
               let platform_webview = webview.inner.webview();
               let manager = webview.inner.manager();
 
-              f(Webview {
-                webview: Retained::as_ptr(&platform_webview).cast_mut() as *mut std::ffi::c_void,
-                manager: Retained::as_ptr(&manager).cast_mut() as *mut std::ffi::c_void,
-                view_controller: window.ui_view_controller(),
-              });
+              f(Webview::new(
+                Retained::as_ptr(&platform_webview).cast(),
+                Retained::as_ptr(&manager).cast(),
+                window.ui_view_controller().cast_const(),
+              ));
             }
             #[cfg(windows)]
             {
-              f(Webview {
-                controller: webview.controller(),
-                environment: webview.environment(),
-              });
+              f(Webview::new(webview.controller(), webview.environment()));
             }
             #[cfg(target_os = "android")]
             {
-              f(webview.handle())
+              f(Webview::new(webview.handle()))
             }
           }
           #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -3996,49 +4183,52 @@ fn handle_user_message<T: UserEvent>(
       #[cfg(windows)]
       let is_window_transparent = builder.window.transparent;
 
-      if let Ok(window) = builder.build(event_loop) {
-        window_id_map.insert(window.id(), window_id);
+      let window = match builder.build(event_loop) {
+        Ok(window) => window,
+        Err(e) => {
+          sender.send(Err(Error::CreateWindow(Box::new(e)))).unwrap();
+          return;
+        }
+      };
 
-        let window = Arc::new(window);
+      window_id_map.insert(window.id(), window_id);
 
-        #[cfg(windows)]
-        let surface = if is_window_transparent {
-          if let Ok(context) = softbuffer::Context::new(window.clone()) {
-            if let Ok(mut surface) = softbuffer::Surface::new(&context, window.clone()) {
-              window.draw_surface(&mut surface, background_color);
-              Some(surface)
-            } else {
-              None
-            }
+      let window = Arc::new(window);
+
+      #[cfg(windows)]
+      let surface = if is_window_transparent {
+        if let Ok(context) = softbuffer::Context::new(window.clone()) {
+          if let Ok(mut surface) = softbuffer::Surface::new(&context, window.clone()) {
+            window.draw_surface(&mut surface, background_color);
+            Some(surface)
           } else {
             None
           }
         } else {
           None
-        };
-
-        windows.0.borrow_mut().insert(
-          window_id,
-          WindowWrapper {
-            label,
-            has_children: AtomicBool::new(false),
-            inner: Some(window.clone()),
-            window_event_listeners: Default::default(),
-            webviews: Vec::new(),
-            #[cfg(windows)]
-            background_color,
-            #[cfg(windows)]
-            is_window_transparent,
-            #[cfg(windows)]
-            surface,
-            #[cfg(windows)]
-            focused_webview: Default::default(),
-          },
-        );
-        sender.send(Ok(Arc::downgrade(&window))).unwrap();
+        }
       } else {
-        sender.send(Err(Error::CreateWindow)).unwrap();
-      }
+        None
+      };
+
+      windows.0.borrow_mut().insert(
+        window_id,
+        WindowWrapper {
+          label,
+          has_children: AtomicBool::new(false),
+          inner: Some(window.clone()),
+          webviews: Vec::new(),
+          #[cfg(windows)]
+          background_color,
+          #[cfg(windows)]
+          is_window_transparent,
+          #[cfg(windows)]
+          surface,
+          #[cfg(windows)]
+          focused_webview: Default::default(),
+        },
+      );
+      sender.send(Ok(Arc::downgrade(&window))).unwrap();
     }
 
     Message::UserEvent(_) => (),
@@ -4136,14 +4326,14 @@ fn handle_event_loop<T: UserEvent>(
     Event::RedrawRequested(id) => {
       if let Some(window_id) = window_id_map.get(&id) {
         let mut windows_ref = windows.0.borrow_mut();
-        if let Some(window) = windows_ref.get_mut(&window_id) {
-          if window.is_window_transparent {
-            let background_color = window.background_color;
-            if let Some(surface) = &mut window.surface {
-              if let Some(window) = &window.inner {
-                window.draw_surface(surface, background_color);
-              }
-            }
+        if let Some(window) = windows_ref.get_mut(&window_id)
+          && window.is_window_transparent
+        {
+          let background_color = window.background_color;
+          if let Some(surface) = &mut window.surface
+            && let Some(window) = &window.inner
+          {
+            window.draw_surface(surface, background_color);
           }
         }
       }
@@ -4160,23 +4350,14 @@ fn handle_event_loop<T: UserEvent>(
       WebviewMessage::WebviewEvent(event),
     )) => {
       let windows_ref = windows.0.borrow();
-      if let Some(window) = windows_ref.get(&window_id) {
-        if let Some(webview) = window.webviews.iter().find(|w| w.id == webview_id) {
-          let label = webview.label.clone();
-          let webview_event_listeners = webview.webview_event_listeners.clone();
+      if let Some(window) = windows_ref.get(&window_id)
+        && let Some(webview) = window.webviews.iter().find(|w| w.id == webview_id)
+      {
+        let label = webview.label.clone();
 
-          drop(windows_ref);
+        drop(windows_ref);
 
-          callback(RunEvent::WebviewEvent {
-            label,
-            event: event.clone(),
-          });
-          let listeners = webview_event_listeners.lock().unwrap();
-          let handlers = listeners.values();
-          for handler in handlers {
-            handler(&event);
-          }
-        }
+        callback(RunEvent::WebviewEvent { label, event });
       }
     }
 
@@ -4190,20 +4371,10 @@ fn handle_event_loop<T: UserEvent>(
         let window = windows_ref.get(&window_id);
         if let Some(window) = window {
           let label = window.label.clone();
-          let window_event_listeners = window.window_event_listeners.clone();
 
           drop(windows_ref);
 
-          callback(RunEvent::WindowEvent {
-            label,
-            event: event.clone(),
-          });
-
-          let listeners = window_event_listeners.lock().unwrap();
-          let handlers = listeners.values();
-          for handler in handlers {
-            handler(&event);
-          }
+          callback(RunEvent::WindowEvent { label, event });
         }
       }
     }
@@ -4214,23 +4385,14 @@ fn handle_event_loop<T: UserEvent>(
       if let Some(window_id) = window_id_map.get(&window_id) {
         {
           let windows_ref = windows.0.borrow();
-          if let Some(window) = windows_ref.get(&window_id) {
-            if let Some(event) = WindowEventWrapper::parse(window, &event).0 {
-              let label = window.label.clone();
-              let window_event_listeners = window.window_event_listeners.clone();
+          if let Some(window) = windows_ref.get(&window_id)
+            && let Some(event) = WindowEventWrapper::parse(window, &event).0
+          {
+            let label = window.label.clone();
 
-              drop(windows_ref);
+            drop(windows_ref);
 
-              callback(RunEvent::WindowEvent {
-                label,
-                event: event.clone(),
-              });
-              let listeners = window_event_listeners.lock().unwrap();
-              let handlers = listeners.values();
-              for handler in handlers {
-                handler(&event);
-              }
-            }
+            callback(RunEvent::WindowEvent { label, event });
           }
         }
 
@@ -4279,15 +4441,15 @@ fn handle_event_loop<T: UserEvent>(
             {
               let size = size.to_logical::<f32>(window.scale_factor());
               for webview in webviews {
-                if let Some(b) = &*webview.bounds.lock().unwrap() {
-                  if let Err(e) = webview.set_bounds(wry::Rect {
+                if let Some(b) = &*webview.bounds.lock().unwrap()
+                  && let Err(e) = webview.set_bounds(wry::Rect {
                     position: LogicalPosition::new(size.width * b.x_rate, size.height * b.y_rate)
                       .into(),
                     size: LogicalSize::new(size.width * b.width_rate, size.height * b.height_rate)
                       .into(),
-                  }) {
-                    log::error!("failed to autoresize webview: {e}");
-                  }
+                  })
+                {
+                  log::error!("failed to autoresize webview: {e}");
                 }
               }
             }
@@ -4357,17 +4519,9 @@ fn on_close_requested<'a, T: UserEvent>(
   let windows_ref = windows.0.borrow();
   if let Some(w) = windows_ref.get(&window_id) {
     let label = w.label.clone();
-    let window_event_listeners = w.window_event_listeners.clone();
 
     drop(windows_ref);
 
-    let listeners = window_event_listeners.lock().unwrap();
-    let handlers = listeners.values();
-    for handler in handlers {
-      handler(&WindowEvent::CloseRequested {
-        signal_tx: tx.clone(),
-      });
-    }
     callback(RunEvent::WindowEvent {
       label,
       event: WindowEvent::CloseRequested { signal_tx: tx },
@@ -4392,7 +4546,7 @@ fn on_window_close(window_id: WindowId, windows: &WindowsStore) {
 /// Tauri has no API for WebView2 multi-profile (tauri-apps/tauri#9285), and the
 /// profile name cannot ride along in `additional_browser_args` because WebView2
 /// requires every webview using the same user data folder to be created with
-/// identical environment options — any extra arg makes `CreateCoreWebView2Controller`
+/// identical environment options - any extra arg makes `CreateCoreWebView2Controller`
 /// fail with HRESULT(0x8007139F). So the app registers a name before asking for
 /// the webview and this crate consumes it during creation.
 #[cfg(windows)]
@@ -4451,7 +4605,7 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   webview_id: u32,
   event_loop: &EventLoopWindowTarget<Message<T>>,
   context: &Context<T>,
-  pending: PendingWindow<T, Wry<T>>,
+  pending: PendingWindow<T, WryRuntime<T>>,
   after_window_creation: Option<F>,
 ) -> Result<WindowWrapper> {
   #[allow(unused_mut)]
@@ -4468,8 +4622,6 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   #[cfg(feature = "tracing")]
   let window_create_span =
     tracing::debug_span!(parent: &window_draw_span, "wry::window::create").entered();
-
-  let window_event_listeners = WindowEventListeners::default();
 
   #[cfg(windows)]
   let background_color = window_builder.inner.window.background_color;
@@ -4565,27 +4717,24 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   // If fullscreen is requested with an explicit position, resolve the target
   // monitor up front so the window is created fullscreen on that display.
   #[cfg(any(target_os = "macos", target_os = "linux"))]
-  if let (true, Some(position)) = (is_fullscreen, initial_position) {
-    if let Some(target_monitor) =
+  if let (true, Some(position)) = (is_fullscreen, initial_position)
+    && let Some(target_monitor) =
       find_monitor_for_position(event_loop.available_monitors(), position)
-    {
-      window_builder.inner.window.fullscreen = Some(Fullscreen::Borderless(Some(target_monitor)));
-    }
+  {
+    window_builder.inner.window.fullscreen = Some(Fullscreen::Borderless(Some(target_monitor)));
   }
 
   let window = window_builder
     .inner
     .build(event_loop)
     .inspect_err(|e| log::error!("Error creating window: {e:?}"))
-    .map_err(|_| Error::CreateWindow)?;
+    .map_err(|e| Error::CreateWindow(Box::new(e)))?;
 
   // On macOS, `with_position` uses the content origin; the title bar is added
   // above it. `set_outer_position` is needed for precise window placement.
   #[cfg(target_os = "macos")]
-  if !is_fullscreen {
-    if let Some(position) = initial_position {
-      window.set_outer_position(position);
-    }
+  if !is_fullscreen && let Some(position) = initial_position {
+    window.set_outer_position(position);
   }
 
   #[cfg(feature = "tracing")]
@@ -4606,6 +4755,15 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   context.window_id_map.insert(window.id(), window_id);
 
   if let Some(handler) = after_window_creation {
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    use gtk::glib::translate::ToGlibPtr;
+
     let raw = RawWindow {
       #[cfg(windows)]
       hwnd: window.hwnd(),
@@ -4616,7 +4774,10 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
         target_os = "netbsd",
         target_os = "openbsd"
       ))]
-      gtk_window: window.gtk_window(),
+      gtk_window: {
+        let ptr: *mut gtk::ffi::GtkApplicationWindow = window.gtk_window().to_glib_none().0;
+        ptr as *mut std::ffi::c_void
+      },
       #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -4624,7 +4785,10 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
         target_os = "netbsd",
         target_os = "openbsd"
       ))]
-      default_vbox: window.default_vbox(),
+      default_vbox: window.default_vbox().map(|vbox| {
+        let ptr: *mut gtk::ffi::GtkBox = vbox.to_glib_none().0;
+        ptr as *mut std::ffi::c_void
+      }),
       _marker: &std::marker::PhantomData,
     };
     handler(raw);
@@ -4679,7 +4843,6 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     has_children: AtomicBool::new(has_children),
     inner: Some(window),
     webviews,
-    window_event_listeners,
     #[cfg(windows)]
     background_color,
     #[cfg(windows)]
@@ -4714,7 +4877,7 @@ fn create_webview<T: UserEvent>(
   window_id: Arc<Mutex<WindowId>>,
   id: WebviewId,
   context: &Context<T>,
-  pending: PendingWebview<T, Wry<T>>,
+  pending: PendingWebview<T, WryRuntime<T>>,
   #[cfg(windows)] focused_webview: Arc<Mutex<FocusState>>,
 ) -> Result<WebviewWrapper> {
   if !context.webview_runtime_installed {
@@ -4738,10 +4901,15 @@ You may have it installed on another user account, but it is not available for t
   #[allow(unused_mut)]
   let PendingWebview {
     webview_attributes,
+    #[cfg(desktop)]
+    runtime_specific_attributes,
     uri_scheme_protocols,
     label,
     ipc_handler,
     url,
+    #[cfg(desktop)]
+    opener,
+    navigation_handler,
     ..
   } = pending;
 
@@ -4753,6 +4921,16 @@ You may have it installed on another user account, but it is not available for t
   let is_first_context = web_context.is_empty();
   // the context must be stored on the HashMap because it must outlive the WebView on macOS
   let automation_enabled = std::env::var("TAURI_WEBVIEW_AUTOMATION").as_deref() == Ok("true");
+  // Make sure the data directory exists before handing it to the web context,
+  // or WebView2 / WebKitGTK can panic while initializing the user data folder.
+  if let Some(user_data_dir) = webview_attributes
+    .data_directory
+    .as_ref()
+    .filter(|dir| !dir.exists())
+  {
+    std::fs::create_dir_all(user_data_dir).map_err(|e| Error::CreateWebview(Box::new(e)))?;
+  }
+
   let web_context_key = webview_attributes.data_directory;
   let entry = web_context.entry(web_context_key.clone());
   let web_context = match entry {
@@ -4791,8 +4969,12 @@ You may have it installed on another user account, but it is not available for t
   }
 
   #[cfg(target_os = "macos")]
-  if let Some(webview_configuration) = webview_attributes.webview_configuration {
-    webview_builder = webview_builder.with_webview_configuration(webview_configuration);
+  if let Some(webview_configuration) = runtime_specific_attributes
+    .webview_configuration
+    .as_ref()
+    .or_else(|| opener.as_ref().map(|opener| &opener.target_configuration))
+  {
+    webview_builder = webview_builder.with_webview_configuration(webview_configuration.clone());
   }
 
   #[cfg(any(target_os = "windows", target_os = "android"))]
@@ -4859,7 +5041,7 @@ You may have it installed on another user account, but it is not available for t
     });
   }
 
-  if let Some(navigation_handler) = pending.navigation_handler {
+  if let Some(navigation_handler) = navigation_handler {
     webview_builder = webview_builder.with_navigation_handler(move |url| {
       url
         .parse()
@@ -4880,7 +5062,7 @@ You may have it installed on another user account, but it is not available for t
         tauri_runtime::webview::NewWindowFeatures::new(
           features.size,
           features.position,
-          tauri_runtime::webview::NewWindowOpener {
+          NewWindowOpener {
             #[cfg(desktop)]
             webview: features.opener.webview,
             #[cfg(windows)]
@@ -5021,7 +5203,7 @@ You may have it installed on another user account, but it is not available for t
     webview_builder = webview_builder.with_proxy_config(config);
   }
 
-    #[cfg(windows)]
+  #[cfg(windows)]
   {
     // rustbox patch: WebView2 multi-profile support (tauri-apps/tauri#9285).
     //
@@ -5037,11 +5219,15 @@ You may have it installed on another user account, but it is not available for t
     }
 
     if let Some(additional_browser_args) = webview_attributes.additional_browser_args {
-      webview_builder = webview_builder.with_additional_browser_args(additional_browser_args);
+      webview_builder = webview_builder.with_additional_browser_args(&additional_browser_args);
     }
 
-    if let Some(environment) = webview_attributes.environment {
-      webview_builder = webview_builder.with_environment(environment);
+    if let Some(environment) = runtime_specific_attributes
+      .environment
+      .as_ref()
+      .or_else(|| opener.as_ref().map(|opener| &opener.environment))
+    {
+      webview_builder = webview_builder.with_environment(environment.clone());
     }
 
     webview_builder = webview_builder.with_theme(match window.theme() {
@@ -5086,8 +5272,12 @@ You may have it installed on another user account, but it is not available for t
     target_os = "openbsd"
   ))]
   {
-    if let Some(related_view) = webview_attributes.related_view {
-      webview_builder = webview_builder.with_related_view(related_view);
+    if let Some(related_view) = runtime_specific_attributes
+      .related_view
+      .as_ref()
+      .or_else(|| opener.as_ref().map(|opener| &opener.webview))
+    {
+      webview_builder = webview_builder.with_related_view(related_view.clone());
     }
   }
 
@@ -5103,8 +5293,9 @@ You may have it installed on another user account, but it is not available for t
     if let Some(on_web_content_process_terminate_handler) =
       pending.on_web_content_process_terminate_handler
     {
-      webview_builder = webview_builder
-        .with_on_web_content_process_terminate_handler(on_web_content_process_terminate_handler);
+      webview_builder = webview_builder.with_on_web_content_process_terminate_handler(move || {
+        on_web_content_process_terminate_handler(Default::default());
+      });
     } else {
       log::debug!("web content process terminated");
       let context_ = context.clone();
@@ -5200,7 +5391,20 @@ You may have it installed on another user account, but it is not available for t
 
   #[cfg(any(debug_assertions, feature = "devtools"))]
   {
-    webview_builder = webview_builder.with_devtools(webview_attributes.devtools.unwrap_or(true));
+    let devtools = webview_attributes.devtools.unwrap_or(true);
+    webview_builder = webview_builder.with_devtools(devtools);
+
+    // None of the webviews wry drives - WebView2, WKWebView, WebKitGTK - opens DevTools
+    // on a keyboard shortcut of its own, so the shortcut is a page script that toggles
+    // them through the `webview` plugin. Injecting it is the runtime's call rather than
+    // `tauri`'s: a runtime whose webview already binds the chord would have both fire on
+    // one keypress, and the toggle would close the window the accelerator just opened.
+    if devtools {
+      webview_builder = webview_builder.with_initialization_script_for_main_only(
+        tauri_runtime::webview::devtools_shortcut_script(),
+        true,
+      );
+    }
   }
 
   #[cfg(target_os = "android")]
@@ -5314,7 +5518,6 @@ You may have it installed on another user account, but it is not available for t
     id,
     inner: Rc::new(webview),
     context_store: context.main_thread.web_context.clone(),
-    webview_event_listeners: Default::default(),
     context_key: if automation_enabled {
       None
     } else {
@@ -5330,7 +5533,7 @@ fn create_ipc_handler<T: UserEvent>(
   webview_id: WebviewId,
   context: Context<T>,
   label: String,
-  ipc_handler: Option<WebviewIpcHandler<T, Wry<T>>>,
+  ipc_handler: Option<WebviewIpcHandler<T, WryRuntime<T>>>,
 ) -> Box<IpcHandler> {
   Box::new(move |request| {
     if let Some(handler) = &ipc_handler {

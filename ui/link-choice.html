@@ -287,21 +287,13 @@ async function open() {
       `Always do this in ${appName}`;
   }).catch(() => {});
 
-  // Naming the browser the OS would actually use. In an embedded app nothing
-  // else ever shows it: the Settings picker is disabled there, because an
-  // embedded tab renders in RustBox's own webview and never launches a browser.
-  // "Default browser" alone left the user guessing which one would open.
-  invoke('system_default_browser').then(name => {
-    if (!name) return;
-    const opt = OPTIONS.find(o => o.id === 'external');
-    if (!opt) return;
-    opt.name = `Default browser (${name})`;
-    opt.desc = `Hand it to ${name}, the browser outside RustBox. Not signed in there.`;
-    const el = list.querySelector('.lc-opt[data-id="external"] .name');
-    if (el) el.textContent = opt.name;
-    const desc = list.querySelector('.lc-opt[data-id="external"] .desc');
-    if (desc) desc.textContent = opt.desc;
-  }).catch(() => {});
+  // The default-browser row is deliberately generic: naming the browser the OS
+  // would use meant asking the OS, on the one dialog that has to appear
+  // instantly. Measured on this machine, a click costs 80 ms of deliberate
+  // deferral plus ~150-220 ms of WebView2 window build before anything is on
+  // screen (`logs/shell.log`, `link chooser ... opened`), so nothing else
+  // belongs on this path. The Settings picker still names the OS default,
+  // because there the answer is awaited while a pane is being filled in.
 
   select('new-tab', false);
 

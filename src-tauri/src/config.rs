@@ -123,6 +123,21 @@ fn default_true() -> bool {
 ///    and is moved with it.
 const CURRENT_VERSION: u32 = 5;
 
+/// Which engine runs the whole app.
+///
+/// A process runs exactly one: see `handoff.rs` for why this cannot be a
+/// per-tab or in-process toggle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Runtime {
+    /// The OS webview: WebView2 on Windows, WKWebView on macOS, WebKitGTK on
+    /// Linux. No download, and no H.264/AAC on Windows.
+    #[default]
+    OsWebview,
+    /// Chromium via CEF, installed on demand into `engines\cef\<version>\`.
+    Chromium,
+}
+
 /// Whole workspace config persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -140,6 +155,30 @@ pub struct Config {
     /// written by the pre-2.0 default bug (missing field => false).
     #[serde(default)]
     pub version: u32,
+    /// Which executable should run the app: the OS webview or Chromium.
+    ///
+    /// Read by whichever binary starts first; both write it, so switching is a
+    /// config write plus a restart (`handoff.rs`). Missing field = the OS
+    /// webview, which is what every config written before the engine choice
+    /// existed was running.
+    #[serde(default)]
+    pub runtime: Runtime,
+    /// A data-folder move the user asked for, waiting for the next start.
+    ///
+    /// Applied by `data_root::startup` before any profile is opened, then
+    /// cleared. It lives in the config rather than in the locator because the
+    /// request is made from a running app: the target has to be recorded
+    /// somewhere that the *old* root can still read.
+    #[serde(default)]
+    pub pending_data_root: Option<String>,
+    /// The engine that ran the last time this install started.
+    ///
+    /// Written at startup by `cookie_migrate`, which is what lets the next
+    /// start tell an engine *switch* from an ordinary launch: only a switch has
+    /// a session to carry across. Missing on a config written before the engine
+    /// choice existed, which is the OS webview - the only engine there was.
+    #[serde(default)]
+    pub last_runtime: Option<Runtime>,
     /// Expose the tab browsers to a local AI agent over the MCP bridge.
     ///
     /// Defaults to off. This is a capability grant, not a convenience setting:

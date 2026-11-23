@@ -10,14 +10,24 @@ mod cdp;
 mod chat;
 mod clipboard;
 mod config;
+#[cfg(windows)]
+mod cookie_migrate;
+mod data_root;
+mod engine;
+mod engine_dist;
 mod external;
 mod favicon;
+mod folder_picker;
+mod handoff;
 mod mcp;
 mod paths;
 mod proxy_auth;
 mod session;
 mod settings;
 mod tabs;
+// WebView2 runtime pinning is meaningful only for the build that runs on
+// WebView2; the Chromium build carries its runtime inside the engine directory.
+#[cfg(feature = "wry")]
 mod webview2_skew;
 mod webview_args;
 mod workspace;
@@ -74,7 +84,7 @@ fn save_apps(apps: Vec<App>, state: tauri::State<AppState>) -> Result<(), String
 }
 
 #[tauri::command]
-fn open_devtools(main: tauri::WebviewWindow<tauri::Wry>) {
+fn open_devtools(main: tauri::WebviewWindow) {
     main.open_devtools();
 }
 /// Put text on the clipboard.
@@ -85,6 +95,152 @@ fn open_devtools(main: tauri::WebviewWindow<tauri::Wry>) {
 #[tauri::command]
 fn copy_text(text: String) -> Result<(), String> {
     clipboard::write_text(&text)
+}
+
+/// What the optional Chromium engine situation is: what can be installed and
+/// what already is. Reads no network and no config.
+#[tauri::command]
+fn engine_status() -> engine_dist::EngineStatus {
+    engine_dist::status()
+}
+
+/// Download, verify and install the Chromium engine payload for this platform.
+///
+/// Runs off the main thread: it is a ~166 MB download followed by unpacking
+/// ~400 MB, and neither belongs on the UI thread. Progress is emitted as
+/// `engine-progress` so the settings page can show it.
+#[tauri::command(async)]
+fn engine_install(app: tauri::AppHandle, version: Option<String>) -> Result<String, String> {
+    let payload = engine_dist::available().ok_or_else(|| {
+        format!(
+            "no Chromium engine is published for {}",
+            engine_dist::platform_key()
+        )
+    })?;
+    if let Some(want) = version {
+        if want != payload.version {
+            return Err(format!("the manifest offers {}, not {want}", payload.version));
+        }
+    }
+    let mut last_emit = 0u64;
+    let dir = engine_dist::install(payload, |done, total| {
+        // One event per 4 MB keeps the bar smooth without flooding the IPC.
+        if done.saturating_sub(last_emit) >= 4 * 1024 * 1024 || done == total {
+            last_emit = done;
+            let _ = app.emit(
+                "engine-progress",
+                serde_json::json!({ "done": done, "total": total }),
+            );
+        }
+    })?;
+    // `install` stages this install's Chromium build into the engine directory
+    // as its last step, so an Ok here means the engine can actually start. It
+    // used to be a separate call in this function *after* the ready marker was
+    // already written, which is how a version could be reported as installed
+    // while having no `rustbox-cef.exe` to run.
+    Ok(dir.display().to_string())
+}
+
+/// Delete an installed engine version.
+#[tauri::command]
+fn engine_remove(version: String) -> Result<(), String> {
+    engine_dist::remove(&version)
+}
+
+/// Why the last engine switch could not carry the session over.
+///
+/// Read-and-clear, like the hand-off error: a migration that failed once has
+/// already done all it can, and repeating the sentence every launch would be
+/// noise rather than a warning.
+#[cfg(windows)]
+fn migrate_error() -> Option<String> {
+    cookie_migrate::take_error()
+}
+
+#[cfg(not(windows))]
+fn migrate_error() -> Option<String> {
+    None
+}
+
+/// What the user picked, what this process is running, and what is installed.
+///
+/// Three separate facts on purpose. The settings page has to say all three,
+/// because they disagree in the one case that matters: the user has picked
+/// Chromium but the next start has not happened yet, so the window on screen is
+/// still the OS webview.
+#[tauri::command]
+fn engine_runtime(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let chosen = state.config.lock().map_err(|e| e.to_string())?.runtime;
+    let installed = engine_dist::installed_versions();
+    let newest = installed.last().cloned();
+    let binary = newest.as_deref().and_then(engine_dist::binary);
+    // A payload whose binary was never staged. Reported separately from
+    // `installed` because the two need different buttons: a runnable engine can
+    // be picked, a repairable one has to be reinstalled first.
+    let unrunnable = engine_dist::unrunnable_versions();
+    Ok(serde_json::json!({
+        "chosen": chosen,
+        "running": engine::NAME,
+        "runningIsCef": engine::IS_CEF,
+        "installed": newest,
+        "installedVersions": installed,
+        "unrunnableVersions": unrunnable,
+        "binary": binary.map(|p| p.display().to_string()),
+        // Present even when this process is the Chromium build: the launcher is
+        // the one that reads it, and the UI shows the pick it will act on.
+        "handoffError": handoff::take_error(),
+        // Why the last switch could not carry the session over, if it could not.
+        "migrateError": migrate_error(),
+        "status": engine_dist::status(),
+    }))
+}
+
+/// Choose which build should run, and say what that means for this session.
+///
+/// A write to the config plus a restart, not a runtime switch: see
+/// `handoff.rs` for why one process cannot be both engines. Returning the
+/// sentence instead of a bare `Ok(())` keeps the UI from having to reconstruct
+/// the consequences itself.
+#[tauri::command]
+fn set_engine_runtime(runtime: String, state: tauri::State<AppState>) -> Result<String, String> {
+    let wanted = match runtime.as_str() {
+        "chromium" => config::Runtime::Chromium,
+        "os-webview" => config::Runtime::OsWebview,
+        other => return Err(format!("unknown engine runtime: {other}")),
+    };
+    if wanted == config::Runtime::Chromium {
+        let version = engine_dist::installed_versions().pop().ok_or_else(|| {
+            "install the Chromium engine first: it is not downloaded yet".to_string()
+        })?;
+        if engine_dist::binary(&version).is_none() {
+            return Err(format!(
+                "engine {version} is installed but its rustbox-cef binary is missing; \
+                 reinstall the engine"
+            ));
+        }
+    }
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.runtime = wanted;
+    let path = state.config_path.clone();
+    cfg.save(&path)?;
+    // Only Windows carries cookies across a switch (`cookie_migrate`): the other
+    // platforms have no measured equivalent, so they must not promise it.
+    let carries = if cfg!(windows) {
+        " Cookies move with the switch, so most sign-ins survive."
+    } else {
+        ""
+    };
+    Ok(match wanted {
+        config::Runtime::Chromium => {
+            format!(
+                "Chromium will be used after RustBox restarts. Every open tab will \
+                 reload when it does.{carries}"
+            )
+        }
+        config::Runtime::OsWebview => {
+            format!("The system webview will be used after RustBox restarts.{carries}")
+        }
+    })
 }
 
 /// Read the MCP toggle and, when on, the endpoint the agent should use.
@@ -166,6 +322,49 @@ fn set_mcp_enabled(
 #[tauri::command]
 fn data_paths() -> paths::DataPaths {
     paths::report()
+}
+
+/// Open the system folder picker for the data-root setting.
+///
+/// Runs on its own thread: `SHBrowseForFolderW` pumps its own message loop and
+/// wants an apartment-threaded COM initialisation, neither of which belongs on
+/// the thread that is currently servicing an IPC call.
+#[tauri::command]
+async fn pick_data_folder(start_in: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || folder_picker::pick(start_in.as_deref()))
+        .await
+        .map_err(|e| format!("the folder picker crashed: {e}"))?
+}
+
+/// Record a data-folder move for the next start, or fail with the reason now.
+#[tauri::command]
+fn move_data_folder(target: Option<String>, state: tauri::State<AppState>) -> Result<String, String> {
+    data_root::schedule(target.as_deref(), &state.config_path)
+}
+
+/// Forget a data-folder move the user changed their mind about.
+#[tauri::command]
+fn cancel_data_move(state: tauri::State<AppState>) -> Result<String, String> {
+    data_root::cancel(&state.config_path)
+}
+
+/// State of a pending or failed move, so the pane can show it.
+#[tauri::command]
+fn data_move_state(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let pending = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .pending_data_root
+        .clone();
+    Ok(serde_json::json!({
+        "pending": pending,
+        "error": data_root::error_note(),
+        "reverted": paths::fallback_note(),
+        "root": paths::root().display().to_string(),
+        "defaultRoot": paths::default_root().display().to_string(),
+        "moved": paths::root() != paths::default_root(),
+    }))
 }
 
 /// The settings block, with every provider key masked.
@@ -643,11 +842,44 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// `#[cef_entry_point]` rewrites `main` into a browser-process entry point that
+/// first routes CEF's helper processes (renderer, GPU, utility) to
+/// `run_cef_helper_process`. Without it those helpers would run the app's own
+/// startup and each try to become a second browser. The attribute is applied
+/// only in the Chromium build; the default build has no helper processes.
+#[cfg_attr(feature = "cef", tauri_runtime_cef::cef_entry_point)]
 fn main() {
+    // A data-folder move requested from the settings page is applied here, before
+    // `paths::root()` is asked for anything: this is the only moment no profile,
+    // cookie database or engine DLL is open, which is what makes copying the tree
+    // safe. It also freezes the root for the rest of the process.
+    if let Some(note) = data_root::startup() {
+        eprintln!("[rustbox] {note}");
+    }
+
     let config_path = paths::config_file();
+
+    // The Chromium build is started by the default build, not by the shortcut.
+    // When the config asks for it, start it now and leave before this process
+    // builds a single window: two runs of the app at once would fight over the
+    // same config and profile. A failed hand-off falls through instead of
+    // exiting - see `handoff::take_over` for why that direction is the safe one.
+    #[cfg(feature = "wry")]
+    if let Some(code) = handoff::take_over(&config_path) {
+        std::process::exit(code);
+    }
+
+    // A cookie jar belongs to exactly one engine, so a switch starts a signed-out
+    // session. Carry it across here: this is the process that is about to open
+    // the jars, and nothing has opened one yet.
+    #[cfg(windows)]
+    if let Some(note) = cookie_migrate::startup(&config_path) {
+        eprintln!("[rustbox] {note}");
+    }
 
     // Recorded before any webview exists: a later failure has to be compared
     // against the runtime this process actually started on, not against "now".
+    #[cfg(all(feature = "wry", windows))]
     webview2_skew::mark_started();
 
     // Freeze the runtime choice before the first webview exists. Without this,
@@ -656,7 +888,7 @@ fn main() {
     // tab ask a live browser process for a version it is not running and fail
     // with RPC_E_DISCONNECTED. Pinned, tabs keep opening on the version this
     // process started with; the UI offers a restart to move to the new one.
-    #[cfg(windows)]
+    #[cfg(all(feature = "wry", windows))]
     match webview2_skew::pin_runtime_to_startup_version() {
         Some(pin) => eprintln!(
             "[rustbox] webview2 runtime pinned to {}",
@@ -665,7 +897,35 @@ fn main() {
         None => eprintln!("[rustbox] webview2 runtime not pinned: letting the loader choose"),
     }
 
-    tauri::Builder::default()
+    #[cfg(feature = "cef")]
+    eprintln!("[rustbox] engine: Chromium (CEF)");
+
+    // The shell window's own webview data has to follow the resolved root. Tauri
+    // otherwise derives it from `app_local_data_dir()`, which is fixed by the
+    // bundle identifier: after the user moved the data folder, the shell (and
+    // every `Light` profile, which lives *inside* the shell's WebView2
+    // environment) would keep writing to the old location while every app
+    // profile moved.
+    //
+    // `appDirectoriesOverride` is the hook for that: it redefines
+    // `app_local_data_dir()`, which Tauri then forces as the webview data
+    // directory on Windows and Linux. It is set here, before the app is built,
+    // because the config is otherwise compile-time only.
+    //
+    // The window-level `data_directory` is not usable instead: Tauri only accepts
+    // *relative* paths there and silently ignores an absolute one
+    // (`webview/mod.rs`, "is not a relative path, ignoring config").
+    let mut context = tauri::generate_context!();
+    context.config_mut().app.app_directories_override = Some(
+        tauri::utils::config::AppDirectoriesOverride::Directories(
+            tauri::utils::config::AppDirectoryOverrides {
+                local_data: Some(paths::root()),
+                ..Default::default()
+            },
+        ),
+    );
+
+    engine::apply(tauri::Builder::default())
         .manage(AppState::new(config_path))
         .invoke_handler(tauri::generate_handler![
             list_apps,
@@ -674,6 +934,10 @@ fn main() {
             set_favorites,
             bump_usage,
             data_paths,
+            pick_data_folder,
+            move_data_folder,
+            cancel_data_move,
+            data_move_state,
             platform_info,
             reset_app_profile,
             purge_app_data,
@@ -734,13 +998,55 @@ fn main() {
             tabs::set_active_tab,
             tabs::activate_app,
             open_devtools,
-            copy_text
+            copy_text,
+            engine_status,
+            engine_install,
+            engine_remove,
+            engine_runtime,
+            set_engine_runtime
         ])
         .setup(|app| {
             use tauri::Manager;
             let handle = app.handle().clone();
             let state: tauri::State<AppState> = handle.state();
             *state.app_handle.lock().unwrap() = Some(handle.clone());
+
+            // An interrupted engine download leaves a `.partial` directory that
+            // can never be valid: `.ready` is written only after the archive
+            // verified and every required file unpacked. Deleting it here keeps
+            // a killed download from accumulating hundreds of megabytes.
+            for stale in engine_dist::prune_partials() {
+                eprintln!("[rustbox] removed incomplete engine install: {stale}");
+            }
+
+            // An engine installed by an older build may predate the staged
+            // `rustbox-cef.exe`, or this launcher may have been upgraded since.
+            // Bringing it up to date here means the hand-off cannot fail on a
+            // stale binary the user has no way to notice. A launcher without a
+            // Chromium build beside it is a normal state (a source build, or an
+            // install that shipped only the launcher), so that case is silent.
+            //
+            // Both lists are repaired: `unrunnable_versions` covers a payload
+            // whose binary was never staged (a version older builds reported as
+            // installed), and `installed_versions` covers a binary left stale by
+            // a launcher upgrade.
+            #[cfg(feature = "wry")]
+            {
+                let mut repair: Vec<String> = engine_dist::unrunnable_versions();
+                repair.extend(engine_dist::installed_versions());
+                for version in repair {
+                    if let Err(e) = engine_dist::stage_binary_if_present(&version) {
+                        eprintln!("[rustbox] could not stage the Chromium engine: {e}");
+                    }
+                }
+            }
+
+            // Tell the launcher this build is up. It has been waiting since it
+            // spawned this process, and exits as soon as the marker appears; if
+            // it never does, the launcher falls back to the OS-webview build
+            // instead of leaving the user with nothing on screen.
+            #[cfg(feature = "cef")]
+            handoff::mark_ready();
 
             // Keep tab overlay windows glued to the main window's content area
             // whenever it is moved or resized.
@@ -842,7 +1148,7 @@ fn main() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building rustbox")
         .run(|_, event| {
             // Delete the endpoint file on the way out, so the shim reports

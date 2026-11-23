@@ -571,7 +571,7 @@ mod gtk {
   }
 
   pub fn attach_resize_handler(webview: &wry::WebView) {
-    use gtk::{gdk::WindowEdge, glib::Propagation};
+    use gtk::{gdk::WindowEdge, glib::Propagation, prelude::*};
     use wry::WebViewExtUnix;
 
     let webview = webview.webview();

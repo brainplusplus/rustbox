@@ -42,3 +42,6 @@ req*.json
 .vscode/
 .idea/
 .DS_Store
+
+# JCE context index runtime state
+.opencode-jce/context/

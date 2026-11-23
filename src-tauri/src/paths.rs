@@ -30,14 +30,206 @@
 //! directory on Windows and Linux (`manager/webview.rs`), so the UI shell
 //! profile lands in `<root>\EBWebView` next to everything else. On macOS it
 //! uses the system default instead.
+//!
+//! That forced directory is why `main` rewrites the window config's
+//! `data_directory` before the app is built: after the user moves the root, the
+//! identifier-derived path would leave the shell (and every `Light` profile
+//! inside its WebView2 environment) behind. With the rewrite, the shell uses
+//! `<root>` too and the whole tree follows the locator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Root data directory.
-pub fn root() -> PathBuf {
+/// File in the default location naming the folder that actually holds the data.
+///
+/// The pointer has to live *outside* the data root, or it could not name its own
+/// location: `config.json` cannot say "my folder is on D:" and still be found on
+/// D: when the app starts. So the default location keeps one small text file and
+/// everything else can move.
+pub const LOCATOR: &str = "data-root.txt";
+
+/// Where the data lives when the user has not moved it.
+pub fn default_root() -> PathBuf {
     dirs_next::data_local_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("rustbox")
+}
+
+/// Debug-only override, see [`root`].
+pub fn debug_root() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("RB_DATA_ROOT").map(PathBuf::from)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
+static FALLBACK: OnceLock<Option<String>> = OnceLock::new();
+
+/// Root data directory.
+///
+/// Debug builds honour `RB_DATA_ROOT`, which is what lets the hand-off and the
+/// engine install be exercised end to end without touching the real workspace
+/// (two instances fighting over one `config.json` is not a test, it is a
+/// corruption). Release builds ignore it: a redirected data root in a shipped
+/// binary would be a way to make the app write anywhere.
+///
+/// Otherwise this is [`default_root`], unless the locator file names another
+/// folder (see [`crate::data_root`]). The answer is resolved once per process:
+/// a root that changed halfway through a run would split one workspace across
+/// two folders.
+pub fn root() -> PathBuf {
+    // A root frozen by `init_root` wins, including over `RB_DATA_ROOT`: after a
+    // data-folder move the process has to run against the new folder, and the
+    // debug seam would otherwise pin it to the one the move just deleted.
+    if let Some(dir) = ROOT.get() {
+        return dir.clone();
+    }
+    if let Some(dir) = debug_root() {
+        return dir;
+    }
+    ROOT.get_or_init(|| {
+        let (root, why) = resolve();
+        let _ = FALLBACK.set(why);
+        root
+    })
+    .clone()
+}
+
+/// Why the locator was ignored, if it was. Read by the settings page.
+pub fn fallback_note() -> Option<String> {
+    let _ = root();
+    FALLBACK.get().cloned().flatten()
+}
+
+/// Resolve the root from the locator without committing to it.
+///
+/// Split out so a pending move can be applied between the decision and the
+/// first path lookup: the move happens before anything opens a profile, which
+/// is the only moment the tree is not locked.
+pub fn resolve_root() -> (PathBuf, Option<String>) {
+    if let Some(dir) = debug_root() {
+        return (dir, None);
+    }
+    resolve()
+}
+
+/// Freeze the root for this process. First call wins.
+///
+/// `note` is kept for the settings page: a locator that named a folder which is
+/// gone is not an error the app can fix, but the user has to be told, or their
+/// data looks lost.
+pub fn init_root(dir: PathBuf, note: Option<String>) {
+    let _ = ROOT.set(dir);
+    let _ = FALLBACK.set(note);
+}
+
+/// Resolve the locator into a usable root, explaining any refusal.
+fn resolve() -> (PathBuf, Option<String>) {
+    resolve_from(read_locator())
+}
+
+/// The decision itself, split from reading the file so it can be tested without
+/// touching the real `%LOCALAPPDATA%`.
+fn resolve_from(chosen: Option<PathBuf>) -> (PathBuf, Option<String>) {
+    let fallback = default_root();
+    let Some(chosen) = chosen else {
+        return (fallback, None);
+    };
+    if chosen == fallback {
+        return (fallback, None);
+    }
+    if !chosen.is_absolute() {
+        return (
+            fallback.clone(),
+            Some(format!(
+                "the saved data folder \"{}\" is not a full path, so RustBox started in {}",
+                chosen.display(),
+                fallback.display()
+            )),
+        );
+    }
+    if !chosen.is_dir() {
+        return (
+            fallback.clone(),
+            Some(format!(
+                "the saved data folder {} is not there any more, so RustBox started in {}",
+                chosen.display(),
+                fallback.display()
+            )),
+        );
+    }
+    (chosen, None)
+}
+
+/// The folder named by the locator file, if any.
+pub fn read_locator() -> Option<PathBuf> {
+    read_locator_in(&locator_dir())
+}
+
+/// The locator file itself. Always in the default location, never in the root
+/// it names.
+///
+/// Debug builds honour `RB_DATA_ROOT_LOCATOR`, so the move can be exercised end
+/// to end without writing the developer's real locator - the same reason
+/// `RB_DATA_ROOT` exists. Release builds ignore both.
+pub fn locator_file() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("RB_DATA_ROOT_LOCATOR") {
+        return PathBuf::from(path);
+    }
+    default_root().join(LOCATOR)
+}
+
+/// The directory holding the locator, which is what [`read_locator`] and
+/// [`write_locator`] work in. Also where the move's error note lives, so a
+/// redirected locator keeps the note beside it instead of in the real profile.
+pub fn locator_dir() -> PathBuf {
+    locator_file()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_root)
+}
+
+/// Seam for the tests: the locator is read from `dir` instead of the real
+/// `%LOCALAPPDATA%`, because a test that wrote the real one would move the
+/// developer's own workspace.
+pub(crate) fn read_locator_in(dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(dir.join(LOCATOR)).ok()?;
+    let line = raw.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(line))
+    }
+}
+
+pub(crate) fn write_locator_in(dir: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let file = dir.join(LOCATOR);
+    let tmp = file.with_extension("txt.tmp");
+    std::fs::write(&tmp, format!("{}\n", target.display()))
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not update {}: {e}", file.display())
+    })
+}
+
+pub(crate) fn clear_locator_in(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(dir.join(LOCATOR)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "could not delete {}: {e}",
+            dir.join(LOCATOR).display()
+        )),
+    }
 }
 
 /// Workspace config file.
@@ -90,6 +282,40 @@ pub fn light_profile(app_id: &str) -> PathBuf {
     root()
         .join("EBWebView")
         .join(format!("WV2Profile_{}", profile_name(app_id)))
+}
+
+/// Root of the Chromium engine's on-disk state.
+///
+/// CEF requires every request context's cache to live at or under one global
+/// cache root, so the whole tree hangs off a single directory that can be moved
+/// or deleted as a unit.
+pub fn cef_root() -> PathBuf {
+    root().join("cef")
+}
+
+/// Per-app request context for the Chromium engine.
+///
+/// This is the CEF equivalent of [`embedded_profile`]: one Chromium profile per
+/// app, so cookies, localStorage and IndexedDB stay separate.
+///
+/// It has to be a *direct* child of [`cef_root`], not a nested one. Chrome's
+/// profile manager only accepts a profile directory whose parent is the user
+/// data directory; a path one level deeper is refused at browser-context
+/// creation (`cef.log`: `Cannot create profile at path ...\cef\profiles\<app>`)
+/// and the tab silently falls back to the shared `Default` profile, i.e. every
+/// app ends up sharing one cookie jar. Measured: with `cef\profiles\<app>` the
+/// cookie landed in `cef\Default\Network\Cookies`; with `cef\<app>` it lands in
+/// `cef\<app>\Network\Cookies`.
+pub fn cef_profile(app_id: &str) -> PathBuf {
+    let mut name = sanitize(app_id);
+    // Chrome owns these names in a user data directory. An app that sanitised
+    // to one of them would be handed the shell's own jar instead of its own.
+    if name.eq_ignore_ascii_case("Default")
+        || name.to_ascii_lowercase().starts_with("profile-")
+    {
+        name.insert(0, '_');
+    }
+    cef_root().join(name)
 }
 
 /// `WKWebsiteDataStore` identifier for per-app isolation on macOS.
@@ -153,6 +379,7 @@ pub fn app_data_dirs(app_id: &str) -> Vec<PathBuf> {
     vec![
         embedded_profile(app_id),
         light_profile(app_id),
+        cef_profile(app_id),
         external_root(app_id),
     ]
 }
@@ -243,16 +470,29 @@ pub struct DataPaths {
     pub config: String,
     pub profiles: String,
     pub external: String,
+    /// Where the data would live if it had not been moved.
+    pub default_root: String,
+    /// The locator file, which is what makes a moved root stick.
+    pub locator: String,
+    /// True when the data is not in [`default_root`].
+    pub moved: bool,
+    /// Why a saved location was ignored, so the UI can explain a reset.
+    pub note: Option<String>,
     /// `std::env::consts::OS`, so the UI can explain platform limits.
     pub platform: String,
 }
 
 pub fn report() -> DataPaths {
     let root = root();
+    let fallback = default_root();
     DataPaths {
         config: config_file().display().to_string(),
         profiles: root.join("profiles").display().to_string(),
         external: root.join("external").display().to_string(),
+        moved: root != fallback,
+        default_root: fallback.display().to_string(),
+        locator: locator_file().display().to_string(),
+        note: fallback_note(),
         root: root.display().to_string(),
         platform: std::env::consts::OS.to_string(),
     }
@@ -283,6 +523,11 @@ pub fn save_screenshot(base64_png: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// The decision on a candidate locator, without reading the real file.
+    fn resolve_for(chosen: &Path) -> (PathBuf, Option<String>) {
+        resolve_from(Some(chosen.to_path_buf()))
+    }
+
     #[test]
     fn sanitize_blocks_traversal() {
         assert_eq!(sanitize("../../evil"), "______evil");
@@ -311,6 +556,15 @@ mod tests {
             external_profile("x", "gecko")
         );
         assert_eq!(light_profile("x"), r.join("EBWebView").join("WV2Profile_x"));
+        // CEF only accepts a profile directory directly under its cache root.
+        // Nesting it one level deeper makes Chrome refuse the profile and the
+        // tab silently shares `Default`, so pin the shape here.
+        assert_eq!(cef_profile("x"), cef_root().join("x"));
+        assert_eq!(cef_profile("x").parent(), Some(cef_root().as_path()));
+        // `Default` and `Profile-<hash>` are Chrome's own names inside a user data
+        // directory; an app that mapped onto one would share the shell's jar.
+        assert_eq!(cef_profile("Default"), cef_root().join("_Default"));
+        assert_eq!(cef_profile("profile-abc"), cef_root().join("_profile-abc"));
         assert_eq!(profile_name("x"), "x");
         // The name reaches a filesystem path, so traversal must not survive.
         assert_eq!(profile_name("../../evil"), "______evil");
@@ -322,8 +576,62 @@ mod tests {
     }
 
     #[test]
-    fn data_store_identifier_is_stable_and_distinct() {
-        // Stable: the same app must map to the same store across launches, or
+    fn the_locator_round_trips_and_survives_a_trailing_newline() {
+        let dir = std::env::temp_dir().join("rb-locator-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Nothing written yet reads as "use the default", not as an error.
+        assert_eq!(read_locator_in(&dir), None);
+
+        let target = Path::new("D:\\RustBox");
+        write_locator_in(&dir, target).unwrap();
+        assert_eq!(read_locator_in(&dir), Some(target.to_path_buf()));
+
+        // The file ends with a newline; a reader that kept it would build a path
+        // with a stray character on the end.
+        let raw = std::fs::read_to_string(dir.join(LOCATOR)).unwrap();
+        assert!(raw.ends_with('\n'));
+
+        clear_locator_in(&dir).unwrap();
+        assert_eq!(read_locator_in(&dir), None);
+        // Clearing twice is not an error: the caller may retry after a crash.
+        assert_eq!(clear_locator_in(&dir), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_locator_is_ignored_rather_than_resolved_to_nothing() {
+        let dir = std::env::temp_dir().join("rb-locator-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LOCATOR), b"\n\n").unwrap();
+        assert_eq!(read_locator_in(&dir), None);
+    }
+
+    #[test]
+    fn a_missing_folder_falls_back_instead_of_failing_to_start() {
+        // The drive may be unplugged, or the folder renamed by hand. The app has
+        // to start on the default root and say why, not refuse to run.
+        let (root, note) = resolve_for(Path::new("Q:\\definitely-not-there-rb"));
+        assert_eq!(root, default_root());
+        assert!(note.is_some_and(|n| n.contains("not there any more")));
+    }
+
+    #[test]
+    fn a_relative_locator_falls_back_with_an_explanation() {
+        let (root, note) = resolve_for(Path::new("rustbox-data"));
+        assert_eq!(root, default_root());
+        assert!(note.is_some_and(|n| n.contains("not a full path")));
+    }
+
+    #[test]
+    fn a_locator_pointing_at_the_default_root_is_not_a_move() {
+        let (root, note) = resolve_for(&default_root());
+        assert_eq!(root, default_root());
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn data_store_identifier_is_stable_and_distinct() {        // Stable: the same app must map to the same store across launches, or
         // the user is logged out on every restart.
         assert_eq!(data_store_identifier("app-a"), data_store_identifier("app-a"));
         // Distinct: two apps sharing an identifier would share a session.

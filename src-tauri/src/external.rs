@@ -1147,6 +1147,13 @@ fn open_with_default(url: &str) -> Result<(), String> {
     // starts a hand-off process and never hears which browser the OS picked.
     // Record the hand-off so "it opened Safari" can be told apart from "RustBox
     // picked a browser itself", which would be a different code path.
+    //
+    // The browser is not named. Asking the OS is a registry read on Windows and
+    // a helper process on macOS and Linux, and it used to sit on the click path
+    // for nothing a log needs: whichever browser the shell picks, the next line
+    // of the log is the same. The Settings picker still asks, because there the
+    // answer is shown to the user and awaited while a pane is being filled in.
+    //
     // Host only: a URL can carry a session token, and a log is not the place
     // for one.
     let host = url
@@ -1156,10 +1163,7 @@ fn open_with_default(url: &str) -> Result<(), String> {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    crate::tabs::shell_log(&format!(
-        "hand-off to the OS default browser ({}): {host}",
-        default_browser_name().unwrap_or_else(|| "unknown".to_string())
-    ));
+    crate::tabs::shell_log(&format!("hand-off to the OS default browser: {host}"));
     #[cfg(target_os = "windows")]
     {
         shell_execute_open(url)

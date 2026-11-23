@@ -448,10 +448,1545 @@ Two conclusions that shaped the decision:
   not a licensing or effort trade-off, it is a capability gap, which is why they
   are not on the milestone path.
 
+Servo, Blitz and Lightpanda were not in this table and are re-checked separately
+in §14, together with the measured WebView2 comparison in §13.
+
+## 13. Measured head-to-head against WebView2 (Windows, 2026-11-19)
+
+§11 answered "does CEF render". It did not answer "what does a workspace of ten
+apps cost", which is the question the engine choice actually turns on. Two
+harnesses were used: `tools/cef-spike/src/bin/tabs.rs` (CEF, windowed browsers
+over distinct origins so site isolation gives one renderer per tab) and a
+WebView2 harness with the same tab count and origins. Both run with
+`--disable-extensions` — this machine has four externally-registered extensions
+that Chromium-based engines inject into pages, and leaving them on measures the
+extensions rather than the engine. Process trees are walked by parent PID *and*
+by the `--user-data-dir` / `--profile` tag, because `msedgewebview2.exe` is not a
+child of the hosting process.
+
+10 tabs, 45 s idle, RSS in MB:
+
+| | WebView2 shared | CEF shared context | CEF per-tab contexts |
+| --- | --- | --- | --- |
+| RSS idle | 989.8 | 822.8 | 885.6 |
+| RSS peak | 990.1 | 824.4 | 886.7 |
+| Processes | 16 | 16 | 16 |
+| Renderers | 10 | 11 | 11 |
+| **RSS per renderer** | **61.5** | **55.7** | **55.9** |
+| Browser process | 161.4 | 115.5 | 164.8 |
+| GPU process | 80.1 | 39.8 | 40.3 |
+| CPU (1 core) | 5.3 % | 5.9 % | 11.5 % |
+| create, 10 tabs | 1092 ms | 667 ms | 951 ms |
+| load | 165 ms | 796 ms | 1344 ms |
+
+Three tabs, same method: WebView2 501 MB / 9 processes / 3.4 % CPU / 460–551 ms
+to create; CEF 388 MB / 8 processes / 1.7 % / 232–253 ms.
+
+**The 17 % difference is fixed cost, not per-tab cost.** RSS per renderer is
+within 10 % of each other (61.5 vs 55.7 MB). The saving comes from the browser
+process (−46 MB) and the GPU process (−40 MB) — one-off costs that do not grow
+with the tab count. Tab eleven costs the same in both engines. The "CEF is
+lighter once you have many tabs" hypothesis is therefore **not supported by
+measurement**; the honest statement is "CEF starts lower and stays lower by a
+constant".
+
+> Later correction (§19.1): the GPU-process line in this table is not clean.
+> CEF's GPU process crashes on this machine, so part of the −40 MB is a dead
+> process rather than a leaner one. Re-measured on real applications with the
+> rasterizer matched on both sides, the constant is **12 %**, and the conclusion
+> — fixed cost, not per-tab — is unchanged.
+
+### 13.1 Responsiveness under load (the reason §11 was incomplete)
+
+§11 recorded that the host-pumped message loop never blocked: 120 heartbeat
+samples, monotonic pump counts over 60 s. That measured the *pump*, not the
+*windows*. A `SendMessageTimeout(WM_NULL, 5 s)` probe answers the question the
+user actually experiences — is this window responding. 3 tabs, 40 s window,
+three runs per configuration:
+
+| Configuration | Run 1 | Run 2 | Run 3 |
+| --- | --- | --- | --- |
+| CEF, host-pumped (`do_message_loop_work`) | 1/672 | 1/660 | 1/676 |
+| CEF, `multi_threaded_message_loop` | **0/800** | **0/792** | **0/788** |
+| CEF, host-pumped + `--disable-gpu` | 1/672 | 1/668 | 1/676 |
+| WebView2 | **0/197** | **0/199** | **0/200** |
+
+The shape is deterministic rather than random: **every** host-pumped run is
+unresponsive exactly once, at t ≈ 6.0–6.2 s, and never at any other time — 9 runs,
+same point, single occurrence, 4 windows present. `--disable-gpu` does not remove
+it, so the GPU process is not the cause. The only variable that removes it is who
+owns the message loop.
+
+So the pump can be healthy while a window is blocked, and §11's "the host loop was
+never blocked" is not evidence that Option A is safe. What this does **not**
+establish: the root cause at t ≈ 6 s, and whether a real Tauri event loop (which
+pumps at a different cadence than the 5 ms probe loop) behaves the same. Both are
+open, and macOS cannot use the configuration that measured clean anyway (§4).
+
+## 14. Engine candidates re-checked (2026-11)
+
+Re-run because the alternatives in §12 were written before Servo's embedder API
+existed and before Blitz was a candidate at all. Everything here is from the
+projects' own documentation and release notes — **none of it was measured on this
+machine**, unlike §13.
+
+| Candidate | What it actually is (2026-11) | Verdict for a tab that must render WhatsApp Web / Gmail |
+| --- | --- | --- |
+| **Servo** (`servo` crate 0.8.0, 2026-11-07; 0.1.0 on crates.io 2026-04-13, monthly releases, LTS offered) | Real engine, now genuinely embeddable. `multiprocess` and `bundled` on by default, media through GStreamer, storage in `servo-storage`, one storage profile per instance | **Not yet.** WebRTC code exists but is off by default (`servo#41396` "Enable WebRTC by default" is still open) and receiving remote streams does not work (`servo/media#210`, 2026-04: "the servo side does not yet implement playing streams"), so video calls fail; there is no EME/Widevine, so protected playback fails. Web-platform conformance is still short of Blink/WebKit and the embedder API breaks monthly. Storage isolation means one Servo instance per profile, not a per-tab partition |
+| **Blitz** (DioxusLabs, beta) | HTML/CSS renderer built on Stylo + Taffy + Vello for *native app UI*. JavaScript is deliberately replaced by a Rust API; the README's own scope statement is "renders many popular **no-JS** websites (Wikipedia, old Reddit)" | **No — wrong category.** It is not a browser engine. Nothing that needs a JS framework runs on it |
+| **Lightpanda** (1.0) | Zig, headless by design, **no layout, no rasterisation, no compositor** | **No — cannot display anything.** Genuinely useful as a headless agent target, which is a different feature |
+| **Ultralight 2.0** | A single-process WebKit/WebCore fork (WebKit 615.1.18 ≈ Safari 16.4). Vendor feature matrix in §17: **no WebAssembly, no WebRTC, no MSE, no WebGL, no service workers, no notifications, no `<input type="file">` picker**. Media (VP9/Opus only) needs Indie or higher | No. It renders pages; it cannot run this class of app |
+| **LibWeb** (Ladybird) | The only independent engine with real momentum. First alpha for macOS/Linux is still "coming later this year" as of 2026-11; no embedder API exists, and `libweb-gtk` is a proof of concept | No, and not for years |
+| **CEF** | Chromium, embeddable everywhere, 281 MB `libcef.dll` | Yes for rendering; **no** for H.264/AAC and Widevine, which official builds do not ship (obtaining them needs a self-built CEF with `proprietary_codecs=true` plus patent-licence responsibility) |
+
+The set of engines that can host a real third-party web app is closed: Blink
+(CEF / WebView2 / Electron), WebKit (WKWebView / WebKitGTK / Ultralight's fork),
+and Gecko (no desktop embedding API). Servo is the only plausible fourth, and it
+is not there yet. That is a capability statement, not a preference.
+
+UAParser.js's own list of detected engines makes the same point from the other
+direction: it has 18 names, and of them only Blink and Gecko are living
+general-purpose engines for third-party sites. The rest are dead (Amaya, EdgeHTML,
+KHTML, Presto, Tasman, Trident), text-only (Links, Lynx, w3m), confined to a TV or
+handset platform (ArkWeb, Flow, NetFront, iCab, Dillo, NetSurf, Goanna), or
+aspirational (LibWeb, Servo). "There must be a small engine we could use" is a
+reasonable intuition that this list answers: there is not, and the small ones are
+small because they do not run the web.
+
+### 14.1 The trilemma, stated plainly
+
+The three goals pull against each other in a way no engine choice escapes:
+
+- **Consistent across OS** requires shipping the same engine to all three, i.e.
+  +281 MB and a browser security cadence of our own.
+- **Lightweight** requires using the engine the OS already has, i.e. 0 MB and
+  three different engines.
+- **Runs real web apps** requires Blink or WebKit, which removes the other
+  options from the table entirely.
+
+Pick two. There is no fourth engine waiting to be found, and "combine Servo +
+Ultralight + Lightpanda" is not a combination that renders anything: only the last
+of the three renders at all, and it is the one that cannot.
+
+What *is* separable, and this is the part worth designing around:
+
+- **Session isolation is not the expensive part.** `ProfileMode::Light` already
+  gives every app its own cookies, localStorage and IndexedDB inside one shared
+  runtime. Isolation costs storage, not a process tree. The measured 61 MB per
+  tab is the price of *rendering a modern web app*, and it is the same in every
+  Chromium-based engine.
+- **Consistency of behaviour** (shortcuts, tab model, notifications, proxy) is
+  ours to define and is already engine-independent. Consistency of *rendering* is
+  the only part that needs a bundled engine.
+- **Stability** is where adding engines is actively harmful: the measured hang
+  in §13.1 exists only in the configuration a Tauri host is forced into, and
+  macOS cannot use the clean one.
+
+### 14.2 Servo through Tauri exists — and rules itself out for this app
+
+`tauri-runtime-verso` (versotile-org, MIT, 142 stars) is a Tauri v2 runtime that
+replaces wry with Verso, i.e. Servo. It is close to a drop-in: disable tauri's
+`wry` feature, call `tauri_runtime_verso::builder()` instead of `tauri::Builder`,
+and ship `versoview` as an `externalBin` (prebuilt for x64 Linux/Windows/macOS and
+arm64 macOS). This is the only path by which Servo could host a RustBox tab
+without writing an embedder by hand, so it was worth checking rather than
+dismissing.
+
+Its own README rules it out for this product:
+
+> "We currently hard coded the `Origin` header for the custom protocol IPC to
+> work, but this means Tauri won't be able to check for if the URL is a remote URL
+> or a local one for the capabilities, so right now, please don't use this to load
+> arbitrary websites if you have related settings."
+
+Loading arbitrary third-party websites *is* the product. RustBox's tab is a remote
+origin by definition, and the capability system is what stops a remote page from
+reaching Tauri commands; a runtime that cannot tell local from remote has to be
+treated as a sandbox hole, not as a caveat. Add no devtools (Firefox remote
+debugging instead of CDP, so `cdp.rs` and the MCP bridge would need a second
+implementation), no per-window menus, pinned Tauri versions, and it is a research
+branch rather than a backend.
+
+That leaves the sequencing honest: Servo is the only engine that could one day
+give consistency *without* Chromium's 281 MB, and the day it can is the day
+`tauri-runtime-verso` can safely load a remote URL. Neither is true in 2026-11.
+
+## 15. What "making Option C perfect" would actually take (2026-11)
+
+Asked directly: can CEF be made to keep H.264/AAC/Widevine, never hang, and stay
+lightweight? Three of the four are engineering with a known recipe. One is not
+available at all, on one platform. Stated per requirement, with the cost attached.
+
+| Requirement | Achievable? | What it actually requires |
+| --- | --- | --- |
+| **H.264 / AAC** | Yes | Build CEF from source: `is_official_build=true proprietary_codecs=true ffmpeg_branding=Chrome` (add `rtc_use_h264=true` if video calls are in scope). Well-trodden — Spotify, CefSharp users and several public build scripts do exactly this. The cost is a build farm: ~100 GB of checkout per configuration, hours per build, six binaries (Win/macOS/Linux × x64/arm64), rebuilt on every Chromium security release. Plus the patent question, which is a business decision, not a flag: the distributor of an H.264/AAC decoder is the one carrying the licence |
+| **Widevine** | Yes, as a contract | `enable_widevine=true`, and `enable_cdm_host_verification` on Windows/macOS (`cef/BUILD.gn` asserts it there and only there). The CDM binary is not ours to redistribute without a Widevine licence, and persistent playback needs a VMP signature. castlabs is a Widevine 3PL partner and sells exactly this service for custom Chromium builds; their `electron-releases` fork is the working precedent. Two ceilings remain even when it is done right: desktop CDMs are L3 (software), so 4K is out — that needs L1 hardware plus PlayReady/HDCP 2.2, which is why Edge reaches 4K and Chrome stops at 1080p — and how a *custom* CEF app is tiered by each service is unmeasured. Also note `cef#3820`: Widevine has shipped broken in recent CEF versions even when built in |
+| **Never hangs** | Windows/Linux yes, macOS **no** — and **not** for a Tauri host | `multi_threaded_message_loop` measured 0 hangs in 3/3 runs (§13.1). The CEF header is explicit about where that works: *"Set to true (1) to have the browser process message loop run in a separate thread. … This option is only supported on Windows and Linux."* macOS is therefore stuck on the pump model — the one that hung once per run, at t ≈ 6 s, 9 times out of 9. **Correction (see §18): the Windows/Linux half of this row does not apply to RustBox either.** A second thread pumping the Windows message queue competes with the WebView2 that hosts Tauri's own UI; that is exactly why Electrobun forces `external_message_pump` on Windows. Closing this needs either (a) finding and fixing the t ≈ 6 s block, or (b) a helper process that owns its own loop plus windowless rendering into a Tauri texture — which forfeits native input/IME/accessibility and is a multi-month project with no measurement behind it |
+| **Still lightweight** | Partly, and the wrong axis | RAM: already 17 % below WebView2 (822.8 vs 989.8 MB at 10 tabs) and that is a fixed saving, not a per-tab one. Disk: 281 MB is the floor for an official build, but a self-built CEF with `symbol_level=0` has been reported at 90–160 MB (third-party forum figures, **not measured here**), at the cost of PGO. Per-tab RSS stays ~56 MB either way, because that is what a modern web app costs — the same number Electron pays |
+
+So "perfect" has one hard wall and one soft one. The hard wall is macOS: the
+configuration that measured clean does not exist there, and no flag changes that.
+The soft wall is that a self-built, codec-complete, Widevine-signed CEF is a
+*browser vendor* obligation — a permanent rebuild/re-sign/re-test pipeline across
+six binaries. That obligation is precisely what Electron exists to absorb, and
+what Rambox buys by being Electron. Rebuilding it in-house with fewer resources is
+the honest description of Option C, and it is why the recommendation stays with
+the OS webview plus a per-app CEF backend rather than a global switch.
+
+## 16. Zebkit, and the Google sign-in constraint (2026-11)
+
+`zebkit` (github.com/ikey4u, LGPL-2.1) is a new Chromium-as-a-library: Chromium
+157 over the Content API, C ABI, ships Windows x64, macOS (arm64 + Intel) and
+Linux x64. It is the closest thing to what Option C wants, so it was evaluated
+against the four requirements rather than dismissed.
+
+| Requirement | Zebkit |
+| --- | --- |
+| H.264 / AAC | **Included.** It builds its own FFmpeg (`src/ffmpeg/`, `scripts/ffmpeg-config.sh`) and the README lists "media with H.264 and AAC" in the shipped platform. This is the one thing it does that official CEF does not |
+| Widevine | **Absent.** The README and the 0.6.0 release notes never mention it, and the author states it in the launch thread: "zebkit has no printing, web bluetooth, widevine and so on" |
+| Lightweight | **Only against Electron.** Shipped 0.6.0 archives, unpacked: Windows x64 **255.7 MiB** (75.7 xz), Linux x64 187.0 (62.7), macOS 162.7–165.4 (48.7–50.3). Windows is therefore within 10 % of the official CEF runtime (281 MB) — against today's 14 MB installer this is a 5× increase. The project's own benchmark against Electron 45.2.1 puts ten popular sites at 4495 vs 4661 MB (**4 % less**), so bundled Chromium is bundled Chromium |
+| Never hangs | **Unknown, and the shape is wrong.** The documented API for a host-owned loop is `zebkit_init()` + `zebkit_pump()` — the same shape as the configuration that hung once per run in §13.1. `zebkit_main()` owns the loop instead, which a Tauri host cannot give up. Zebkit is not CEF, so the root cause may not transfer, but nothing in its documentation claims otherwise and nothing here has measured it |
+| Maturity | v0.6.0, released 2026-11, effectively one author (ikey4u), 117 points / 47 comments on the launch thread, which is openly sceptical that parts are machine-written. The engineering notes themselves are unusually rigorous — hashes per archive, controlled A/B comparisons, limits stated plainly — but a workspace app taking a months-old single-maintainer engine as its renderer is a dependency risk, not a technical one |
+
+Net: Zebkit is a genuine improvement over CEF on codecs and size and still fails
+Widevine and lightness. It does not change the decision.
+
+### 16.1 The finding that matters more than the engine
+
+Zebkit's own investigation notes are the best available evidence about a risk
+that applies to **every** bundled-Chromium option, CEF included. Reproduced from
+`docs/notes/google-signin.md`:
+
+- A slim Chromium embedding was rejected by Google at email → Next with "This
+  browser or app may not be secure" (`/v3/signin/rejected`, `rrk=46`), while a
+  full Chromium build on the same machine reached the password page.
+- The trigger was isolated to one missing legacy API: the renderer installed
+  `chrome.loadTimes` and `chrome.csi` but not `chrome.app`. Restoring it made the
+  same binary reach the password page, twice, on fresh profiles.
+- Restoring FedCM alone did not help; disabling PDF viewing, `navigator.plugins`
+  and DevTools did not cause it.
+- The author is explicit that this is an observation, not a contract: "Google's
+  private decision logic is not available; the tests do not identify a particular
+  member or internal score." Full login, MFA and token persistence were never
+  tested.
+
+Two consequences for this ADR:
+
+1. **Google sign-in is a hard gate for a bundled engine, and it is undocumented.**
+   RustBox's product is a workspace of third-party web apps, and Gmail / Google
+   Drive / YouTube sign-in is a first-class use case. A slim Chromium embedding
+   has been *observed* to fail it, and the fix is a guess about private
+   heuristics that Google can change without notice. This belongs next to the
+   codec and signing costs as a reason Option C is not a free win.
+2. **The OAuth popup problem is real and already documented by someone else.**
+   Zebkit records that a host which replaced `View::on_new_window` with
+   "report the URL, open a new tab" broke Google Identity Services: the
+   `window.opener` relationship, the form POST body and the
+   provider→site `postMessage` contract are not recoverable from a URL. Any
+   windowless/OSR backend (Option B in §4) hits this on the first "Sign in with
+   Google" button, which is a concrete cost that was previously only predicted.
+
+**Now measured, on both engines.** The one-minute test above was run on
+2026-11-19: load `accounts.google.com/signin/v2/identifier`, read the page, fill
+the identifier field, click Next, read again. Both harnesses were extended for
+it — `--urls`/`--probe` in the WebView2 harness, `--urls`/`--probe-file` plus a
+`PROBE:` title channel in the CEF harness.
+
+| | Step 0 | After Next |
+| --- | --- | --- |
+| WebView2 | `Sign in - Google Accounts`, `email:true`, `pw:true` | "Couldn't find this account" |
+| Official CEF 156 | `Sign in - Google Accounts`, `email:true`, `pw:true` | "Couldn't find this account" |
+
+Neither engine was walled. Google evaluated the (deliberately fake) address
+instead of rejecting the browser, which is exactly the behaviour a real sign-in
+would produce with a real address. Two consequences:
+
+1. **The §16 risk is specific to slim Chromium embeddings, not to bundled
+   Chromium as a class.** Official CEF — the only bundled option this ADR
+   actually proposes — does not hit it. Zebkit's finding remains valid for
+   Zebkit and for any build that trims the `chrome.*` surface.
+2. **Today's default is not affected.** RustBox does not currently have a
+   Google-sign-in bug caused by its engine. That rules out the one scenario that
+   could have forced a CEF decision immediately.
+
+Caveat: this exercises the identifier step only. Password submission, MFA and
+token persistence are still unmeasured, and the probe used a fake address, so
+"reaches the password page" is inferred from Google's own "Couldn't find this
+account" response rather than observed directly.
+
+## 17. Ultralight, and what its own docs settle (2026-11)
+
+`ovsky/Ultralight-WebBrowser` was raised as evidence that Ultralight can be a real
+browser. It is worth reading carefully, because it proves something narrower than
+it appears to.
+
+**What the repository is.** A C++/GLFW shell around the Ultralight SDK, GPL-3.0,
+one author, created 2025-10, 22 stars, 2 forks, v0.9.x and labelled
+"experimental / educational". Its README claims MIT while the repository licence
+is GPL-3.0, claims "full web standards compliance", and marks its entire roadmap
+complete — the recent commits are CI fixes merged from `cline/` branches. Those
+are signals about review depth, not about the engine, so the engine was checked
+against the vendor instead.
+
+**What it does prove.** Ultralight genuinely renders ordinary web pages in a
+23.3 MB portable build (Windows x64; 14.3 MB installer). Nothing else evaluated
+here is within an order of magnitude of that. If the goal were "a small renderer
+for our own HTML", this would be the answer.
+
+**What it hides.** Its "DRM Content Support (Experimental)" is not Ultralight
+doing DRM. The README states that DRM-protected content "cannot be rendered by
+the Ultralight engine" and that the app switches to the **native platform webview**
+(WebView2 / WKWebView / WebKit2GTK) when it detects DRM. The project's flagship
+browser is therefore already the hybrid architecture this ADR recommends — OS
+webview plus a second backend — with Ultralight in the role of the optional one.
+
+### 17.1 The vendor's own feature matrix
+
+From `ultralig.ht/docs/2.0/supported-web-features`, not paraphrased:
+
+| Feature | Status |
+| --- | --- |
+| **WebAssembly** | **Not available** |
+| **WebRTC and `getUserMedia()`** | **Not available** |
+| **Media Source Extensions (MSE)** | **Not available** |
+| **WebGL** | **Not available** |
+| **Service workers** | **Not available** |
+| **`crypto.subtle`** | **Not available** |
+| **Notification** | **Not available** |
+| **`alert` / `confirm` / `prompt`** | **Not available** |
+| **`SharedWorker`** | **Not available** |
+| **HTML drag and drop** | **Not available** |
+| **Assistive technology / screen readers** | **Not available** |
+| `<input type="file">` | Partial — **opens no picker** |
+| `window.open` | Partial |
+| HTML5 media | Partial — **Pro or higher**, WebM with VP9 video and Opus audio only |
+| Web components, `<dialog>`, `contenteditable` | Supported |
+
+That list is a map of what a workspace app needs. Concretely, for the apps this
+product exists to host:
+
+- **WhatsApp Web** — uses WebAssembly and Service Workers; calls need WebRTC. All
+  three are "Not available".
+- **YouTube** — playback requires MSE. "Not available" means no video at all, in
+  every edition, because MSE is not an edition-gated feature.
+- **Google Meet, Discord, any call** — WebRTC. Not available.
+- **Google Maps, Figma** — WebGL, and Figma also WebAssembly.
+- **Attaching a file in Gmail or WhatsApp** — `<input type="file">` opens no
+  picker.
+- **Desktop notifications**, which a multi-app workspace is largely *for* — not
+  available.
+
+H.264/AAC never appears in any edition: the media stack is WebM/VP9/Opus. So the
+earlier §12 statement, "no JavaScript JIT and no media playback", was true of the
+Free edition and imprecise overall: JIT and media are Indie-or-higher, and the
+codecs are VP9/Opus regardless.
+
+### 17.2 Licensing and platform coverage
+
+- Free edition: $0, but limited to organisations under **$200K turnover and
+  funding**, 60 FPS cap, **no JavaScript JIT**, no media playback, no custom user
+  agent, no remote inspector.
+- Indie $395/title, Pro $4,500/title, per title, with annual renewal for updates.
+- Ultralight 2.0 ships for **Windows x64, macOS arm64, Linux x64** only — no
+  macOS Intel and no Linux ARM64, both of which this project's §12 matrix assumes.
+
+### 17.3 Verdict
+
+Against the four requirements: session isolation **yes** (per-`View` session, so
+cookies/localStorage/IndexedDB are separable — the data half of `ProfileMode`);
+lightweight **yes, decisively**; consistency **partly**, with the platform gaps
+above; stability **unmeasured**, and it is a single-process 2023 WebKit fork with
+no sandbox; running real web apps **no**, by the vendor's own matrix.
+
+It is worth being precise about what would change this. Measurement cannot: no
+amount of testing adds WebAssembly, MSE or WebRTC. Only the vendor shipping those
+would.
+
+## 18. Electrobun: the architecture exists in production, and it is not copyable (2026-11)
+
+`blackboardsh/electrobun` is the strongest external check on this ADR, so it was
+read at source level rather than from the README. MIT, Zig core with a
+TypeScript/Bun API, 13.1k stars, created 2024-02, pushed 2026-11-15, 178 open
+issues.
+
+### 18.1 It independently arrived at the shape recommended here
+
+- **System webview by default.** Release artifacts separate
+  `electrobun-core-*` from `electrobun-cef-*`. Core for Windows x64 is **11.6 MB**
+  compressed — the same league as RustBox's current 14 MB installer.
+- **Bundled Chromium as an opt-in flag**, in the README's own words: a
+  "`bundleCEF` flag to bundle and pin Chromium for those that want that tradeoff
+  of consistency over file size". The CEF tarball for Windows x64 is **177.2 MB**
+  compressed. So enabling it multiplies the installer ~15×, which is the number
+  §8 predicted from `libcef.dll` and this is the first real shipped figure for it.
+- **Isolated webviews composited into the UI** via `<electrobun-webview>` and
+  `partition_context.h` — the same concept as RustBox's `ProfileMode`, one
+  Chromium context per app.
+- **CEF is official upstream**: `CEF.md` downloads the `minimal` distribution from
+  `cef-builds.spotifycdn.com` and pins 147.0.10. That means `bundleCEF` inherits
+  the same gap as §15: no H.264/AAC and no Widevine. The repository has no issue,
+  document or flag mentioning either.
+
+That an independent project with 13k stars converged on "OS webview by default,
+bundled Chromium behind a flag" is the best available evidence that this is the
+right shape — better than any argument in this document.
+
+### 18.2 Why its solution does not transfer to a Tauri host
+
+Read from `package/src/native/{win,macos,linux}/nativeWrapper.*`:
+
+| Platform | CEF configuration | Why |
+| --- | --- | --- |
+| Windows | `multi_threaded_message_loop=false`, `external_message_pump=true`, pumped from `OnScheduleMessagePumpWork` | The in-source comment: "With external_message_pump=true, CEF does NOT internally pump Windows messages, **preventing it from stealing WebView2 messages**" |
+| macOS | `multi_threaded_message_loop=false`, `windowless_rendering_enabled=true`, `CefRunMessageLoop` owns the main thread | Single-threaded loop is the only supported option |
+| Linux | `CefRunMessageLoop` on a dedicated thread | In-source note: driving `CefDoMessageLoopWork` from a `gtk_main` timer "leaves it perpetually ready and spins an idle CPU core" |
+| All | `no_sandbox = true`, `windowless_rendering_enabled = true` (OSR) | Simplicity; OSR is required for compositing into their UI |
+
+Two consequences that change earlier conclusions in this ADR:
+
+1. **§15 overstated the Windows escape hatch.** It said "Windows/Linux: use
+   `multi_threaded_message_loop`". Electrobun's comment explains why that is not
+   available to any host that keeps a WebView2 UI: a second thread pumping the
+   Windows message queue competes with WebView2's own pump. RustBox's shell is a
+   WebView2 UI, so the conflict applies. The hang-free configuration is therefore
+   not merely unavailable on macOS — it is likely unavailable on Windows too. Only
+   Linux has a clean answer, and it costs a dedicated thread running
+   `CefRunMessageLoop`.
+2. **Electrobun could only make those choices because it owns `main()`.** For
+   macOS it hands the main-thread loop to CEF entirely. Tauri's `tao` event loop
+   cannot do that. This is the structural reason "just do what Electrobun does"
+   is not an option: adopting their loop strategy means adopting their
+   framework.
+
+Also worth recording as a hypothesis, not a finding: their OSR configuration may
+be why this hang has not been reported there. §13.1 probed a *windowed* CEF
+browser with `SendMessageTimeout` on its `HWND`; with `windowless_rendering_enabled`
+there is no per-tab HWND, so a blocked Chromium UI thread would present as a
+render freeze rather than an unresponsive window. Nobody has measured that.
+
+### 18.3 Adoption verdict
+
+As a framework: not adoptable. Electrobun is Zig + TypeScript with a custom
+toolchain ("Hutch", "Cottontail"), and adopting it means rewriting the shell, not
+swapping an engine. RustBox is ~20 Rust modules including `tabs.rs` (143 KB),
+`cdp.rs`, `mcp.rs`, `session.rs`, `proxy_auth.rs`; none of that transfers.
+
+As a reference implementation: extremely valuable, and the only production
+codebase found that solves the concrete problems a CEF backend would face —
+WebView2 coexistence, per-context partitions, OSR compositing, per-platform
+process helpers, and the three-way loop strategy above.
+
+## 19. Three real applications, and the rasterizer confound (Windows, 2026-11-19)
+
+§13 measured eight blank local pages. Blank pages are the best case for any
+engine: no scripts churning, no network, nothing to composite. RustBox runs
+WhatsApp Web, Gmail and YouTube, so the ranking had to be re-checked against
+pages that never go idle.
+
+Method: three tabs, 45 s idle sampling, same three URLs in the same order on both
+sides, three runs per configuration, `--disable-extensions` everywhere. URLs are
+logged-out (`web.whatsapp.com`, `mail.google.com/mail/u/0/#inbox`,
+`www.youtube.com`), so no account data or credentials are involved. Logged-out
+is also the harder case for memory: each page runs its full unauthenticated
+front-end instead of a synced shell.
+
+### 19.1 The confound that invalidates a naive comparison
+
+This machine has an RTX 3090 and an Intel UHD 770, but CEF's GPU process
+**dies at startup on every run**: `GPU process exited unexpectedly:
+exit_code=-2147483645` (STATUS_BREAKPOINT), followed by
+`ContextResult::kTransientFailure`. CEF therefore rasterizes in software.
+WebView2 logs no such error and keeps a 137–139 MB GPU process doing real work.
+
+That asymmetry is worth roughly 90 MB and, more importantly, all of the CPU
+difference: a hardware-accelerated WebView2 against a software CEF is a
+measurement of the rasterizer, not of the engine. Every number below is given in
+both configurations — as-shipped, and with `--disable-gpu` forced on **both**
+sides so the comparison is like-for-like.
+
+### 19.2 Results
+
+RSS in MB, 3 tabs, median of three runs:
+
+| | WebView2 as-shipped | CEF as-shipped | WebView2 `--disable-gpu` | CEF `--disable-gpu` |
+| --- | --- | --- | --- | --- |
+| RSS idle (median) | 1132.5 | 918.9 | 1045.5 | 918.8 |
+| Run spread | 966.4 – 1139.7 | 877.1 – 932.7 | 847.5 – 1054.6 | 909.4 – 948.5 |
+| Processes | 11–12 | 12–13 | 10–12 | 12–13 |
+| Renderer RSS (sum) | 500 – 663 | 607 – 657 | 471 – 664 | 621 – 661 |
+| GPU process | 137.1 – 139.6 | 27.2 – 27.6 (dead) | 52.4 – 59.5 | 47.2 – 47.6 |
+| CPU, % of one core | 4.5 – 8.1 | 10.4 – 13.4 | 2.0 – 5.2 | 7.9 – 12.0 |
+| create 3 tabs | 473 – 510 ms | 244 – 264 ms | 508 – 525 ms | 233 – 246 ms |
+| load | 1555 – 5351 ms | 1406 – 1645 ms | 1742 – 1817 ms | 1388 – 1836 ms |
+
+**At matched rasterizer the RSS advantage shrinks to 12 %** (918.8 vs 1045.5 MB)
+and the CPU advantage disappears entirely. The 17–19 % seen when comparing
+default configurations is real as an end-user observation on *this* machine, but
+it is not "CEF is leaner": part of it is a dead GPU process on the CEF side.
+The honest claim, consistent with §13, remains: **CEF starts ~12 % lower and
+stays lower by a constant, not by a per-tab amount.** Renderer RSS is the same
+within noise (621–661 vs 471–664 MB for three tabs).
+
+### 19.3 The CPU number is mostly the harness, not the engine
+
+§13.1 already showed the host-pumped loop is the wrong mode. On real apps the
+same split appears in CPU, so one run was repeated with
+`--multi-threaded` (CEF owns the loop):
+
+| CEF `--disable-gpu` | RSS | CPU, % one core |
+| --- | --- | --- |
+| host-pumped (`do_message_loop_work`, 5 ms tick) | 918.8 MB | 11.8 % |
+| `multi_threaded_message_loop` | 947.1 MB | **7.4 %** |
+
+Roughly 4 points of the gap was the 200 wakeups/second harness pump. What
+remains — 7.4 % against WebView2's 5.1 % — is 0.23 % versus 0.16 % of a
+32-thread machine. In wall-clock terms this is not a user-visible difference,
+and it is the *wrong* mode being compared: `multi_threaded` is also the mode that
+removed the t≈6 s freeze (§13.1). The CPU objection to CEF does not survive
+being measured in the mode CEF would actually ship in.
+
+### 19.4 Isolation, at equal meaning
+
+§13 compared WebView2 `shared` with CEF `contexts`, which is one browser process
+with separate storage — not the same thing as WebView2 `isolated`, which forks a
+whole browser tree per app. Three tabs:
+
+| | RSS idle | Processes | CPU % one core |
+| --- | --- | --- | --- |
+| WebView2 `isolated` (3 browser trees) | 1557.8 – 1764.1 | 23–24 | 3.5 – 9.8 |
+| CEF `contexts` (1 tree, storage split) | 1012.8 | 14 | 12.4 |
+| CEF 3 independent clients (3 trees) | 1432.3 | 28 | 14.7 |
+
+Relative to its own shared baseline, per-app isolation costs WebView2
++47–59 % RSS and CEF +56 % — the same order. CEF `contexts` looks 40 % cheaper
+only because it is not isolating processes; it must not be quoted against
+WebView2 `isolated`.
+
+### 19.5 What this settles
+
+- The §13 result replicates on real applications. CEF's saving is real, fixed and
+  modest (~12 % at equal rasterizer), not the 17–40 % that a careless reading of
+  the raw table suggests.
+- The apparent CPU penalty is mostly an artifact of the harness's pump loop plus
+  a dead GPU process. In the shipping loop mode the remaining gap is 0.23 % vs
+  0.16 % of a 32-thread machine — 0.07 percentage points.
+- CEF creates tabs roughly twice as fast (250 vs 483 ms for three) and loads
+  no slower; WebView2's load times are far more variable (1555–5351 ms vs
+  1388–1836 ms), which matches the "page is up but not painted" complaints that
+  motivated this ADR.
+- None of this changes the decision. At 12 % fixed memory saving with a
+  ~500 MB per-platform runtime and two backends to maintain, opt-in CEF remains
+  correct and remains not-yet-worth-shipping (§2, §18.3).
+
+### 19.6 What remains unmeasured
+
+Windows only, one machine, logged-out pages. YouTube was not playing video;
+WhatsApp Web was sitting on the QR screen. A playing video and a synced inbox
+are different workloads, and the GPU-process crash means the hardware path has
+never been measured for CEF on this host at all — the 12 % figure is a
+software-rasterizer comparison, which is the *pessimistic* case for both sides
+but not the common one. macOS and Linux remain entirely unmeasured.
+
+## 20. Electron, and why "it is more stable" is true but does not transfer (2026-11-20)
+
+The obvious question after §13.1: if CEF's host-pumped loop is the configuration
+that hangs, and Electron is observed to be stable, why not use Electron? It was
+measured rather than argued about.
+
+### 20.1 What Electron actually is, in this comparison
+
+Electron 45.4.1 ships **Chromium 156.0.8078.100**; the CEF built here is
+**156.0.8078.88**. These are the same engine, to within three patch numbers. Any
+difference measured below is therefore shell and integration, not rendering.
+
+That is exactly why the comparison is worth making — and exactly why it is a
+trap. Electron is not a library that a host embeds. It *is* the application:
+
+| | Who owns the main thread and its message loop |
+| --- | --- |
+| Electron | **Electron.** It calls `BrowserMainLoop` itself and pumps libuv from inside it, so Node and Chromium share one loop with one owner |
+| WebView2 | **Tauri.** The webview is created on Tauri's thread; `msedgewebview2.exe` runs its own browser process |
+| CEF in a Tauri host | **Split.** Either CEF pumps (impossible — Tauri owns the thread) or Tauri pumps for CEF (`external_message_pump`), which is the mode that hangs 9/9 runs in §13.1 |
+
+Electron appears stable because it never has the split. There is no second owner
+to fail to pump. `multi_threaded_message_loop` on the CEF side reproduces that
+same single-owner property, and §13.1 measured **0/800, 0/792, 0/788** hung
+probes in that mode — the same cleanliness Electron shows.
+
+So the observation is correct and the mechanism is understood, but it does not
+transfer: **Electron cannot be adopted as an engine inside a Tauri app.** There
+is no embedding API. `WebContentsView` composes views inside Electron's own
+`BaseWindow`; it does not accept a foreign HWND. The only way to get Electron's
+stability is to become an Electron app — i.e. throw away `src-tauri/`: `tabs.rs`
+(143 KB), `cdp.rs`, `mcp.rs`, `session.rs`, `proxy_auth.rs`, and the Rust shell.
+That is the same conclusion §18.3 reached for Electrobun, by a different route.
+
+There is a second-order reason the comparison flatters Electron: it has no
+WebView2 coexisting next to it. Electrobun's own Windows source comment (§18)
+records that it must run CEF with `external_message_pump=true` specifically to
+avoid "stealing WebView2 messages" — the host-pumped mode — and Electrobun is
+thus exposed to the same class of problem this ADR measured. Running both
+engines in one process is where the hang lives.
+
+### 20.2 Measured footprint, 3 real apps, 45 s idle
+
+Same three URLs, same sampler, same `--disable-extensions` as §19.
+
+| | WebView2 | CEF 156 | **Electron 45.4.1** |
+| --- | --- | --- | --- |
+| RSS idle, median of 2–3 | 1132.5 MB | 918.9 MB | **1285 MB** (1102 / 1469) |
+| RSS, software rasterizer | 1045.5 MB | 918.8 MB | **1285 MB** (1320 / 1250.6) |
+| Processes | 11–12 | 12–13 | **7–9** |
+| Renderer RSS (sum) | 500–663 MB | 607–657 MB | **605–1060 MB** |
+| GPU process | 137–140 MB | 27 MB (dead) | **188–247 MB** |
+| CPU, % one core | 4.5–8.1 | 10.4–13.4 (host-pumped) | 3.3–14.2 |
+| create 3 tabs | 473–510 ms | 244–264 ms | **224–263 ms** |
+| load | 1555–5351 ms | 1406–1645 ms | 1272–10054 ms |
+| **Installed runtime, unpacked** | 0 (OS component) | **281 MB** `libcef.dll` | **356.9 MB** (151 MB zip) |
+
+Electron is **not** lighter than either alternative. It is the heaviest of the
+three on RSS and on disk, and it carries a Node.js runtime that a browser tab
+does not need. Fewer processes, more memory per process — the GPU process alone
+is ~190–250 MB because it is hardware-accelerating on this machine's RTX 3090,
+which is the one thing CEF could not do here (§19.1).
+
+### 20.3 The codec result, measured on all three
+
+This is the finding that matters most for a Rambox-style workspace, and it was
+measured in each engine's own JS context rather than read from documentation:
+
+| | H.264 | AAC | HEVC | Widevine |
+| --- | --- | --- | --- | --- |
+| WebView2 (Chrome 157 / Edg 157) | `probably`, MSE yes | `probably`, MSE yes | `probably` | not measured here |
+| **Official CEF 156** | **`""` — cannot play** | **`""` — cannot play** | `""` | **no API** |
+| Electron 45.4.1 | `probably`, MSE yes | `probably`, MSE yes | `probably` | unavailable (needs castlabs fork) |
+
+Official CEF returns the empty string from `canPlayType` for both H.264 and AAC
+and `false` from `MediaSource.isTypeSupported`. That is not a nuance: **YouTube
+video, WhatsApp voice notes, Instagram/X clips and most MP4 content simply do
+not play** in the CEF configuration this ADR has been measuring. §15 said this
+from `proprietary_codecs=false` in the build flags; it is now confirmed in the
+engine's own answer.
+
+Electron ships `USE_PROPRIETARY_CODECS` and gets H.264/AAC for free. WebView2
+already has them and has them today — which is the strongest single argument for
+leaving the default engine alone. The gap is not "CEF is worse", it is "the
+default already wins on the axis users notice fastest".
+
+Widevine is absent in CEF and in Electron as shipped; Electron needs the castlabs
+fork, CEF needs a self-built + VMP-signed binary (§15). WebView2 was not probed
+for Widevine in this session, so nothing is claimed about it beyond the codecs
+that were measured.
+
+### 20.4 What this changes in the decision
+
+Nothing about the default. It removes Electron from the candidate list on
+grounds that are architectural rather than empirical, and it adds one hard
+requirement to any future CEF work:
+
+- **A bundled CEF must be self-built with `proprietary_codecs=true`**, or it is
+  demonstrably worse than the engine it replaces for the app categories RustBox
+  exists to host. The 281 MB official runtime is not merely "missing DRM" — it
+  cannot decode the most common video format on the web.
+- **Electron is not a candidate**, not because it is bad but because adopting it
+  is a rewrite, and §20.2 shows it is heavier anyway.
+- **The stability question has an answer already**: the hang is a dual-loop
+  problem, and the fix is to not split the loop. For a Tauri host with WebView2
+  UI that is genuinely hard (§18.2, §19.3), which is the strongest remaining
+  argument against CEF on Windows — stronger than memory, stronger than disk.
+
+### 20.5 Stability, measured on all three
+
+The §13.1 `SendMessageTimeout` probe was extended to Electron (`probe-hang.ps1
+-Engine electron`, same 40 s window, 3 tabs, 3 runs). Result:
+
+| Configuration | Run 1 | Run 2 | Run 3 | Worst response |
+| --- | --- | --- | --- | --- |
+| CEF, host-pumped (`external_message_pump`) | 1/672 | 1/660 | 1/676 | >5000 ms |
+| CEF, `multi_threaded_message_loop` | 0/800 | 0/792 | 0/788 | — |
+| **WebView2 (today's default)** | **0/197** | **0/199** | **0/200** | <10 ms |
+| **Electron 45.4.1** | **0/465** | **0/462** | **0/459** | **8 ms / 2 ms / 3 ms** |
+
+Electron is clean, and so is **WebView2**. Both are single-owner message loops;
+only the host-pumped CEF configuration hangs, and it hangs deterministically at
+t≈6 s. Re-confirmed the same day: CEF host-pumped **1/476** hung probes, Electron
+**0/465, 0/462, 0/459**.
+
+This is the most important line in this ADR for the current decision: **the
+stability problem the user reports is a property of the CEF configuration, not a
+property WebView2 lacks.** Migrating to Electron to obtain stability would be
+paying a shell rewrite, +150 MB RSS and +357 MB of runtime for something the
+current default already delivers. If stability is the driver, the cheap action
+is to *not ship CEF* — which is what §2 already decided.
+
+Electron earns its stability the same way `multi_threaded_message_loop` does: it
+owns the loop. Neither is evidence that Chromium-in-a-Tauri-host can be made
+equally clean, and neither is reachable from inside `src-tauri/`.
+
+### 20.6 The configuration the user actually asked for, and it works
+
+The request was: stay in Rust, but get Electron's stability, and keep both
+WebView2 and an opt-in embedded Chromium. Electron's stability comes from owning
+the message loop (§20.1). The same property is available to a Rust host through
+CEF's `multi_threaded_message_loop`, where CEF runs its own UI thread instead of
+being pumped by the host.
+
+That was tested rather than assumed. `tabs.rs` gained `--host-loop`, which
+creates a real Win32 window on the main thread and runs a standard
+`GetMessage`/`DispatchMessage` loop in it — the exact shape Tauri has — while CEF
+services its browsers on its own thread. Three real applications, 40 s window,
+`SendMessageTimeout` at 250 ms:
+
+| Configuration | Probes | Hung | Worst response |
+| --- | --- | --- | --- |
+| CEF host-pumped + real apps (§20.5) | 476 | **1** | >5000 ms |
+| CEF `multi_threaded`, real apps | 619 | 0 | 5 ms |
+| **CEF `multi_threaded` + host Win32 loop, real apps** | **765** | **0** | **3 ms** |
+| Electron 45.4.1 | 459–465 | 0 | 2–8 ms |
+
+**The coexistence works.** A Rust host can own a message loop, keep WebView2 for
+the UI, and run CEF windows on their own loop, and the result is
+indistinguishable from Electron on the responsiveness probe. The architectural
+objection in §18.2 ("a Tauri host cannot give up the main thread") turns out to
+be surmountable: the host does not have to give it up, because CEF does not need
+it.
+
+This removes the last strong argument against CEF on Windows and changes the
+recommendation's shape, not its content:
+
+- The opt-in design of §2 is now **implementable as measured**, not just as
+  designed.
+- The `--multi-threaded` requirement is not optional. Any CEF backend that pumps
+  from the host thread reproduces the t≈6 s freeze, and that includes the OSR
+  shape in §4 Option B if the host drives it.
+- It does **not** make official CEF shippable: H.264/AAC are still absent
+  (§20.3), which is disqualifying for a workspace hosting YouTube and WhatsApp
+  voice notes.
+
+### 20.7 Codecs: the one blocker left, and it is not free
+
+§20.3 measured official CEF returning `""` for H.264 and AAC. The question that
+decides whether an opt-in CEF is worth building is whether that can be fixed
+without a build farm.
+
+The recipe is public and small. `amenophis/cef-codecs` builds CEF from source
+with exactly these GN arguments and nothing else changed:
+
+```
+is_official_build=true proprietary_codecs=true ffmpeg_branding=Chrome
+```
+
+That is the whole difference between a CEF that plays YouTube and one that does
+not. What it costs is not the flags:
+
+| Route | Reality |
+| --- | --- |
+| `amenophis/cef-codecs` | Correct recipe, correct patches, but **macOS arm64 only**. Nothing for Windows or Linux |
+| `psmux/godwinmix-cef` | Six platforms, official layout, `index.json` + sha1/sha256. **Measured working on Windows (§24)**: real H.264 decodes, AAC supported. Single maintainer, no CI, no attestation |
+| Build it yourself | `automate-git.py` at the CEF commit + Chromium build number; ~100 GB checkout, hours per configuration, one per platform/arch, rebuilt on every Chromium security release |
+| Electron | Has them for free — and is not embeddable (§20.1) |
+
+So the honest state of the option is:
+
+- **On Windows, opt-in CEF no longer has to cost video.** §24 measured a
+  codec-complete build that decodes H.264 at the exact CEF version the Tauri 3
+  CEF runtime pins. What remains is supply-chain trust, the Windows sandbox
+  (§21.3), a GPU process that dies on this host, and the absence of Widevine.
+  The default WebView2 still has codecs *and* measured stability (§20.5), so
+  the opt-in keeps its narrow justification: escaping the WebView2 skew class of
+  ADR 0006, for users whose app breaks on the installed runtime.
+- **On macOS and Linux the stable configuration does not exist.** CEF requires
+  the main thread there; `multi_threaded_message_loop` is Windows-only. A Tauri
+  host cannot give up the main thread, so those platforms fall back to the
+  host-pumped shape that hangs, or to OSR.
+
+That asymmetry is the real answer to "just make it like Electron everywhere": the
+part that makes it work is Windows-specific.
+
+### 20.8 Unmeasured
+
+One machine, Windows only, logged-out pages, and the Electron hang parity probe
+was prepared (`probe-hang.ps1 -Engine electron`) but not yet run under the same
+40 s window as §13.1. The claim "Electron is stable" here rests on the user's
+observation plus the architectural argument in §20.1, not on this session's
+`SendMessageTimeout` data.
+
+## 21. `tauri-runtime-cef`: the official runtime, and why the hand-built seam is cancelled (2026-11-20)
+
+Everything in §2, §5 and §20.6 assumed RustBox would build the CEF seam itself:
+`EmbeddedBackend::{System, Chromium}` inside `os-webview`, a `Surface::Chromium`
+variant beside `Surface::System(WebviewWindow)`, and a hand-rolled pump. That
+work is unnecessary. Tauri 3.0 ships an official CEF runtime.
+
+### 21.1 What it is, verified from the crate rather than the announcement
+
+`tauri-runtime-cef` on crates.io:
+
+| | |
+| --- | --- |
+| Publisher | `tauri-bot`, from `github.com/tauri-apps/tauri` — **first-party, not a community fork** |
+| Licence | Apache-2.0 OR MIT (same as Tauri) |
+| Size | 15,455 lines of Rust across 67 files; 239 KB crate |
+| Version | `3.0.0-alpha.7`, published 2026-11-06, 8,777 downloads |
+| Pins | `cef =154.5.0`, `tauri =3.0.0-alpha.6`, Rust 1.95, edition 2024 |
+| Platforms | Windows, macOS, Linux; mobile keeps wry |
+
+The documentation states it plainly: *"The CEF runtime is new in the Tauri 3.0
+alpha and is not available in Tauri 2.0. Its APIs may still change before the
+stable release."*
+
+It is a **webview runtime**, peer to `tauri-runtime-wry`. That means it replaces
+the whole `Surface` seam rather than sitting inside it: windows, webviews, menus,
+tray, events, commands and plugins all route through the runtime trait. RustBox's
+`Surface::System(WebviewWindow)` already exists (commit `021af33`) and is exactly
+the abstraction this swaps out.
+
+### 21.2 The message loop: better than the harness, and still unmeasured
+
+The runtime uses `external_message_pump` — the host-pumped family that hangs in
+§13.1 — **not** `multi_threaded_message_loop`. But its pump is not the harness's
+pump:
+
+| | Harness (`tabs.rs`, §13.1) | `tauri-runtime-cef` |
+| --- | --- | --- |
+| Trigger | `do_message_loop_work()` every 5 ms, unconditionally | `OnScheduleMessagePumpWork(delay)` posts `WM_HAVE_WORK` to a message-only window; a `WM_TIMER` covers the delay |
+| Re-entrancy | none | detected and reposted, per cefclient |
+| Source | written for the spike | a port of upstream cefclient's `main_message_loop_external_pump_win.cc` |
+| Nested loops | not handled | the timer rides winit's own loop, so CEF keeps painting during modal move/resize |
+
+The 1/476 hang in §20.5 was measured on the naive pump. The reference
+implementation may well not exhibit it, and the crate's own comment explains why
+it should not: the pump is driven by CEF's work notifications rather than a
+blind 200 Hz poll. **This is unmeasured and must not be assumed either way** —
+it is the first thing to test if RustBox ever takes this path.
+
+### 21.3 The three blockers, in order of severity
+
+**1. It is a whole-app choice, not a per-app choice.** The runtime is selected by
+the Cargo manifest and by the `runtime(..)` call on the builder. From the docs:
+*"A binary can only run one runtime."* When both crates are linked the CLI
+assumes CEF, because it is the one that must be shipped. There is no API to give
+one webview WebView2 and another CEF. The "user picks WebView2 or CEF" shape
+therefore becomes **two builds of the app**, not one build with a switch:
+
+- Default installer: wry, ~14 MB, WebView2, codecs, sandboxed, today's stability.
+- Optional CEF build/download: pinned Chromium, ~300 MB+, consistent across OS.
+
+That is a legitimate product shape — arguably a better one, since it keeps the
+default download small — but it is not the per-tab seam ADR 0005 §2 designed.
+Worth noting the runtime swap is otherwise cheap: Tauri 3 defaults to
+`DynRuntime`, so app code (commands, `AppHandle`, `WebviewWindow`) does not change
+at all, and swapping runtimes is "a change to `Cargo.toml` and to the `runtime`
+call". RustBox's `Surface` seam becomes unnecessary rather than impossible.
+
+**2. Windows runs unsandboxed, and the crate says so.** From `src/sandbox.rs`:
+*"Windows currently runs unsandboxed, whatever the policy says."* Since Chromium
+M138 the sandbox broker can only be linked by a binary built with Chromium's own
+toolchain; CEF ships `bootstrap.exe` hosts for that, and a Tauri app is an
+executable, not a bootstrap-hosted DLL. `SandboxPolicy::Required` **fails to
+start** on Windows rather than quietly pretending.
+
+For a workspace that loads arbitrary third-party web apps, this is a genuine
+security regression against WebView2, which is sandboxed today. It is a packaging
+problem rather than a code problem, but it is not solved.
+
+**3. Codecs: absent from the official distribution, solved by a third-party
+one.** The runtime pins `cef = "=154.5.0"` → CEF `154.0.34`, and the official
+distribution of that version has no `proprietary_codecs`, so §20.3's measurement
+carries over unchanged: no H.264, no AAC. A prebuilt at the *same* version with
+codecs exists and was measured working — see §24, which supersedes this point.
+The crate's own guide never mentions media codecs at all.
+
+Plus a version constraint: RustBox is on Tauri **2.12.4** stable. Taking this
+means upgrading to a **3.0 alpha**, against the docs' own advice to keep
+production on 2.x — and re-doing the vendored `tauri-runtime-wry` patch
+(`vendor/tauri-runtime-wry`, added for WebView2 multi-profile) against a new
+runtime API.
+
+One more structural fact worth recording, because it closes the door on any
+hybrid: **on Linux, wry is GTK 3 and CEF is GTK 4, and the two cannot be
+initialized in the same process.** The `tauri` crate picks its GTK bindings at
+compile time via the runtime crate. So even a hand-written per-tab seam could not
+mix them on Linux; "two builds" is not merely the documented shape, it is the
+only possible one there.
+
+### 21.4 What it would give RustBox, if the blockers clear
+
+Worth stating, because it is more than an engine swap:
+
+- **CDP as a first-class API** — `send_dev_tools_message` and
+  `on_dev_tools_protocol`. RustBox's `cdp.rs` (32 KB) exists to get this through
+  WebView2 by hand.
+- **Per-webview permissions** — `on_permission_request` with a real
+  `PermissionKind`, including the FedCM / storage-access cases that third-party
+  sign-in flows need (§16.1).
+- **Popups with a correct opener** — `features.opener().as_cef_window_opener()`,
+  which is precisely the `window.opener` / POST-body problem §16.1 recorded as
+  unrecoverable in a URL-reporting design.
+- **Frame lifecycle events**, console messages, and `with_browser_settings` for
+  the fields Tauri exposes no attribute for.
+- **An opinionated secure default**: release builds ignore Chromium switches on
+  their own command line, so a user cannot relaunch the shipped binary with
+  `--disable-web-security` or `--remote-debugging-port`.
+
+### 21.5 Decision
+
+**Do not hand-build the CEF seam.** ADR 0005 §2's `EmbeddedBackend`, §5's
+`Surface::Chromium`, and the pump work in §20.6 are superseded by a first-party
+runtime that does all of it, better, and will be maintained by the Tauri team.
+Writing them now would be building a private fork of a shipped crate.
+
+Revised path:
+
+1. **Now:** keep WebView2 as the only engine. It is measured stable (§20.5),
+   has codecs (§20.3), and is sandboxed. No work.
+2. **Now:** do not ship CEF. Its two hard blockers — codecs and the Windows
+   sandbox — are properties of the official distribution, not of any
+   integration RustBox could write.
+3. **When Tauri 3.0 goes stable:** re-evaluate `tauri-runtime-cef` as a second
+   build target. Re-run the §13.1/§20.5 probe against *its* pump before
+   believing either the hang or its absence.
+4. **Before any CEF build ships:** resolve H.264/AAC (self-built or trusted
+   prebuilt distribution) and accept or fix the unsandboxed Windows renderer.
+
+This replaces the M2 plan in the previous recommendation. The correct next action
+is not to write `Surface::Chromium`; it is to track Tauri 3 and re-test then.
+
+### 21.6 Unmeasured
+
+Whether `tauri-runtime-cef`'s external pump reproduces the t≈6 s freeze. Whether
+its default configuration plays H.264 (expected no, from the pinned distribution,
+but not measured on that crate). macOS and Linux entirely. Tauri 3.0's stability
+as a platform, which is alpha.
+
+## 22. Can the runtime be a global setting, and what happens to sessions (2026-11-20)
+
+Two questions that decide whether the "user picks the engine" feature is
+implementable at all.
+
+### 22.1 No in-process switch. "A binary can only run one runtime."
+
+The runtime is chosen twice, both at build time: the Cargo dependency selects the
+crate, and `tauri::Builder::runtime(..)` selects the attrs type (`Wry` or `Cef`).
+Tauri 3 defaults to `DynRuntime`, which keeps *application* code portable — but
+the dispatch target is fixed per binary. Calling a wry-only method on a CEF build
+returns `RuntimeTypeMismatch` at runtime; the build does not become a hybrid.
+
+Two further facts close the door:
+
+- When both crates are linked, the Tauri CLI assumes CEF, because CEF is the one
+  that must be bundled. There is no "either" build.
+- On Linux, wry is GTK 3 and CEF is GTK 4. The `tauri` crate picks its GTK
+  bindings at compile time, and the two toolkits cannot be initialized in one
+  process.
+
+So a settings toggle that swaps the engine inside a running app is **not
+implementable**, and that is also the architecturally correct answer: the two
+loops, two compositors and two storage roots coexisting in one process is exactly
+the configuration that produced the dual-loop hang in §13.1 and that Electrobun
+works around by never letting CEF pump (§18.2).
+
+**What is implementable**, and is what "a global setting" should mean here:
+
+| Shape | Mechanism | Cost |
+| --- | --- | --- |
+| Two executables, one config | `rustbox.exe` (wry) and `rustbox-cef.exe` share `config.json`; changing `engine` writes the file and relaunches into the other binary | Both must be installed, or CEF is an optional download; requires a restart |
+| Two distributions | Default installer (wry, 14 MB) and a separate "Chromium edition" | User chooses at download time, not in settings |
+| Settings toggle, one binary | **Impossible** (§22.1) | — |
+
+A per-app engine choice is also ruled out by the same fact: RustBox's `Engine`
+enum is per-app today, but the runtime is per-process. Choosing Chromium for one
+app while another stays on WebView2 cannot be done in a single run. The setting
+must be global, and the per-app `OsWebview` / `Chromium` distinction collapses
+into "which build am I running".
+
+### 22.2 Storage: what survives a switch, and what does not
+
+RustBox's on-disk layout today (from `src-tauri/src/paths.rs`):
+
+```text
+rustbox\
+  config.json             workspace config        <- engine-independent
+  session.json            open tabs + last URLs   <- engine-independent
+  EBWebView\              main-window WebView2 data
+    WV2Profile_<app-id>\  per-app profile (ProfileMode::Light)
+  profiles\<app-id>\      per-app profile (ProfileMode::Isolated)
+```
+
+Under `tauri-runtime-cef` the equivalent is a different tree entirely:
+
+- Root: `{user cache}/{identifier}/cef` by default (`Cef::root_cache_path`),
+  holding Chromium's user data directory — `Local State`, every profile, caches.
+- Per app: a separate request context created from `WebviewAttributes::
+  data_directory`, resolved relative to the root. Verified in
+  `request_context_from_webview_attributes`, so `ProfileMode::Isolated` maps
+  cleanly onto CEF.
+
+| Item | Survives a runtime switch? |
+| --- | --- |
+| `config.json`, `session.json` | **Yes.** Plain JSON, no engine involvement |
+| Tab URLs, window layout | **Yes**, via `session.json` |
+| Cookies, saved logins | **Cookies: yes, since 2026-11-22** (§25.1). Saved logins (`Login Data`) are not migrated. |
+| `localStorage`, IndexedDB, Cache Storage, service workers | **No** |
+| Granted permissions | **No** |
+| `ProfileMode::Light` | **No equivalent.** CEF has no "named profile inside a shared environment"; it falls back to per-webview request contexts, i.e. `Isolated`, at roughly 2× the memory |
+
+The encryption detail is the one that made this non-negotiable rather than
+inconvenient. Chromium's `os_crypt` encrypts cookies and saved passwords against
+a key stored per profile. The runtime's own `SecretStorage` docs state the
+consequence for any key change: cookies encrypted under the previous key become
+unreadable, **"logging users out"**. Moving between WebView2 and CEF is exactly
+such a key change. The same section also warns that `SecretStorage::Auto` uses a
+mock keychain in development and the OS store in release, so even dev and release
+builds of the *same* engine do not share a session.
+
+That is still true, and it is why the migration does not share a key: it
+*re-encrypts* every row under the incoming engine's key (§25.1).
+
+There is a second trap for pinned builds. `downgrade.rs` documents that Chromium
+migrates a profile forward only, and its own warning text is explicit: when a
+newer milestone has written the profile, "Cookies, local storage, IndexedDB and
+granted permissions are gone." A CEF build pinned to Chromium 154 that meets a
+profile written by 156 loses the session. WebView2 escapes this only because it
+tracks the installed Edge runtime.
+
+### 22.3 What this means for the feature
+
+1. **The setting is a build selector, not a runtime selector.** Say so in the UI:
+   changing it requires a restart and switches which executable runs.
+2. **Never share a profile root between engines.** Keep
+   `profiles/wry/<app-id>` and `profiles/cef/<app-id>` (or equivalent) so a
+   switch is reversible and cannot corrupt the other engine's profile.
+3. **Switching used to mean signing in again, everywhere.** That warning was
+   honest when it was written. Since 2026-11-22 the cookies are carried across at
+   startup, so most sign-ins survive a switch (§25.1); the stores that are *not*
+   carried are `localStorage`, IndexedDB and Cache Storage, so an app that keeps
+   its token there can still ask for a login. A CDP export/import
+   (`Network.getAllCookies` → `Network.setCookie`) would need a running webview on
+   both sides and would still miss those stores, which is why the migration
+   rewrites the jar instead.
+4. **`ProfileMode::Light` has no CEF meaning.** The settings UI must hide or
+   re-label it per engine rather than offering a choice that silently costs 2×
+   memory.
+
+### 22.4 Unmeasured
+
+Whether the CEF runtime's `data_directory` handling behaves identically for a
+profile written by a different CEF version on the same milestone. Nothing here
+was tested on macOS or Linux.
+
+Whether `localStorage`, IndexedDB and Cache Storage can be carried across engines
+at all (not attempted). A migrated cookie set is not the same as a migrated
+session for an app that keeps its token in one of those stores.
+
+## 23. The download-on-demand design, and what it costs (2026-11-20)
+
+The proposed shape — wry by default, "CEF mode" as an option, payload downloaded
+when first selected — is **implementable**, but not as a DLL that appears inside
+an existing process. The constraint is in the binary itself.
+
+### 23.1 Why it cannot be one binary plus a downloaded DLL
+
+`tabs.exe` (the CEF harness) has `libcef.dll` in its **PE import table**. Verified
+by parsing the import directory: 36 imported DLLs, `libcef.dll` among them.
+
+That means the Windows loader resolves `libcef.dll` **before `main()` runs**. A
+CEF-built executable cannot start, cannot print an error, and cannot fall back if
+the DLL is absent — it dies at load time. `cef_load_library()` does not help: it
+is compiled only `#if defined(OS_MAC)` (checked in
+`include/wrapper/cef_library_loader.h`), so the runtime-load path exists on macOS
+and nowhere else.
+
+Combined with §22.1 ("a binary can only run one runtime"), the shape that works
+is **two executables**, and the CEF one arrives as a complete payload:
+
+```text
+%LOCALAPPDATA%\rustbox\
+  config.json                     "engine": "wry" | "cef"
+  session.json                    open tabs, last URLs
+  rustbox.exe                     wry build — always installed, 14 MB installer
+  engines\cef\
+    156.0.8078.88\                <- one directory per CEF build
+      rustbox-cef.exe             CEF build (imports libcef.dll)
+      libcef.dll                  281.0 MB
+      resources.pak                23.5 MB
+      icudtl.dat                   10.3 MB
+      dxcompiler.dll               24.8 MB
+      vk_swiftshader.dll            5.1 MB
+      d3dcompiler_47.dll            4.5 MB
+      chrome_elf.dll, v8_context_snapshot.bin, *.pak ...
+      locales\                    220 files, 49.8 MB
+      .ready                      marker written only after verification
+```
+
+Measured payload: **368.6 MB unpacked** across 16 top-level files plus 220
+locale files; **166.9 MB** as the official `tar.bz2`. Trimming to a handful of
+locales and dropping `CREDITS.html` / `bootstrap*.exe` takes it to roughly
+**311 MB / ~140 MB compressed** — worth doing, not transformative.
+
+### 23.2 The flow, end to end
+
+1. **Install.** Installer unchanged: wry only, 14 MB, WebView2, today's
+   behaviour. Nothing about the default user's experience moves.
+2. **Select.** Settings → Engine → "Chromium (unduh ~140 MB)". This is the
+   global setting from §22.3, and the UI must say it needs a restart.
+3. **Download.** Fetch a signed manifest (version, URL, SHA-256, size) and the
+   payload. Extract into `engines\cef\<version>.partial\`.
+4. **Verify.** SHA-256 against the manifest, then **Authenticode on
+   `rustbox-cef.exe` and `libcef.dll`** using the same certificate as the app. A
+   hash from a manifest fetched over the same channel is not a trust boundary; a
+   signature is.
+5. **Commit.** Atomic rename `<version>.partial` → `<version>`, write `.ready`.
+   A crash mid-download leaves a `.partial` directory that is deleted on next
+   launch, never a half-installed engine.
+6. **Handoff.** Write `config.json: engine=cef`, spawn
+   `engines\cef\<ver>\rustbox-cef.exe`, then exit the wry process. The new
+   process must not start until the old one has released `session.json` and the
+   window, so this is a "spawn after exit" handoff, not a concurrent one.
+7. **Health check.** If `rustbox-cef.exe` does not report ready within a bound
+   (say 30 s), or exits within that window, revert `config.json` to `wry`,
+   relaunch the wry binary, and show the captured stderr. This is the only thing
+   that makes a 140 MB download safe to enable: a bad payload must degrade to
+   the working app, not to a dead one.
+
+RustBox already has most of the primitives: `reqwest` (with `blocking`, `socks`,
+`native-tls`), `handle.restart()` in `tabs::restart_after_runtime_swap`, and a
+debounced single-writer `session.json`. What is missing is a downloader, a
+signature check, and the engine directory.
+
+### 23.3 The costs that do not go away
+
+| Cost | Detail |
+| --- | --- |
+| **~140 MB per Chromium security release** | `libcef.dll` is pinned to the Chromium version `rustbox-cef.exe` was compiled against. Exe and runtime are one unit; the DLL cannot be updated alone. Every CEF bump is a rebuild, a re-sign and a full re-download |
+| **No H.264/AAC** | §20.3, measured. The downloaded payload is the official distribution. Users switching to CEF lose YouTube, WhatsApp voice notes and most MP4 |
+| **Everyone logs out** | §22.2. Different profile tree, different `os_crypt` key |
+| **No per-app choice** | §22.1. One runtime per process, so "this app on Chromium, that one on WebView2" is impossible in one run |
+| **Windows sandbox off** | §21.3. The CEF build runs its renderers unsandboxed |
+| **Signing burden** | Two executables and a 281 MB DLL to sign, notarize and keep notarized per release |
+| **Per-platform packaging** | macOS: a second `.app` inside the first is awkward; Linux: a second binary plus `libcef.so` in deb/AppImage. Only Windows has a measured design |
+| **AV / SmartScreen** | A freshly downloaded 281 MB DLL with no installer history is exactly what heuristics flag. Signed, it is fine; unsigned, the feature is unusable |
+
+### 23.4 Is there a cheaper way to get the same thing?
+
+Worth stating, because the goal behind "CEF mode" is usually *"stop the engine
+changing under me"*, not *"I want Chromium specifically"*:
+
+- **WebView2 runtime pinning (ADR 0006, already implemented).**
+  `src-tauri/src/webview2_skew.rs` (32 KB) plus the `BrowserExecutableFolder`
+  policy reader already pin the WebView2 runtime to a known-good version. That
+  delivers the actual benefit — a fixed Chromium, no surprise update breaking a
+  tab — with **zero download**, and keeps H.264/AAC and the sandbox.
+- **What pinning does not give:** macOS/Linux consistency. WebView2 is Windows
+  only, so a user on macOS still gets WKWebView. That is the one requirement CEF
+  genuinely satisfies and pinning cannot.
+
+So the download mechanism is worth building **only if cross-OS consistency is
+the requirement**. If the requirement is stability on Windows, ADR 0006 already
+answers it for free.
+
+### 23.5 Verdict
+
+Implementable, and the design above is the one to build — but not yet, and not
+before the codec question is answered. Shipping "Chromium mode" that cannot play
+video is a worse product than not offering it, because the user pays 140 MB and a
+full logout to get a browser that fails on YouTube.
+
+Order of work if it is pursued:
+
+1. Tauri 3 stable (it is alpha today; `tauri-runtime-cef` is `3.0.0-alpha.7`).
+2. ~~A codec-complete CEF distribution, self-built or trusted prebuilt (§20.7).~~
+   **Done on Windows (§24), measured.**
+3. Decide the supply-chain route: rebuild from the repo's scripts, or vendor the
+   prebuilt pinned by SHA-256 (§24.5).
+4. Re-run the §20.5 hang probe against `tauri-runtime-cef`'s own pump.
+5. Then the downloader, signature check and handoff above.
+
+### 23.6 Unmeasured
+
+Whether the CEF build starts and renders when launched from
+`engines\cef\<version>\` rather than beside the app — the directory layout is
+inferred from how CEF resolves resources relative to the executable, not tested.
+Whether Authenticode verification of a 281 MB DLL is fast enough to run on every
+launch or must be cached in `.ready`. The macOS and Linux packaging shapes. The
+30 s health-check bound.
+
+## 24. Does a codec-complete prebuilt exist, and does it work (2026-11-20)
+
+§20.7 left two open questions: is there a prebuilt CEF with H.264/AAC, and can
+the Tauri 3 CEF runtime be pointed at it. Both were answered by measurement, not
+by reading.
+
+### 24.1 The official index has no codec variant
+
+Downloaded `https://cef-builds.spotifycdn.com/index.json` (10.4 MB, the CDN
+`download-cef` uses by default) and searched it: **zero** occurrences of
+`codec` and zero of `spotify`. Every distribution is `minimal`, `client`,
+`debug_symbols` or `release_symbols` — the codec dimension does not exist in the
+official build matrix. So "just pick the codec build from CEF" is not a thing
+that exists to pick.
+
+### 24.2 The version coincidence that makes this work
+
+`tauri-runtime-cef` `3.0.0-alpha.7` pins `cef = "=154.5.0"` and
+`cef-dll-sys = "=154.5.0"` exactly. Resolved against the crates.io index:
+
+| Crate | Pinned version | Resolves to CEF |
+| --- | --- | --- |
+| `cef` | `=154.5.0` | `154.5.0+154.0.34` |
+| `cef-dll-sys` | `=154.5.0` | `154.5.0+154.0.34` |
+
+`psmux/godwinmix-cef` publishes exactly `cef-154.0.34`. The prebuilt is not
+"close enough" to the pinned version — it is the same version, which matters
+because `cef_api_hash` rejects a `libcef` whose API version differs from the
+one compiled in. A 155 or 156 codec build would not work with that crate.
+
+### 24.3 Built and run against it
+
+Downloaded the Windows archive, verified it, extracted it, and built the same
+`tabs.rs` harness the rest of this ADR uses, with only the dependency changed:
+
+```toml
+[dependencies]
+cef = { version = "=154.5.0", features = ["build-util"] }
+```
+
+```
+CEF_PATH=%TEMP%\cef-codecs
+CEF_DOWNLOAD_URL=https://github.com/psmux/godwinmix-cef/releases/download/cef-154.0.34
+cargo build --release --bin tabs
+```
+
+Result: `Compiling cef-dll-sys v154.5.0+154.0.34`, `Compiling cef
+v154.5.0+154.0.34`, build succeeded. The crate fetched from the third-party
+release using only its documented `CEF_DOWNLOAD_URL` mechanism — no patching, no
+vendoring, no forked crate. Archive layout, naming and `index.json` are
+interchangeable with the official ones, as claimed.
+
+Verified archive integrity independently rather than trusting the downloader:
+
+| Check | Result |
+| --- | --- |
+| Downloaded size | 165.7 MB |
+| Published SHA-256 vs computed | **match** (`af1f1887…c884ce`) |
+| `include/cef_version.h` | `154.0.34+g14c5a08+chromium-154.0.8037.98` |
+| `Release/libcef.lib` present | yes — linkable, not just runtime files |
+| `Release/libcef.dll` | 278.7 MB |
+
+### 24.4 The codecs actually decode
+
+`canPlayType` only reports intent, so both distributions were asked for a
+decoded frame: a `<video>` pointed at an MP4, polled until `readyState >= 2`
+(HAVE_CURRENT_DATA) or error. Same probe script, same host, same harness.
+
+| Distribution | `readyState` | `videoWidth × height` | `duration` | `error` |
+| --- | --- | --- | --- | --- |
+| psmux CEF 154.0.34 | **4** (HAVE_ENOUGH_DATA) | **320 × 176** | **10 s** | — |
+| official CEF 156.0.26 | 0 | 0 × 0 | NaN | **code 4** (SRC_NOT_SUPPORTED) |
+
+Reported capabilities on the psmux build:
+
+```json
+{"h264":"probably","h264_mse":true,"aac":"probably","aac_mse":true,
+ "hevc":"probably","ua":"…Chrome/154.0.0.0…"}
+```
+
+Official CEF 156 returns `""` for H.264 and AAC with MSE false (§20.3). So the
+codec blocker in §20.3 is **real, measured, and fixable by choosing a different
+distribution of the same CEF version**.
+
+Widevine is still absent: `{"widevine":"unavailable: no-api"}`. That is
+independent of codecs — the CDM is a separate binary shipped under a Google
+licence that CEF does not carry in any distribution. Netflix, Spotify and other
+DRM services stay unavailable on either build. Electron needs the castlabs fork
+for the same reason (§20.2).
+
+### 24.5 What this does not fix
+
+| Gap | Status |
+| --- | --- |
+| **Supply chain** | Single maintainer, 3 stars, created 2026-10-15, two releases, **no CI workflows**, no build attestation. `libcef.dll` is **`NotSigned`** — as is the official one, so signing is not a differentiator, but provenance is |
+| **Patent licence** | The repo states plainly that H.264/AAC are covered by Via LA pools and that these builds "come with no patent licence of any kind", leaving the decision to whoever ships them |
+| **Windows sandbox** | Unchanged (§21.3). The runtime runs renderers unsandboxed whatever the policy says |
+| **GPU process** | Still dies every run on this host: `GPU process exited unexpectedly: exit_code=-2147483645`, then `Failed to create shared context for virtualization`. Same as §19.1 — codecs do not touch the rasterizer |
+| **macOS / Linux** | Archives exist for `macosarm64`, `macosx64`, `linux64`, `linuxarm64`, but nothing was run there. The stable message-loop configuration is still Windows-only (§20.7) |
+| **Per-release cost** | Still a rebuild + re-sign + full re-download per Chromium security release (§23.3) |
+
+The supply chain question is the honest one, and it has a cheap answer that does
+not depend on trusting the maintainer: **you can rebuild it yourself with the
+same two scripts.** The repo ships `build.sh` and `publish.sh`, and the only
+inputs are the CEF version string. That converts "trust a stranger's binary" into
+"trust your own build host", at the cost of the ~100 GB checkout and build hours
+already noted in §20.7. The prebuilt is then a convenience, not a dependency.
+
+Size, measured on the extracted tree: 418.2 MB deployable (17 top-level files
+369.8 MB + 220 locales 48.5 MB), 165.7 MB as `tar.bz2`. That is larger than the
+156 minimal distribution measured in §23.1 because this one ships `libcef.lib`,
+headers and CMake files. Trimming to a runtime payload — `libcef.dll`,
+`resources.pak`, `icudtl.dat`, the three compiler DLLs, a handful of locales —
+lands back near the §23 figures, roughly 300 MB / ~140 MB compressed.
+
+### 24.6 Effect on the verdict
+
+§23.5 said "not before the codec question is answered" and listed a
+codec-complete CEF as work item 2. **That item is now done, on Windows.** The
+remaining order of work becomes:
+
+1. Tauri 3 stable (still alpha; `tauri-runtime-cef` is `3.0.0-alpha.7`).
+2. Decide the supply-chain route: republish our own build from `build.sh`, or
+   vendor this one pinned by SHA-256, or vendor nothing.
+3. Re-run the §20.5 hang probe against `tauri-runtime-cef`'s own pump.
+4. Then the downloader, signature check and handoff of §23.2.
+
+What does not change: the default stays WebView2, CEF stays opt-in, the switch
+still logs everyone out (§22.2), and one binary still cannot run both runtimes
+(§22.1).
+
+### 24.7 Unmeasured
+
+Whether `tauri-runtime-cef` itself renders video with this distribution inside a
+Tauri app — the measurement above is the `tabs.rs` harness, which uses the same
+`cef` crate at the same version but not the Tauri runtime. Whether the crate's
+`Cef` builder accepts a non-official `CEF_PATH` at *build* time (expected yes,
+since `cef-dll-sys` is what resolves the path, and it succeeded here). macOS and
+Linux builds of the same archives. Whether `build.sh` reproduces a byte-identical
+archive, or merely a functionally equivalent one.
+
+## 25. Where the data lives, and letting the user move it (2026-11-22)
+
+Two questions that came up with the engine setting: does switching engines keep
+a session, and can the data folder itself be moved.
+
+### 25.1 Both engines are Chromium on disk, and that still does not make storage portable
+
+Measured on this machine (Windows, 2026-11-22):
+
+| Engine / mode | Cookie database | `os_crypt.encrypted_key` |
+| --- | --- | --- |
+| WebView2 `Isolated` | `%LOCALAPPDATA%\rustbox\profiles\<app>\EBWebView\Default\Network\Cookies` | own key per app, DPAPI description `Microsoft Edge` |
+| WebView2 `Light` | `%LOCALAPPDATA%\rustbox\EBWebView\WV2Profile_<app>\Network\Cookies` | inherits the shared environment's `EBWebView\Local State` |
+| CEF | `<root>\cef\<app>\Network\Cookies` | one key for the whole engine root, in `<root>\cef\Local State`, description `Chromium` |
+
+The formats are the same family (WebView2 *is* Chromium), but three things stop a
+plain copy from carrying a login:
+
+1. The layout differs (`Default\Network\Cookies` vs `Network\Cookies`), and the
+   `Local State` that holds the key sits at a different level in each tree (per
+   app under `EBWebView`, once per engine under `cef`).
+2. `encrypted_key` is per user-data directory, and the cookie values are AES-GCM
+   under that key. Copy the DB without the matching `Local State` and every row
+   is undecryptable - and Chromium does not merely ignore those rows, it
+   **deletes them** on the next run (measured: a copied jar went from one row to
+   zero, and the page saw no cookie).
+3. The two jars are not the same schema: WebView2 adds `is_edgelegacycookie` and
+   `browser_provenance` (22 columns) where CEF has 20. CEF tolerates the extra
+   columns on read, but nothing maintains them.
+
+**The DPAPI description is a label, not a barrier.** `CryptUnprotectData` on a
+key whose description says `Microsoft Edge` succeeds in a process that is
+neither Edge nor Chromium, and re-wrapping the same 32 bytes under a description
+of `Chromium` unwraps to the same key. So a key *can* be carried across engines;
+what it cannot do is decrypt rows written under a different key (`InvalidTag`).
+
+**Therefore a login can be carried across engines, and it was measured.** In a
+controlled test (local HTTP server, one app):
+
+- copy the WebView2 jar into a CEF profile and leave CEF's own key: the cookie
+  is not served and the rows are deleted;
+- copy the same jar and seed `cef\Local State` with the WebView2
+  `os_crypt.encrypted_key`: CEF serves `probe=alive` to the page.
+
+The alternative, re-encryption, was also proven: decrypt a row with the source
+key, re-encrypt with the target key (`v10` + 12-byte nonce + AES-256-GCM over
+`SHA-256(host_key) || value`), and the target key reads it back while the source
+key rejects the new blob.
+
+What is *not* encrypted - `localStorage`, IndexedDB, Cache Storage, service
+worker registrations - could be copied outright, but nothing reads across
+engines today.
+
+**Consequence, and what the UI says:** a switch is normally a one-time login in
+the other engine. Each engine keeps its own stable profile (`profiles\<app>` /
+`cef\<app>`, both derived from the app id), so switching back to the engine used
+before restores that engine's session untouched.
+
+**Built, and measured end to end (2026-11-22).** `src-tauri/src/cookie_migrate.rs`
+runs at startup, immediately after `data_root::startup` and before any webview
+exists, and re-encrypts every embedded app's rows into the incoming engine's jar
+with that engine's key (`bcrypt.dll` for AES-256-GCM, `crypt32.dll` for DPAPI).
+Two things had to be true for it to work, and both were only known by running it:
+
+1. **The target `Local State` has to exist with a key in it.** When the incoming
+   engine has never run, the module generates a 32-byte key, DPAPI-wraps it, and
+   writes `os_crypt.encrypted_key` into the target's `Local State` before writing
+   any row. That is what Chromium does on its own first run.
+2. **WebView2 will not adopt a CEF-shaped jar.** It does not read the rows and
+   ignore what it does not know - it replaced the whole file with an empty one
+   (measured: 1 row in, `no such table: cookies` out). Adding the two columns is
+   not enough; the copied jar also needs `meta.edge_version_number` and
+   `meta.compatible_edge_version_number` (both `3`), which a jar WebView2 builds
+   for itself carries. With the columns and those two rows, WebView2 reads the
+   migrated rows.
+
+The direction that needs no schema work is the other one: CEF reads a 22-column
+jar happily, so WebView2 → CEF is a straight re-encrypt. Both directions were
+verified against real engines and a local HTTP server:
+
+- WebView2 → CEF: `carried 1 cookies from the OS webview to Chromium`, and the
+  CEF page received `seeded=yes`.
+- CEF → WebView2: `carried 1 cookies from Chromium to the OS webview`, and the
+  WebView2 page received `seeded=yes`.
+
+The row that the second test migrates is not hand-built: phase 1 lets WebView2
+write a cookie for a local page, and the test reuses that row's column values, so
+the only invented part is the key. `localStorage`, IndexedDB and Cache Storage
+are still not carried, so an app that keeps its session there can still ask for a
+login; nothing measured yet says which apps do.
+
+### 25.2 Moving the data root: the pointer lives outside it
+
+`config.json` cannot name its own folder and still be found, so the location is
+recorded in a separate one-line file at the default location
+(`%LOCALAPPDATA%\rustbox\data-root.txt`, `paths::LOCATOR`). `paths::root()`
+resolves once per process: locator if it names an existing absolute directory,
+otherwise the default, with the reason surfaced to the settings page.
+
+The move cannot run when the user asks for it. WebView2, CEF and every profile
+hold open handles on `Cookies`, `Local State` and `libcef.dll`; copying an open
+SQLite database yields a torn copy. So the request is recorded
+(`Config::pending_data_root`) and applied first thing in `main`, before a single
+profile is opened:
+
+1. copy the tree and check every file arrived at its full length (`manifest` vs
+   `verify`, file count and byte total);
+2. save the config in the new folder with the request cleared;
+3. write the locator - the moment the new folder becomes authoritative;
+4. delete the old folder, best effort.
+
+A failure in step 1 changes nothing: the locator still names the old folder, the
+process keeps using it, and the reason is written to `data-move-error.txt` beside
+the locator for the settings page. Refusals are checked before scheduling, where
+the user can answer: not absolute, inside the current root, a parent of it, a
+file, not writable, or already holding files (merging two workspaces is not a
+move).
+
+### 25.3 The shell window has to be told, and Tauri only accepts one particular hook
+
+Tauri derives the shell webview's data directory from
+`app_local_data_dir()` and forces it on Windows/Linux
+(`manager/webview.rs`). That path comes from the bundle identifier, so after a
+move the shell - and every `Light` profile, which lives *inside* the shell's
+WebView2 environment - would keep writing to the old folder while every `Isolated`
+profile moved, and `Light` apps would come back logged out.
+
+Two hooks exist; only one works:
+
+- `app.windows[].dataDirectory` / `WebviewWindowBuilder::data_directory` with an
+  **absolute** path is silently ignored by Tauri 3 alpha
+  (`webview/mod.rs`: `"data_directory ... is not a relative path, ignoring
+  config"`). Measured: the shell kept writing to the old location.
+- `app.appDirectoriesOverride.localData` redefines `app_local_data_dir()`. Set on
+  the `Context` in `main` before `.build(context)`, it moves the shell with
+  everything else. This is what ships.
+
+Verified end to end (debug build, `RB_DATA_ROOT` + `RB_DATA_ROOT_LOCATOR`):
+
+- queued move: `moved 2 files`, old folder deleted, new folder holds
+  `config.json`, `profiles\`, and a fresh `EBWebView\`; the locator names the new
+  folder; `pending_data_root` is `null`;
+- next start with only the locator: window opens, data read from the new folder,
+  the default location untouched;
+- same with `rustbox-cef.exe`: `cef\`, `profiles\`, `engine-ready.json` and
+  `config.json` all in the new folder;
+- refused move (target already holds a file): source intact, no locator written,
+  error recorded, request cleared.
+
+Not measured: a release-build move (same code path, no `RB_DATA_ROOT`), the move
+of a 400 MB engine payload plus profiles on a slow disk (it is a full copy, so it
+takes time proportional to the data), and macOS/Linux, where there is no native
+folder picker yet - the text field is the only route there.
+
+
+
+### 25.4 One CEF profile per app: the path has to be a direct child of the engine root
+
+The first port put app profiles at `cef\profiles\<app>`, mirroring the WebView2
+`profiles\<app>` layout. That silently did nothing: Chrome's profile manager
+only accepts a profile directory whose parent *is* the user data directory, and
+refuses anything deeper (`cef.log`: `Cannot create profile at path
+...\cef\profiles\<app>`). The tab still opened - on the shared `Default`
+profile - so every CEF app ended up in one cookie jar, which is exactly the
+isolation the per-app profile was supposed to provide.
+
+Measured after the fix (`cef\<app>`, a direct child):
+
+- `cef\<app>\Network\Cookies` is created and holds the app's rows;
+- `cef\Default\Network\Cookies` stays empty, i.e. the app is not sharing the
+  shell's jar;
+- a cookie set by the page survives a graceful close (the row is still there
+  afterwards), while a hard kill leaves the DB without it - CEF flushes cookies
+  on shutdown, not on every write.
+
 ## Consequences
 
+- **The hand-built CEF seam is cancelled (§21).** Tauri 3.0 ships
+  `tauri-runtime-cef` as a first-party webview runtime: Apache-2.0/MIT, from
+  `tauri-apps/tauri`, 15,455 lines. `EmbeddedBackend` inside `os-webview` and a
+  `Surface::Chromium` variant would be a private fork of a shipped crate.
+- **The engine cannot be a runtime toggle (§22.1).** A binary runs one runtime;
+  Linux GTK 3 vs GTK 4 makes a hybrid impossible there. The "global setting"
+  can only select which executable is launched, which means a restart and either
+  both binaries installed or an optional Chromium download. It also ends the
+  per-app engine choice: the runtime is per-process, so `Engine::Chromium`
+  cannot be per-app.
+- **Switching engines carries cookies, and only cookies (§22.2, §25.1).**
+  `config.json` and `session.json` survive a switch, and so do cookies: on
+  Windows, `cookie_migrate` re-encrypts every embedded app's rows into the
+  incoming engine's jar at startup, verified in both directions against the real
+  engines (§25.1). Profiles must still never be shared between engines.
+  `localStorage`, IndexedDB, Cache Storage and granted permissions are *not*
+  carried, so an app that keeps its session there still asks for a login. The
+  rest of the platforms have no equivalent: the DPAPI/CNG path is Windows-only.
+- **Each CEF app gets its own profile, as a direct child of `cef\` (§25.4).**
+  A nested `cef\profiles\<app>` is refused by Chrome and silently shares
+  `Default`, which would put every Chromium app in one cookie jar.
+- **The data folder is relocatable, on the next start (25).** A pointer file at
+  the default location names the real root, because `config.json` cannot say
+  where it lives and still be found. The move is deferred to startup - a running
+  browser holds its cookie database open - and only becomes authoritative once
+  the copy has been verified and the locator written. The shell window follows
+  through `appDirectoriesOverride.localData`, not through the window
+  `dataDirectory`, which Tauri silently ignores for absolute paths.
+- **An on-demand download is implementable, as two executables (§23).** Verified:
+  `libcef.dll` is in the CEF binary's PE import table, so a CEF build cannot start
+  without its ~311–369 MB payload — it is not a DLL that can be dropped into a
+  running process. The viable shape is a wry installer (14 MB) plus an optional,
+  signed `engines\cef\<version>\` payload (~140 MB compressed) with a health
+  check that reverts to wry on failure. ADR 0006's WebView2 runtime pinning
+  already delivers the "engine stops changing" benefit for free on Windows; the
+  download buys cross-OS consistency only.
+- CEF is consequently a **whole-app build variant**, not a per-app toggle: the
+  dependency in the manifest selects the runtime for the entire toolchain. The
+  product shape becomes "default installer (WebView2, 14 MB) plus an optional
+  Chromium build", which is defensible but is not the per-tab seam §2 designed.
 - A RustBox tab can be Chromium on macOS for the first time, and on Windows can
-  escape the WebView2 skew class.
+  escape the WebView2 skew class — but only in that optional build.
+- The Windows coexistence question is settled (§20.6): a Tauri host keeps its
+  message loop, WebView2 keeps the UI, and CEF runs on its own thread with
+  Electron-class responsiveness (0/765 hung probes, worst 3 ms). It is therefore
+  known-implementable — though `tauri-runtime-cef` uses the external-pump family
+  instead, whose own behaviour is unmeasured.
+- That result is **Windows-only**. CEF needs the main thread on macOS/Linux, so
+  the `multi_threaded` shape does not exist there.
+- One of the two distribution blockers is **solved, measured** (§24): a prebuilt
+  CEF at the exact pinned version decodes real H.264 (`readyState` 4, 320×176)
+  where the official build returns `SRC_NOT_SUPPORTED`. What replaces it is not a
+  code problem but a policy one — an unaudited single-maintainer binary, no build
+  attestation, and no patent licence for H.264/AAC, so the honest route is to
+  rebuild it from the repo's own scripts rather than vendor a stranger's DLL. The
+  other blocker, **an unsandboxed Windows renderer** (stated by the runtime's own
+  `sandbox.rs`, not fixable without packaging the app as a bootstrap-hosted DLL),
+  remains and is not RustBox's to solve.
 - RustBox starts carrying a browser: its own Chromium security cadence, hundreds
   of MB per platform, and a signing requirement that does not exist today.
 - ADR 0001's "Embedded engine: OS webview" becomes "OS webview by default,
@@ -461,3 +1996,104 @@ Two conclusions that shaped the decision:
   UI has to say so rather than offering a choice that behaves identically.
 - Every future tab feature must be implemented for two backends or abstracted.
   That is the recurring cost, not the one-time work.
+
+## 26. Shipping it: one installer, two executables (2026-11-23)
+
+§23 concluded that an on-demand engine download has to be **two executables**, and
+that conclusion was implemented as a launcher plus a separately downloaded engine.
+The installer, however, still shipped only the launcher. That produced a broken
+state rather than a missing feature: the payload downloaded and unpacked, `.ready`
+was written, `installed_versions()` reported the engine as installed, the settings
+page offered a switch to it - and `rustbox-cef.exe` had never been installed, so
+the hand-off had nothing to start. Nothing repaired it either, because the only
+startup repair path treats "no Chromium build beside the launcher" as a normal
+state (a source build). Verified on the affected install: `engines\cef\154.0.34\`
+held 362 MB of payload and no binary.
+
+### 26.1 Why both binaries are in the installer
+
+The alternatives were considered and rejected on measurement, not preference.
+
+| Option | Shape | Why not |
+| --- | --- | --- |
+| A (chosen) | One installer, `rustbox.exe` + `rustbox-cef.exe` + `rustbox-mcp.exe`; payload still downloaded on demand | - |
+| B | Offline installer with the 173 MB payload embedded | +173 MB for every user, including the majority who never pick Chromium, to solve a problem the download already solves |
+| C | One `.exe` that switches engine at run time | **Impossible**, measured below |
+
+C is not a packaging question. `libcef.dll` is a *load-time* import of the
+Chromium build: without it the process dies in 0.4 s with `0xC0000135`. Relinking
+with `/DELAYLOAD:libcef.dll` does work at the PE level - `libcef.dll` moves from
+STATIC to DELAY in the import directory - but the process then dies at 5.7 s with
+`0xC06D007E` at the first CEF call, because `engine::apply` always constructs the
+CEF runtime. Delay-loading moves the failure, it does not remove it. On the Tauri
+side, `Builder::runtime` is a compile-time generic over `runtime::Runtime`, which
+has associated types and `Sized`; a runtime `dyn` switch does not type-check, and
+merging the two builds would need two monomorphisations across 67
+`#[cfg(feature = ...)]` sites, 78 `#[tauri::command]`s and 184
+`AppHandle`/`WebviewWindow`/`State<>` mentions.
+
+A costs one extra executable in the installer (33 MB) and keeps the "one shortcut,
+one config" property, because `handoff.rs` starts whichever binary the config
+names. That is what shipped.
+
+### 26.2 `.ready` no longer means "installed"
+
+The bug above was a contract bug, not a download bug. The fix makes the binary
+part of the definition:
+
+- `payload_complete_in` - the payload is unpacked, hashed and marked `.ready`.
+  This is the weaker precondition: what `stage_binary_in` accepts, and the
+  re-entry guard in `install_into`.
+- `is_installed_in` - `payload_complete_in` **and** `rustbox-cef.exe` present.
+  This is what `installed_versions()` reports.
+- `unrunnable_versions()` - payload complete but binary missing. Reported
+  separately so the UI can offer **Repair** (which skips the 173 MB download and
+  repeats only the copy) instead of **Use this** (which the backend would reject).
+
+`install()` now stages the binary as its last step, so an `Ok` means the engine can
+actually start. A staging failure leaves the payload on disk, which the re-entry
+guard recognises: the retry finishes the copy rather than re-downloading 173 MB to
+recover from a 33 MB copy.
+
+### 26.3 Two build constraints found while making the installer
+
+Both were discovered by the release path failing, and both are recorded here
+because neither is obvious from the code.
+
+**The Chromium build needs the MSVC environment.** It is the only part of the
+project that compiles C++: `cef-dll-sys` drives CMake over 123 wrapper translation
+units. CMake's Ninja generator passes the MSVC include and library paths through
+the *environment* instead of baking them into the build files, so a shell without
+`vcvars64.bat` fails with `fatal error C1083: Cannot open include file:
+'stdint.h'` - which reads like a broken checkout. `scripts/build-installer.mjs`
+now checks `INCLUDE` and says so explicitly. Ordinary `cargo build` of the wry app
+does not need it: rustc finds its own linker and system libraries.
+
+**The Chromium build must not live at a deep path.** Each object is written under
+`<target>/release/build/cef-dll-sys-<hash>/out/build/libcef_dll_wrapper/
+CMakeFiles/libcef_dll_wrapper.dir/cpptoc/test/<name>.cc.obj` - 52 characters of
+cargo scaffolding plus 114 for the deepest CEF source. Measured on a nested
+checkout, `src-tauri/target/cef` put the longest object path at **262** characters
+against a 260 limit, and cl.exe reported it as `fatal error C1083: Cannot open
+compiler generated file: ''`, naming neither the file nor the limit. The same
+sources compiled without complaint in a 105-character target dir (object paths
+217), which is what identified the cause. `LongPathsEnabled=1` was set and did not
+help: cl.exe and Ninja are not long-path aware. The script therefore builds into
+`<temp>/rustbox-cef-target` (230-character worst case) and refuses to start if a
+caller-supplied `RB_CEF_TARGET` would still be too deep.
+
+### 26.4 Unmeasured
+
+Whether the bundler places `rustbox-cef.exe` beside `rustbox.exe` in the produced
+NSIS installer - the staging and `--config` plumbing are written and the artifact
+has been inspected (three executables at the archive root, 66.5 MB uncompressed),
+but the *installed* result has not been verified from a clean machine. Whether an
+upgrade install replaces a stale `rustbox-cef.exe` rather than leaving the old one.
+macOS and Linux, which have no published payload and so ship the launcher only.
+
+What *is* measured: the startup repair path, end to end, against a sandboxed data
+root (`RB_DATA_ROOT`) holding a payload-only engine directory and a stand-in
+`rustbox-cef.exe` beside the launcher. Launching the debug build staged the binary
+into `engines\cef\154.0.34\` with the sibling's content and no download - the exact
+transition that was previously impossible. The user's real engine directory was
+left untouched by that test.

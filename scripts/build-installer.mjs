@@ -1,4 +1,17 @@
-// Build a platform installer with the MCP shim included.
+// Build a platform installer with the MCP shim and the Chromium build included.
+//
+// The app ships as two executables, not one, and that is a measured constraint
+// rather than a packaging choice: `libcef.dll` is a load-time import of the
+// Chromium build, so running CEF without the 292 MB payload on disk is
+// impossible (`0xC0000135` without it; `/DELAYLOAD` moves the failure, it does
+// not remove it). Both binaries therefore have to be installed, and the user
+// still gets one shortcut because `handoff.rs` starts whichever one the config
+// asks for.
+//
+// Both are staged here as `externalBin` sidecars. Shipping only the launcher is
+// how an install ends up with the engine payload present, `installed_versions()`
+// reporting it ready, and `stage_binary_if_present` finding no binary - the
+// launcher then hands off to a `rustbox-cef.exe` that was never installed.
 //
 // Why this wrapper exists: `bundle.externalBin` in `src-tauri/tauri.conf.json`
 // points at `binaries/rustbox-mcp`, which the bundler resolves to
@@ -19,7 +32,8 @@
 // to build one target per job.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,19 +63,69 @@ function run(command, args, env) {
   });
 }
 
+// Path length the Chromium build has to fit into, measured rather than assumed.
+//
+// `CEF_BUILD_SUFFIX` is what cargo appends to the target dir for a release build
+// of cef-dll-sys: `\release\build\cef-dll-sys-<16 hex>\out\build`.
+// `CEF_DEEPEST_OBJECT` is the longest relative object path under that build dir,
+// from `cpptoc/test/`. Together they are what has to stay under `MAX_PATH`.
+const CEF_BUILD_SUFFIX = "\\release\\build\\cef-dll-sys-0123456789abcdef\\out\\build".length;
+const CEF_DEEPEST_OBJECT =
+  "\\libcef_dll_wrapper\\CMakeFiles\\libcef_dll_wrapper.dir\\cpptoc\\test\\api_version_test_ref_ptr_client_cpptoc.cc.obj".length;
+
+// Bundle targets this platform can actually produce.
+//
+// `tauri.conf.json` lists every platform's targets in one array (`nsis` and `msi`
+// for Windows, `app` and `dmg` for macOS, `deb`/`rpm`/`appimage` for Linux),
+// because the config is one file for all of them. That is fine when the CLI reads
+// it - it filters by host - but it is *not* fine to forward the list verbatim to
+// `--bundles`, which validates every name against the host's supported set and
+// aborts on the first foreign one:
+//
+//   error: invalid value 'dmg' for '--bundles [<BUNDLES>...]'
+//     [possible values: msi, nsis]
+//
+// So the configured list is filtered to this platform's set. Anything the config
+// names that the host cannot build is dropped rather than failing the run; if
+// that leaves nothing, the run fails with a message that says which names were
+// considered.
+const BUNDLE_TARGETS = {
+  win32: ["nsis", "msi"],
+  darwin: ["app", "dmg"],
+  linux: ["deb", "rpm", "appimage"],
+};
+
 function bundles() {
   const override = process.env.RB_BUNDLES?.trim();
   if (override) return override;
-  // A dry read of the config, not a JSON parse: the file is the source of truth
-  // for what this platform can actually produce, and Tauri validates it anyway.
-  const conf = JSON.parse(
-    execFileSync("node", ["-e", `
-      const fs = require("node:fs");
-      const c = JSON.parse(fs.readFileSync(${JSON.stringify(join(srcTauri, "tauri.conf.json"))}, "utf8"));
-      process.stdout.write(JSON.stringify(c.bundle?.targets ?? "all"));
-    `], { encoding: "utf8" }),
+
+  const configured = JSON.parse(
+    readFileSync(join(srcTauri, "tauri.conf.json"), "utf8"),
+  ).bundle?.targets ?? "all";
+  // `"all"` is Tauri's own spelling for "every target this platform supports", so
+  // it is passed straight through instead of being expanded here.
+  if (configured === "all") return "all";
+
+  const supported = BUNDLE_TARGETS[process.platform] ?? [];
+  const wanted = (Array.isArray(configured) ? configured : [configured]).filter((t) =>
+    supported.includes(t),
   );
-  return Array.isArray(conf) ? conf.join(",") : String(conf);
+  if (wanted.length === 0) {
+    console.error(
+      `build-installer: tauri.conf.json names no bundle target for ${process.platform}.\n` +
+        `  configured: ${JSON.stringify(configured)}\n` +
+        `  supported:  ${supported.join(", ") || "(none)"}\n` +
+        `Set RB_BUNDLES to choose one explicitly.`,
+    );
+    process.exit(1);
+  }
+  const dropped = (Array.isArray(configured) ? configured : []).filter(
+    (t) => !supported.includes(t),
+  );
+  if (dropped.length > 0) {
+    console.log(`skipping bundle targets for other platforms: ${dropped.join(", ")}`);
+  }
+  return wanted.join(",");
 }
 
 const hostTriple = execFileSync("rustc", ["--print", "host-tuple"], {
@@ -94,8 +158,10 @@ const shimTriples = universal
 //
 // `tauri-build` validates `bundle.externalBin` while compiling the app crate and
 // fails when the triple-suffixed file is missing, which it is on a clean tree.
-// Clearing `externalBin` for this one invocation (TAURI_CONFIG is merged over
-// tauri.conf.json) lets the shim compile without that check.
+// Clearing `externalBin` for this one invocation lets the shim compile without
+// that check: `tauri-build` *does* read `TAURI_CONFIG` and merges it over
+// tauri.conf.json. (The CLI itself does not read it - see step 4 - but this
+// invocation never goes through the CLI.)
 for (const t of shimTriples) {
   run(
     "cargo",
@@ -175,23 +241,168 @@ if (triple !== hostTriple) {
   console.log(`seeded bundler out dir: ${outShim}`);
 }
 
-// 3. Build the app and the installer(s).
+// 3. Stage the Chromium build as a second sidecar.
+//
+// Two reasons it is built here rather than by `cargo tauri build`:
+//
+// * The engines are mutually exclusive Cargo features (`Cargo.toml`), so the
+//   `rustbox-cef` target is skipped whenever the default feature set is active.
+//   Nothing else in the release path would ever produce it.
+// * It needs its own target directory. Sharing `target/release` with the wry
+//   build would flip the feature set on every invocation and recompile the whole
+//   dependency graph twice.
+//
+// Only Windows has a published payload (`src-tauri/engine-manifest.json` carries
+// a single `windows-x86_64` entry), so elsewhere there is nothing to stage and
+// the sidecar is left out of the bundle instead of failing the build.
+const sidecars = ["binaries/rustbox-mcp"];
+if (process.platform === "win32") {
+  if (triple !== hostTriple) {
+    console.error(
+      `build-installer: the Chromium sidecar is built for the host triple only, but\n` +
+        `RB_TARGET is ${triple} and the host is ${hostTriple}.`,
+    );
+    process.exit(1);
+  }
+  const cefPath = process.env.CEF_PATH?.trim();
+  if (!cefPath) {
+    console.error(
+      "build-installer: CEF_PATH is not set.\n\n" +
+        "The Chromium build links against a CEF 154.0.34 distribution (see\n" +
+        "docs/adr/0005-embedded-chromium-cef.md, section 24). Point CEF_PATH at the\n" +
+        "extracted `cef_binary_154.0.34+..._windows64_minimal` directory.",
+    );
+    process.exit(1);
+  }
+  // The distribution must be extracted, not the archive it arrived in: cef-dll-sys
+  // looks for `<CEF_PATH>/<version>/cef_windows_x86_64/CEFConfig.cmake`, and
+  // reports a missing one as a CMake configuration error a long way from here.
+  if (!existsSync(cefPath)) {
+    console.error(`build-installer: CEF_PATH does not exist: ${cefPath}`);
+    process.exit(1);
+  }
+
+  // A short target directory, deliberately not `src-tauri/target/cef`.
+  //
+  // cef-dll-sys drives CMake over 123 wrapper translation units, and CMake's
+  // Ninja generator writes each object under
+  // `<target>/release/build/cef-dll-sys-<hash>/out/build/libcef_dll_wrapper/
+  //  CMakeFiles/libcef_dll_wrapper.dir/cpptoc/test/<name>.cc.obj`
+  // - 52 characters of cargo scaffolding plus 114 for the deepest CEF source.
+  // MSVC on Windows still refuses paths over `MAX_PATH` (260) even with
+  // `LongPathsEnabled=1`, and cl.exe reports it as
+  // `fatal error C1083: Cannot open compiler generated file: ''`, which names
+  // neither the file nor the limit. A checkout whose own path is deep (a
+  // worktree under `AppData`, a CI workspace) pushes the object path over 260
+  // and the build dies two thirds of the way through with no usable message.
+  //
+  // So the build root is placed where it is short. Temp is the portable choice
+  // and it is a cache, not output: losing it costs a recompile, never a wrong
+  // artifact. `RB_CEF_TARGET` overrides it for a CI job that wants to cache it.
+  const cefTarget = process.env.RB_CEF_TARGET?.trim() || join(tmpdir(), "rustbox-cef-target");
+  const objectBudget = cefTarget.length + CEF_BUILD_SUFFIX + CEF_DEEPEST_OBJECT;
+  if (objectBudget > 250) {
+    console.error(
+      `build-installer: the Chromium build target is too deep for MSVC.\n\n` +
+        `  target:        ${cefTarget}\n` +
+        `  longest object: ~${objectBudget} characters (limit is 260)\n\n` +
+        `Set RB_CEF_TARGET to a shorter directory (e.g. C:\\cef).`,
+    );
+    process.exit(1);
+  }
+  // The Chromium build is the only part of this project that compiles C++:
+  // `cef-dll-sys` drives CMake over the CEF wrapper sources. CMake's Ninja
+  // generator passes MSVC include and library paths through the environment
+  // rather than baking them into the build files, so without vcvars it fails
+  // with `fatal error C1083: Cannot open include file: 'stdint.h'` - which reads
+  // like a broken checkout rather than a missing developer prompt. Check for the
+  // environment explicitly instead of letting the build report it as a source
+  // error. Plain `cargo build` of the wry app does not need this: rustc finds
+  // its own linker and system libraries.
+  if (!process.env.INCLUDE?.trim()) {
+    console.error(
+      "build-installer: the MSVC environment is not loaded (INCLUDE is empty).\n\n" +
+        "The Chromium build compiles C++ through CMake, which needs the Visual\n" +
+        "Studio environment. Run this script from a \"Developer PowerShell for VS\n" +
+        "2022\", or from a shell where vcvars64.bat has been called first:\n\n" +
+        '  cmd /c "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" && node scripts/build-installer.mjs"',
+    );
+    process.exit(1);
+  }
+
+  run(
+    "cargo",
+    [
+      "build",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cef",
+      "--bin",
+      "rustbox-cef",
+    ],
+    { CARGO_TARGET_DIR: cefTarget, CEF_PATH: cefPath },
+  );
+
+  const built = join(cefTarget, "release", `rustbox-cef${exe}`);
+  if (!existsSync(built)) {
+    console.error(`build-installer: the Chromium build is missing: ${built}`);
+    process.exit(1);
+  }
+  const stagedCef = join(staging, `rustbox-cef-${triple}${exe}`);
+  copyFileSync(built, stagedCef);
+  console.log(`\nstaged ${stagedCef} (${statSync(stagedCef).size} bytes)`);
+  sidecars.push("binaries/rustbox-cef");
+}
+
+// 4. Build the app and the installer(s).
 //
 // The Tauri CLI is invoked through the local npm install rather than `cargo tauri`:
 // the cargo subcommand only exists where someone ran `cargo install tauri-cli`
 // by hand, which is true on a developer machine and false on a CI runner. The npm
 // binary is pinned by package-lock.json and is the same version everywhere.
 const targets = bundles();
-console.log(`\nBundling: ${targets}`);
-const tauriCli = join(repo, "node_modules", ".bin", process.platform === "win32" ? "tauri.cmd" : "tauri");
+console.log(`\nBundling: ${targets} (sidecars: ${sidecars.join(", ")})`);
+// The CLI is invoked as a JS entry through this same Node binary, not through
+// `node_modules/.bin/tauri.cmd`.
+//
+// Two reasons. On Windows a `.cmd` is not a PE file, so it cannot be spawned
+// without a shell, and `shell: true` makes Node concatenate the argument array
+// instead of escaping it (`DEP0190`) - which mangles the JSON below, since it is
+// full of quotes. Running the JS entry with an argument array keeps every
+// argument as one argv element on every platform.
+const tauriCli = join(repo, "node_modules", "@tauri-apps", "cli", "tauri.js");
 if (!existsSync(tauriCli)) {
   console.error(`build-installer: Tauri CLI missing at ${tauriCli}; run npm ci`);
   process.exit(1);
 }
+// The sidecar list has to reach the bundler through `--config`.
+//
+// `TAURI_CONFIG` looks like the right channel and is not: the CLI *writes* that
+// variable for the build script (`helpers/config.rs`) and never reads it, so an
+// override set here is silently ignored and the bundler uses whatever
+// `tauri.conf.json` declares. That failure is invisible - the installer builds
+// successfully and simply lacks the sidecar. Verified: with the environment
+// variable set, the NSIS installer came out at 32.3 MB uncompressed (launcher and
+// MCP shim only) and `rustbox-cef.exe` was absent.
+//
+// Only `externalBin` is passed, not the whole `bundle` section: `json_patch::merge`
+// replaces arrays wholesale, so this is enough to add the Chromium build without
+// restating (and risking divergence from) the icons, targets and installer
+// options the file already declares.
+const configOverride = JSON.stringify({ bundle: { externalBin: sidecars } });
 execFileSync(
-  tauriCli,
-  ["build", "--bundles", targets, ...(triple === hostTriple ? [] : ["--target", triple])],
-  { cwd: srcTauri, stdio: "inherit", env: process.env, shell: process.platform === "win32" },
+  process.execPath,
+  [
+    tauriCli,
+    "build",
+    "--bundles",
+    targets,
+    ...(triple === hostTriple ? [] : ["--target", triple]),
+    "--config",
+    configOverride,
+  ],
+  { cwd: srcTauri, stdio: "inherit", env: process.env },
 );
 
 // Report whatever the bundler actually produced rather than a name built from

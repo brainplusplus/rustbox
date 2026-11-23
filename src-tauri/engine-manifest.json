@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "note": "Baked into the executable at build time, never fetched. A hash delivered over the same channel as the payload is not a trust boundary; a hash compiled into a signed binary is. Bumping CEF therefore requires shipping a new app version, which is already true because libcef and the executable are one unit (ADR 0005 section 23.3).",
+  "entries": [
+    {
+      "version": "154.0.34",
+      "cef_version": "154.0.34+g14c5a08+chromium-154.0.8037.98",
+      "chromium_version": "154.0.8037.98",
+      "source": "https://github.com/psmux/godwinmix-cef/releases/download/cef-154.0.34",
+      "file": "cef_binary_154.0.34+g14c5a08+chromium-154.0.8037.98_windows64_minimal.tar.bz2",
+      "sha256": "af1f188711b4e9220c87e2a90377d5bddd70e163909070dd81f6f3bb2fc884ce",
+      "size": 173759232,
+      "platform": "windows-x86_64",
+      "codecs": "h264,aac"
+    }
+  ]
+}

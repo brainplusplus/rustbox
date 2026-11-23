@@ -355,7 +355,7 @@ window.__TAURI__ = {
         window.__probeLogs = {
           ...window.__probeLogs,
           entries: [],
-          limit: 100, enabled: true, bytes: 0, file: 'C:\\\\x\\\\logs\\\\ai-requests.jsonl'
+          limit: 100, enabled: true, bytes: 0, file: 'C:\\x\\logs\\ai-requests.jsonl'
         };
         return null;
       }
@@ -381,13 +381,44 @@ window.__TAURI__ = {
         port: window.__probeMcpOn ? 7420 : 0,
         configuredPort: 7420, bind: 'loopback', scope: 'all-tabs',
         allowAppEdits: false, guides: [],
-        endpointFile: 'C:\\\\x\\\\mcp-endpoint.json',
-        logFile: 'C:\\\\x\\\\mcp.log',
-        shimPath: 'C:\\\\x\\\\rustbox-mcp.exe'
+        endpointFile: 'C:\\x\\mcp-endpoint.json',
+        logFile: 'C:\\x\\mcp.log',
+        shimPath: 'C:\\x\\rustbox-mcp.exe'
       };
       case 'data_paths': return {
-        root: 'C:\\\\x', config: 'C:\\\\x\\\\config.json', profiles: 'C:\\\\x\\\\profiles'
+        root: 'C:\\x', config: 'C:\\x\\config.json', profiles: 'C:\\x\\profiles'
       };
+      // The Data folder card is part of General, so it asks for this on open.
+      // Without a stub it paints "Could not read the data folder state", which
+      // is indistinguishable from a real failure.
+      case 'data_move_state': return {
+        pending: null, error: null, reverted: null,
+        root: 'C:\\x', defaultRoot: 'C:\\x', moved: false
+      };
+      // The engine picker now lives inside General, so the pane reads this on
+      // open. A null here would render the "could not read the engine state"
+      // card and hide the controls the probe is meant to see.
+      //
+      // `__probeEngineRepair` switches to the state a failed staging leaves
+      // behind: payload on disk, no binary. The card has to offer a repair there
+      // rather than a switch to an engine that cannot start.
+      case 'engine_runtime': return {
+        chosen: 'os-webview', running: 'os-webview', runningIsCef: false,
+        installed: window.__probeEngineRepair ? null : '154.0.34',
+        installedVersions: window.__probeEngineRepair ? [] : ['154.0.34'],
+        unrunnableVersions: window.__probeEngineRepair ? ['154.0.34'] : [],
+        binary: window.__probeEngineRepair ? null : 'C:\\x\\engines\\154.0.34\\rustbox-cef.exe',
+        handoffError: null, migrateError: null,
+        status: {
+          platform: 'windows-x64', available: true, chromium_version: '154.0.8037.98',
+          codecs: 'h264,aac', download_size: 379240448,
+          installed: ['154.0.34'], installed_bytes: { '154.0.34': 379240448 }
+        }
+      };
+      case 'set_engine_runtime': {
+        (window.__probeEnginePicks = window.__probeEnginePicks || []).push(args.runtime);
+        return `Engine set to ${args.runtime}; restart to apply.`;
+      }
       case 'hide_all_tabs': (window.__probeCalls = window.__probeCalls || []).push('hide_all_tabs'); return null;
       case 'resize_tabs': (window.__probeCalls = window.__probeCalls || []).push('resize_tabs');
         (window.__probeRects = window.__probeRects || []).push([args.x, args.y, args.width, args.height]);

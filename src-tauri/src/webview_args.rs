@@ -73,11 +73,37 @@ pub const BASE: &str = concat!(
 /// Chromium's `--proxy-server` switch takes. Only `Isolated` apps can have one:
 /// they own a separate data folder, so a different argument string does not
 /// collide with the environment the shell already created.
+///
+/// WebView2-only: the CEF build never builds an argument string, because
+/// Chromium's command line is per process and its per-app proxy is `proxy_url`.
+#[cfg(any(feature = "wry", test))]
 pub fn with_proxy(proxy: Option<&str>) -> String {
   match proxy.map(str::trim) {
     Some(uri) if !uri.is_empty() => format!("{BASE} --proxy-server={uri}"),
     _ => BASE.to_string(),
   }
+}
+
+/// [`BASE`] split into individual switches.
+///
+/// Chromium's command line is per process, not per webview, so the CEF runtime
+/// cannot take an argument string on a builder: it takes one switch at a time
+/// before the browser process starts (`Cef::command_line_arg`). Parsing `BASE`
+/// rather than keeping a second list is what stops the two engines from
+/// drifting apart - the switches that keep a hidden tab alive have to be the
+/// same ones on both, and a duplicated list is a list that eventually disagrees.
+///
+/// `--disable-features=a,b,c` becomes one pair with a value; a bare `--flag`
+/// becomes a pair with `None`.
+#[cfg(any(feature = "cef", test))]
+pub fn switches() -> Vec<(&'static str, Option<&'static str>)> {
+  BASE
+    .split_whitespace()
+    .map(|token| match token.split_once('=') {
+      Some((key, value)) => (key, Some(value)),
+      None => (token, None),
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -128,6 +154,34 @@ mod tests {
       .filter(|t| t.starts_with("--disable-features="))
       .count();
     assert_eq!(count, 1, "expected one --disable-features switch, got {count}");
+  }
+
+  #[test]
+  fn switches_round_trip_to_the_same_argument_string() {
+    let parsed = switches();
+    let rebuilt = parsed
+      .iter()
+      .map(|(k, v)| match v {
+        Some(v) => format!("{k}={v}"),
+        None => (*k).to_string(),
+      })
+      .collect::<Vec<_>>()
+      .join(" ");
+    assert_eq!(rebuilt, BASE);
+
+    // The value-carrying switch is the one that must not lose its list.
+    let features = parsed
+      .iter()
+      .find(|(k, _)| *k == "--disable-features")
+      .and_then(|(_, v)| *v)
+      .expect("--disable-features is one switch with a value");
+    assert!(features.contains("IntensiveWakeUpThrottling"));
+    assert!(parsed.iter().any(|(k, v)| *k == "--autoplay-policy" && v.is_some()));
+    assert!(
+      parsed
+        .iter()
+        .any(|(k, v)| *k == "--disable-background-timer-throttling" && v.is_none())
+    );
   }
 
   #[test]

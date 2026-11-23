@@ -6,6 +6,24 @@ edition = "2024"
 # build` cannot tell which one is the product and refuses to bundle.
 default-run = "rustbox"
 
+# One source tree, two engines.
+#
+# The engine is chosen at *build* time, not at run time, for a reason that is
+# not a preference: `libcef.dll` sits in the CEF build's PE import table, so the
+# loader resolves it before `main()` runs. A single executable therefore cannot
+# fall back from CEF to WebView2 - it would not start at all without a ~360 MB
+# payload beside it. Two builds, two executables, one config file.
+#
+# The features are mutually exclusive on purpose. `tauri-runtime-cef` pulls
+# `tauri` in with `gtk4` and `tauri-runtime-wry` pulls it in with `gtk3`; Cargo
+# features are additive, so enabling both would link two GTK majors into one
+# binary and fail to build on Linux. Building with `--no-default-features
+# --features cef` keeps exactly one runtime in the graph.
+[features]
+default = ["wry"]
+wry = ["dep:tauri-runtime-wry"]
+cef = ["dep:tauri-runtime-cef"]
+
 [dependencies]
 base64 = "0.22"
 dirs-next = "2.0.0"
@@ -19,19 +37,31 @@ dirs-next = "2.0.0"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "charset", "json", "socks", "blocking"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tauri = { version = "2.12.4", features = ["devtools", "unstable"] }
+tauri = { version = "3.0.0-alpha.6", default-features = false, features = ["devtools", "unstable"] }
 # The chat panel awaits an HTTP reply from inside a synchronous command (the tool
 # loop is blocking), so it needs a small runtime of its own. `current_thread`
 # keeps it to one thread: the panel sends one request at a time.
 tokio = { version = "1", features = ["rt", "time"] }
-# Direct dependency so the app can register the WebView2 profile name before a
-# tab webview is built. Cargo resolves this to the patched copy in
-# `[patch.crates-io]` below, i.e. the same crate instance `tauri` links against,
-# so the registry lookup happens in-process. `default-features = false` keeps
-# this from turning on features `tauri` did not ask for.
-tauri-runtime-wry = { version = "2.12.2", default-features = false }
+# The default engine: the OS webview. Direct dependency so the app can register
+# the WebView2 profile name before a tab webview is built. Cargo resolves this
+# to the patched copy in `[patch.crates-io]` below, i.e. the same crate instance
+# `tauri` links against, so the registry lookup happens in-process.
+# `default-features = false` keeps this from turning on features `tauri` did not
+# ask for.
+tauri-runtime-wry = { version = "3.0.0-alpha.6", default-features = false, optional = true }
+# The opt-in engine: Chromium via CEF. Optional because it drags in a ~360 MB
+# runtime that most users never install, and because its `gtk4` feature must not
+# be linked alongside wry's `gtk3`.
+tauri-runtime-cef = { version = "3.0.0-alpha.7", optional = true }
 url = "2.5"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+# The optional Chromium engine payload (src/engine_dist.rs). `sha2` is the trust
+# check on a downloaded archive, `tar` + `bzip2` unpack the CEF distribution the
+# way CEF publishes it. `flate2` is already in the graph transitively; bzip2 is
+# not, and it is the only format the CEF project ships.
+sha2 = "0.10"
+tar = "0.4"
+bzip2 = "0.6"
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39.1"
 windows-core = "0.62"
@@ -42,17 +72,27 @@ windows-core = "0.62"
 # dependency graph via `windows-core`, so this adds no download.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # `CoInitializeEx`/`CoTaskMemFree`: the shell folder picker in
+    # `src/folder_picker.rs` needs an apartment for its tree view, and the id
+    # list it returns has to be freed with the COM allocator.
+    "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
     # Reading the WebView2 `BrowserExecutableFolder` policy, so a runtime pin
     # never overrides a folder an administrator deliberately selected.
     "Win32_System_Registry",
+    # `CryptProtectData`/`BCrypt*` for the cross-engine cookie migration: the
+    # cookie key is DPAPI-wrapped and the values are AES-256-GCM, and Windows'
+    # own CNG is the only AES in the dependency graph.
+    "Win32_Security_Cryptography",
     # Handing a link to the OS default browser. `ShellExecuteW` takes the URL as
     # one wide string and does no command-line re-parsing, which is what makes a
     # URL containing `&` survive the trip. `cmd /C start` cannot: it re-parses
     # the line itself (see `external::open_with_default`).
     "Win32_UI_Shell",
+    # `ITEMIDLIST` behind `BROWSEINFOW` in the data-root folder picker.
+    "Win32_UI_Shell_Common",
     # `SW_SHOWNORMAL`, plus the `SetWindowPos` raise used when a tab is shown.
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -60,7 +100,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 [build-dependencies]
-tauri-build = { version = "2.7.3", features = [] }
+tauri-build = { version = "3.0.0-alpha.4", features = [] }
 
 # The MCP shim is a separate, dependency-free binary: an MCP client launches it
 # over stdio and it forwards to the running app. It cannot live inside the app
@@ -70,15 +110,34 @@ tauri-build = { version = "2.7.3", features = [] }
 name = "rustbox-mcp"
 path = "src/bin/mcp.rs"
 
-# Tauri 2.12 does not expose WebView2 multi-profile support, so `ProfileMode::Light`
-# could not exist without this patch. Upstream tracking:
+# One source tree, two executables. Both are built from `src/main.rs`; the engine
+# feature decides which runtime is linked in. Two targets rather than one renamed
+# artifact so `cargo build` can never overwrite the other build's output, and so
+# `required-features` makes a plain `cargo build` skip the Chromium target
+# instead of failing on a missing CEF payload.
+#
+# The launcher (`rustbox`) starts `rustbox-cef` when the config asks for
+# Chromium; see `src/handoff.rs`.
+[[bin]]
+name = "rustbox"
+path = "src/main.rs"
+required-features = ["wry"]
+
+[[bin]]
+name = "rustbox-cef"
+path = "src/main.rs"
+required-features = ["cef"]
+
+# Tauri 3 still does not expose WebView2 multi-profile support, so
+# `ProfileMode::Light` could not exist without this patch. Upstream tracking:
 # https://github.com/tauri-apps/tauri/issues/9285 (open since Mar 2024).
 #
-# The vendored crate is a verbatim copy of tauri-runtime-wry 2.12.2 plus one
-# change: `create_webview` looks the webview label up in a registry of profile
-# names and, when found, forwards the name to wry's `with_profile_name`. That is
-# all it takes to get a second WebView2 profile (separate cookies, localStorage,
-# IndexedDB, cache) inside the existing shared browser process tree.
+# The vendored crate is a verbatim copy of tauri-runtime-wry 3.0.0-alpha.6 plus
+# one change: `create_webview` looks the webview label up in a registry of
+# profile names and, when found, forwards the name to wry's `with_profile_name`.
+# That is all it takes to get a second WebView2 profile (separate cookies,
+# localStorage, IndexedDB, cache) inside the existing shared browser process
+# tree.
 #
 # The name deliberately does NOT ride along in `additional_browser_args`: WebView2
 # requires every webview sharing a user data folder to be created with identical

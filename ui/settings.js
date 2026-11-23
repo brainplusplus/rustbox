@@ -19,6 +19,7 @@
 'use strict';
 (function () {
   const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
 
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -82,6 +83,8 @@
     logs: null,      // router_logs payload: entries, live, stats, limit, bytes, file
     logDetail: null, // index of the request-log row whose detail is open
     logLiveCount: 0, // how many requests were in flight on the last poll
+    engine: null,    // engine_runtime: chosen/running build, installed versions
+    engineBusy: null,// {phase:'download'|'install', done, total} while installing
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -240,15 +243,17 @@
   }
 
   async function reload() {
-    const [view, mcp, logs] = await Promise.all([
+    const [view, mcp, logs, engine] = await Promise.all([
       invoke('get_settings'),
       invoke('mcp_state').catch(() => null),
       invoke('router_logs').catch(() => null),
+      invoke('engine_runtime').catch(() => null),
     ]);
     adoptView(view);
     state.mcp = mcp;
     state.logs = logs;
     state.logLiveCount = (logs && logs.live ? logs.live : []).length;
+    state.engine = engine;
     render();
   }
 
@@ -284,6 +289,10 @@
     if (!el) return;
     el.textContent = text;
     el.style.color = isError ? 'var(--danger)' : 'var(--accent)';
+    // The wrapping rule lives in CSS; this only says which shape to use. A long
+    // error names a path or version and ends with the action to take, and that
+    // tail is what ellipsis used to hide.
+    el.classList.toggle('bad', !!isError);
     el.classList.add('on');
     clearTimeout(flashTimer);
     flashTimer = setTimeout(() => el.classList.remove('on'), isError ? 7000 : 1800);
@@ -573,7 +582,7 @@
     const d = state.draft;
     return `
       <h2 class="sp-title">General</h2>
-      <p class="sp-lede">Appearance and where this app keeps its data.</p>
+      <p class="sp-lede">Appearance, the engine that draws your apps, and where this app keeps its data.</p>
 
       <div class="sp-card">
         <h3>Theme</h3>
@@ -584,9 +593,46 @@
         </div>
       </div>
 
+      ${engineCards()}
+
       <div class="sp-card">
         <h3>Data</h3>
         <p class="sp-note" id="sp-paths">Loading…</p>
+      </div>
+
+      <div class="sp-card" id="sp-datamove">
+        <h3>Data folder</h3>
+        <p class="sp-note">RustBox keeps every app session, the config and the downloaded engine in one folder. Moving it takes a restart, because the browser holds its cookie database open for as long as a window exists — copying it live would give a torn copy.</p>
+        <p class="sp-note" id="sp-move-state">Loading…</p>
+        <div class="sp-choices">
+          <label class="sp-choice on">
+            <input type="radio" name="data-location" value="default" checked>
+            <span class="cbody">
+              <span class="cname">Default folder</span>
+              <span class="cdesc" id="sp-move-default-desc">The folder RustBox uses unless you move it.</span>
+            </span>
+          </label>
+          <label class="sp-choice">
+            <input type="radio" name="data-location" value="custom">
+            <span class="cbody">
+              <span class="cname">Custom folder</span>
+              <span class="cdesc">Any folder you choose. It has to be empty, so two workspaces cannot be merged by accident.</span>
+            </span>
+          </label>
+        </div>
+        <div class="sp-field" id="sp-move-custom" hidden>
+          <label>Folder</label>
+          <div class="sp-row">
+            <div class="sp-field" style="margin-bottom:0">
+              <input id="sp-move-target" placeholder="D:\\RustBox" spellcheck="false" autocomplete="off">
+            </div>
+            <button class="sp-btn ghost" id="sp-move-browse" style="flex:0 0 auto">Browse…</button>
+          </div>
+        </div>
+        <div class="sp-row tight">
+          <button class="sp-btn" id="sp-move-apply">Move on next start</button>
+          <button class="sp-btn ghost" id="sp-move-cancel" hidden>Cancel pending move</button>
+        </div>
       </div>
 
       <div class="sp-card">
@@ -599,6 +645,111 @@
             <span class="cdesc">Each enabled app opens in the background so it is already connected when you click it — new mail and messages arrive without a cold reload. Costs one webview per app. Takes effect on the next launch.</span>
           </span>
         </label>
+      </div>`;
+  }
+
+  // ---- rendering engine, drawn inside General -------------------------------
+
+  /// Human size for the download and disk numbers.
+  function bytes(n) {
+    if (!Number.isFinite(n) || n <= 0) return '0 MB';
+    const mb = n / (1024 * 1024);
+    return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${Math.round(mb)} MB`;
+  }
+
+  /// The engine cards, as a fragment.
+  ///
+  /// Laid out inside General rather than on a tab of its own: which engine draws
+  /// the apps is a property of the install, not a subsystem with pages of its
+  /// own, and a separate rail entry made it easy to miss. The heading that used
+  /// to open this pane is gone with the tab; each card keeps its own `<h3>`.
+  function engineCards() {
+    const e = state.engine;
+    const busy = state.engineBusy;
+
+    if (!e) {
+      return `
+        <div class="sp-card">
+          <h3>Rendering engine</h3>
+          <p class="sp-note warn">Could not read the engine state. Reload the page and try again.</p>
+        </div>`;
+    }
+
+    const status = e.status || {};
+    const chosen = e.chosen === 'chromium' ? 'chromium' : 'os-webview';
+    const installed = (e.installedVersions || []).length > 0;
+    // A payload that unpacked but never got its binary. Shown as a repairable
+    // row instead of disappearing, because the alternative is a user with 362 MB
+    // on disk and a button that would download it all again.
+    const unrunnable = (e.unrunnableVersions || [])[0] || null;
+    const runningChromium = !!e.runningIsCef;
+    // The pick and the running build disagree until the next start. Saying so is
+    // the whole point of reporting three facts instead of one.
+    const pending = (chosen === 'chromium') !== runningChromium;
+    const download = status.download_size || 0;
+
+    const progress = busy
+      ? (() => {
+          const total = busy.total || download;
+          const pct = total ? Math.min(100, (busy.done / total) * 100) : 0;
+          return `<div class="sp-bar" style="margin-top:10px">
+           <div class="b-head"><code>${busy.phase === 'install' ? 'Unpacking' : 'Downloading'}</code>
+             <span>${Math.round(pct)}%</span></div>
+           <div class="b-track"><div class="b-fill" style="width:${pct}%"></div></div>
+           <div class="b-foot">${bytes(busy.done)} of ${bytes(total)}</div>
+         </div>`;
+        })()
+      : '';
+
+    return `
+      <div class="sp-card">
+        <h3>Rendering engine</h3>
+        <p class="sp-note">Which browser engine draws your apps. The system webview is always available and costs nothing. Chromium adds H.264, AAC and HEVC video, which is what makes most video sites play on Windows.</p>
+        <div class="sp-choices">
+          ${choice('engine-runtime', 'os-webview', chosen, 'System webview', 'WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux. No download. Some video sites report "your browser does not support this format" because H.264 is missing on Windows.')}
+          ${choice('engine-runtime', 'chromium', chosen, 'Bundled Chromium', `Ships its own Chromium ${esc(status.chromium_version || '')} with ${esc(status.codecs || 'h264,aac')} support. One-time ~${bytes(download)} download, ~362 MB on disk, and it runs as a separate process with its own memory footprint.`)}
+        </div>
+        ${!installed && !unrunnable ? `<p class="sp-note warn">The Chromium engine is not downloaded yet. Pick it, then install it below.</p>` : ''}
+        ${pending ? `<p class="sp-note warn">You picked ${chosen === 'chromium' ? 'Chromium' : 'the system webview'}, but this window is still running ${runningChromium ? 'Chromium' : 'the system webview'}. The change applies when RustBox restarts — every open tab reloads then.</p>` : ''}
+        <p class="sp-note">This window is running: <code>${esc(e.running || 'unknown')}</code>. Switching is a restart, not a live switch: one process can only run one engine, because Chromium's library has to be loaded before the program's own code runs.</p>
+      </div>
+
+      <div class="sp-card">
+        <h3>Chromium engine files</h3>
+        ${!status.available
+          ? `<p class="sp-note warn">No Chromium engine is published for <code>${esc(status.platform || 'this platform')}</code> yet.</p>`
+          : installed
+            ? `<div class="sp-item">
+                 <div class="i-main">
+                   <div class="i-name">${esc(e.installed)}</div>
+                   <div class="i-meta">${esc(status.chromium_version || '')} · ${bytes((status.installed_bytes || {})[e.installed] || 0)} on disk${e.binary ? '' : ' · app binary missing'}</div>
+                 </div>
+                 <div class="i-acts">
+                   ${e.binary && chosen === 'chromium' ? '' : `<button class="sp-btn sm" id="engine-apply">Use this</button>`}
+                   <button class="sp-btn sm danger" id="engine-remove">Delete</button>
+                 </div>
+               </div>`
+            : unrunnable
+              // The payload is on disk but the app's Chromium build was never
+              // copied into it. Downloading again would re-fetch ~173 MB for a
+              // ~33 MB copy, so this offers the repair instead: the same button,
+              // which skips the download and only repeats the staging step.
+              ? `<div class="sp-item">
+                   <div class="i-main">
+                     <div class="i-name">${esc(unrunnable)}</div>
+                     <div class="i-meta">engine files are complete · app binary missing, so it cannot start</div>
+                   </div>
+                   <div class="i-acts">
+                     <button class="sp-btn sm" id="engine-install" ${busy ? 'disabled' : ''}>${busy ? 'Repairing…' : 'Repair'}</button>
+                     <button class="sp-btn sm danger" id="engine-remove" data-version="${esc(unrunnable)}">Delete</button>
+                   </div>
+                 </div>
+                 <p class="sp-note warn" style="margin-top:10px">The engine files are installed but this build's <code>rustbox-cef</code> was never copied into them, so Chromium cannot start. Repair copies it in without downloading anything again.</p>`
+              : `<p class="sp-note">Not installed. The download is verified against a hash built into RustBox before anything is unpacked.</p>
+               <button class="sp-btn primary" id="engine-install" ${busy ? 'disabled' : ''}>${busy ? 'Installing…' : `Download Chromium (${bytes(download)})`}</button>`}
+        ${progress}
+        ${e.handoffError ? `<p class="sp-note warn" style="margin-top:10px">The last switch to Chromium did not start: ${esc(e.handoffError)}. RustBox is back on the system webview.</p>` : ''}
+        ${e.migrateError ? `<p class="sp-note warn" style="margin-top:10px">Your session could not be carried over from the previous engine: ${esc(e.migrateError)}. You may have to sign in again.</p>` : ''}
       </div>`;
   }
 
@@ -1954,6 +2105,84 @@
       });
     });
 
+    // The engine pick is not part of the settings draft: it is written straight
+    // to config.json, because the build that reads it is the launcher, not this
+    // process. Saving it with the rest would make it look like a setting that
+    // applies on Save, and it does not - it applies on restart.
+    pane.querySelectorAll('input[name="engine-runtime"]').forEach(r => {
+      r.addEventListener('change', async () => {
+        try {
+          const note = await invoke('set_engine_runtime', { runtime: r.value });
+          flash(note);
+          state.engine = await invoke('engine_runtime').catch(() => state.engine);
+        } catch (e) {
+          flash(String(e?.message || e), true);
+        }
+        render();
+      });
+    });
+
+    const ei = pane.querySelector('#engine-install');
+    if (ei) {
+      ei.addEventListener('click', async () => {
+        // The same command covers both cases: `engine_install` skips the
+        // download when the payload is already unpacked and only repeats the
+        // staging step, so "Repair" is not a second code path.
+        state.engineBusy = { phase: 'download', done: 0, total: 0 };
+        render();
+        try {
+          await invoke('engine_install', { version: null });
+          state.engine = await invoke('engine_runtime').catch(() => state.engine);
+          flash('Chromium engine installed');
+        } catch (e) {
+          flash(String(e?.message || e), true);
+        } finally {
+          state.engineBusy = null;
+          render();
+        }
+      });
+    }
+
+    const er = pane.querySelector('#engine-remove');
+    if (er) {
+      er.addEventListener('click', async () => {
+        // The repairable row carries its own version: it is not in
+        // `installedVersions`, so `state.engine.installed` is null there and the
+        // delete button would silently do nothing.
+        const version =
+          er.dataset.version || (state.engine && state.engine.installed);
+        if (!version) return;
+        try {
+          // Switching away first would need a restart anyway, so the honest
+          // choice is to refuse while Chromium is the pick.
+          if (state.engine.chosen === 'chromium') {
+            flash('Switch to the system webview before deleting the Chromium engine', true);
+            return;
+          }
+          await invoke('engine_remove', { version });
+          state.engine = await invoke('engine_runtime').catch(() => state.engine);
+          flash('Chromium engine deleted');
+        } catch (e) {
+          flash(String(e?.message || e), true);
+        }
+        render();
+      });
+    }
+
+    const ea = pane.querySelector('#engine-apply');
+    if (ea) {
+      ea.addEventListener('click', async () => {
+        try {
+          const note = await invoke('set_engine_runtime', { runtime: 'chromium' });
+          flash(note);
+          state.engine = await invoke('engine_runtime').catch(() => state.engine);
+        } catch (e) {
+          flash(String(e?.message || e), true);
+        }
+        render();
+      });
+    }
+
     const edits = pane.querySelector('#mcp-edits');
     if (edits) {
       edits.addEventListener('change', () => {
@@ -2887,15 +3116,160 @@
       const host = pane.querySelector('#sp-paths');
       if (host) {
         invoke('data_paths').then(paths => {
-          host.innerHTML = `Config: <code>${esc(paths.config)}</code><br>Profiles: <code>${esc(paths.profiles)}</code><br>Root: <code>${esc(paths.root)}</code>`;
+          const lines = [
+            `Config: <code>${esc(paths.config)}</code>`,
+            `Profiles: <code>${esc(paths.profiles)}</code>`,
+            `Root: <code>${esc(paths.root)}</code>`,
+          ];
+          if (paths.moved) lines.push(`Default folder (unused): <code>${esc(paths.default_root)}</code>`);
+          host.innerHTML = lines.join('<br>');
         }).catch(() => { host.textContent = 'Could not read the data folder.'; });
       }
+      bindDataMove(pane);
+    }
+  }
+
+  // ---- data folder move ----------------------------------------------------
+
+  /** Paint the move box: where the data is now, and whether a move is queued.
+   *
+   *  The move is scheduled rather than performed, so the pane has to distinguish
+   *  three states that look alike from the outside: nothing queued, a move
+   *  waiting for a restart, and a move that failed last time. Reporting only
+   *  "moved" would hide the failure, which is the case where the user's data is
+   *  still in the old place and they need to know.
+   */
+  function paintDataMove(el, m) {
+    if (!el) return;
+    const rows = [];
+    rows.push(`<p class="sp-note">Data is in <code>${esc(m.root || '')}</code>.</p>`);
+    if (m.moved) rows.push(`<p class="sp-note">The default folder <code>${esc(m.defaultRoot || '')}</code> is unused.</p>`);
+    if (m.pending) {
+      rows.push(`<p class="sp-note warn">A move to <code>${esc(m.pending)}</code> is queued. It runs the next time RustBox starts and then deletes the old folder — restart to finish it.</p>`);
+    }
+    if (m.error) {
+      rows.push(`<p class="sp-note warn">The last move did not happen: ${esc(m.error)}</p>`);
+    }
+    if (m.reverted) {
+      rows.push(`<p class="sp-note warn">${esc(m.reverted)}</p>`);
+    }
+    el.innerHTML = rows.join('');
+  }
+
+  function bindDataMove(pane) {
+    const stateHost = pane.querySelector('#sp-move-state');
+    const card = pane.querySelector('#sp-datamove');
+    const target = pane.querySelector('#sp-move-target');
+    const customBox = pane.querySelector('#sp-move-custom');
+    const defaultDesc = pane.querySelector('#sp-move-default-desc');
+    const browse = pane.querySelector('#sp-move-browse');
+    const apply = pane.querySelector('#sp-move-apply');
+    const cancel = pane.querySelector('#sp-move-cancel');
+    if (!apply || !card) return;
+
+    // The last answer from the backend, so the buttons can tell "already there"
+    // apart from "a move is worth scheduling" without asking twice.
+    let current = null;
+
+    const picked = () => {
+      const r = card.querySelector('input[name="data-location"]:checked');
+      return r ? r.value : 'default';
+    };
+
+    const paint = () => {
+      // Only the two radios in this card carry the selected style; other cards
+      // on the same pane use the same class for unrelated choices.
+      card.querySelectorAll('label.sp-choice').forEach(el => {
+        const input = el.querySelector('input');
+        el.classList.toggle('on', !!(input && input.checked));
+      });
+      const custom = picked() === 'custom';
+      if (customBox) customBox.hidden = !custom;
+      if (cancel) cancel.hidden = !(current && current.pending);
+
+      // A button that cannot do anything is a question the user has to answer
+      // twice, so it says so by being disabled instead of failing on click.
+      const value = target ? target.value.trim() : '';
+      const alreadyDefault = !!(current && !current.moved);
+      apply.disabled = custom ? (!value || (current && value === current.root)) : alreadyDefault;
+      apply.textContent = custom ? 'Move on next start' : 'Use the default folder';
+    };
+
+    const refresh = () => {
+      invoke('data_move_state')
+        .then(m => {
+          current = m;
+          paintDataMove(stateHost, m);
+          if (defaultDesc) {
+            defaultDesc.textContent = m.defaultRoot || 'The folder RustBox uses unless you move it.';
+          }
+          // Reflect where the data actually is, so the radios open on the truth
+          // rather than always on "Default folder".
+          const moved = card.querySelector('input[value="custom"]');
+          const dflt = card.querySelector('input[value="default"]');
+          if (m.moved) {
+            if (moved) moved.checked = true;
+            if (target && !target.value) target.value = m.root || '';
+          } else if (dflt) {
+            dflt.checked = true;
+          }
+          paint();
+        })
+        .catch(() => {
+          if (stateHost) stateHost.textContent = 'Could not read the data folder state.';
+        });
+    };
+    refresh();
+
+    card.querySelectorAll('input[name="data-location"]').forEach(r => {
+      r.addEventListener('change', paint);
+    });
+    if (target) target.addEventListener('input', paint);
+
+    if (browse) {
+      browse.addEventListener('click', async () => {
+        browse.disabled = true;
+        try {
+          const folder = await invoke('pick_data_folder', { startIn: target && target.value || null });
+          if (folder && target) { target.value = folder; paint(); }
+        } catch (e) {
+          // No native picker on this platform, or the user cancelled: typing the
+          // path by hand is still a valid route, so this is a note, not a dead end.
+          flash(String(e?.message || e), true);
+        } finally {
+          browse.disabled = false;
+        }
+      });
+    }
+
+    apply.addEventListener('click', async () => {
+      // `null` is the backend's word for "the default folder", so the two radios
+      // map onto one command instead of a separate reset path.
+      const custom = picked() === 'custom';
+      const value = custom ? (target ? target.value.trim() : '') : '';
+      if (custom && !value) { flash('Choose a folder first', true); return; }
+      try {
+        flash(await invoke('move_data_folder', { target: custom ? value : null }));
+        refresh();
+      } catch (e) {
+        flash(String(e?.message || e), true);
+      }
+    });
+
+    if (cancel) {
+      cancel.addEventListener('click', async () => {
+        try {
+          flash(await invoke('cancel_data_move'));
+          refresh();
+        } catch (e) {
+          flash(String(e?.message || e), true);
+        }
+      });
     }
   }
 
   /** Read the provider editor's fields into the object being edited. */
-  function collectProvider(provider) {
-    const read = (sel, key) => {
+  function collectProvider(provider) {    const read = (sel, key) => {
       const el = $(sel);
       if (el) provider[key] = el.value;
     };
@@ -3020,6 +3394,25 @@
     if (!page) return;
     page.querySelector('#sp-close').addEventListener('click', close);
     page.querySelector('#sp-save').addEventListener('click', () => save());
+    // The engine download reports progress from the backend. Redrawing the whole
+    // pane on every 4 MB chunk would fight the scroll position, so only the
+    // numbers change - and only when that pane is the one on screen.
+    listen('engine-progress', (event) => {
+      if (state.tab !== 'general') return;
+      const p = event.payload || {};
+      state.engineBusy = { phase: 'download', done: p.done || 0, total: p.total || 0 };
+      const bar = page.querySelector('#sp-pane .sp-bar');
+      if (!bar) { render(); return; }
+      const pct = state.engineBusy.total
+        ? Math.min(100, (state.engineBusy.done / state.engineBusy.total) * 100)
+        : 0;
+      const fill = bar.querySelector('.b-fill');
+      const head = bar.querySelector('.b-head span');
+      const foot = bar.querySelector('.b-foot');
+      if (fill) fill.style.width = `${pct}%`;
+      if (head) head.textContent = `${Math.round(pct)}%`;
+      if (foot) foot.textContent = `${bytes(state.engineBusy.done)} of ${bytes(state.engineBusy.total)}`;
+    });
     document.addEventListener('keydown', (e) => {
       if (!state.open) return;
       if (e.key === 'Escape') {

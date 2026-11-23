@@ -164,6 +164,107 @@
         log(`the ${id} pane renders`, text.includes(needle), text.slice(0, 60).replace(/\s+/g, ' '));
       }
 
+      // ---- settings: the engine picker lives inside General ---------------
+      // It used to be a rail entry of its own, which made it easy to miss. What
+      // has to hold now: General owns both cards, the two choices are the two
+      // real engines, and no leftover "Rendering engine" row survives.
+      at('engine inside general');
+      q('.sp-rail-item[data-tab="general"]').click();
+      await wait(80);
+      const generalText = q('#sp-pane').textContent;
+      log('General carries the engine pick',
+        generalText.includes('Rendering engine') && generalText.includes('Chromium engine files'));
+      const enginePicks = qa('#sp-pane input[name="engine-runtime"]');
+      log('General offers exactly the two engines',
+        enginePicks.map((p) => p.value).join(',') === 'os-webview,chromium',
+        enginePicks.map((p) => p.value).join(',') || 'none');
+      log('no rail row is left for the engine',
+        labels.indexOf('Rendering engine') === -1, labels.join(','));
+      log('the theme and data folder cards survived the move',
+        generalText.includes('Theme') && generalText.includes('Data folder'));
+      log('the data folder card reads its state instead of failing',
+        !generalText.includes('Could not read the data folder state'),
+        generalText.includes('Data is in') ? 'state shown' : 'no state line');
+
+      // A payload that unpacked but never got its binary. The old card offered
+      // "Use this" for exactly that state, and the backend rejects the pick, so
+      // the button could only ever fail. It has to offer the repair instead.
+      at('engine repair row');
+      window.__probeEngineRepair = true;
+      await window.RustBoxSettings.open('general');
+      await wait(120);
+      const repairText = q('#sp-pane').textContent;
+      log('a payload without its binary is reported as repairable',
+        repairText.includes('app binary missing') && repairText.includes('Repair'),
+        repairText.includes('app binary missing') ? 'missing-binary row' : 'no missing-binary row');
+      log('the repairable row offers no switch to a dead engine',
+        !q('#sp-pane #engine-apply'),
+        q('#sp-pane #engine-apply') ? 'engine-apply still rendered' : 'no engine-apply');
+      const repairBtn = q('#sp-pane #engine-install');
+      log('the repair action stays available', !!repairBtn, repairBtn ? repairBtn.textContent.trim() : 'missing');
+      const repairDelete = q('#sp-pane #engine-remove');
+      log('the repairable row can still be deleted and names its version',
+        !!repairDelete && repairDelete.dataset.version === '154.0.34',
+        repairDelete ? String(repairDelete.dataset.version) : 'no delete');
+      // The banner above the cards says "not downloaded yet" whenever no version
+      // is installed. That is true for a fresh install and false here - the
+      // files are on disk - and it sat directly above a row saying they are
+      // complete.
+      log('the repairable row does not claim the engine is undownloaded',
+        !repairText.includes('not downloaded yet'),
+        repairText.includes('not downloaded yet') ? 'contradictory banner' : 'no contradiction');
+      window.__probeEngineRepair = false;
+      await window.RustBoxSettings.open('general');
+      await wait(120);
+      log('a runnable engine still offers the switch',
+        !!q('#sp-pane #engine-apply'), q('#sp-pane #engine-apply') ? 'engine-apply present' : 'missing');
+
+      // Paths are labels here, and a doubled separator is a label bug: `C:\\x`
+      // is not a path anyone recognises, and it is what a string literal with
+      // one escape level too many renders as. The fixture had exactly that, so
+      // every screenshot of this card showed `C:\\x\\config.json` and no check
+      // noticed. Assert on the rendered text, not on the fixture.
+      const shownPaths = qa('#sp-paths code, #sp-move-state code, #sp-move-default-desc')
+        .map((el) => el.textContent.trim())
+        .filter(Boolean);
+      const doubled = shownPaths.filter((p) => p.includes('\\\\'));
+      log('no path label shows a doubled separator', doubled.length === 0,
+        doubled.length ? doubled.join(' ; ') : shownPaths.join(' | ') || 'no paths');
+      log('the paths use one separator style', shownPaths.every((p) => !p.includes('/') || !p.includes('\\')),
+        shownPaths.join(' | ') || 'no paths');
+
+      // ---- settings: the data folder offers exactly two choices ------------
+      // One radio for the default folder and one for a custom one, with the
+      // path field revealed only for the custom choice. The three-button layout
+      // it replaced made "move to custom" and "reset to default" look like two
+      // different features.
+      at('data folder choices');
+      const dataRadios = qa('#sp-datamove input[name="data-location"]');
+      log('the data folder offers two choices',
+        dataRadios.map((r) => r.value).join(',') === 'default,custom',
+        dataRadios.map((r) => r.value).join(',') || 'none');
+      log('the default choice starts selected',
+        !!q('#sp-datamove input[value="default"]').checked, 'default checked');
+      log('the custom path field is hidden until chosen',
+        q('#sp-move-custom').hidden, `hidden=${q('#sp-move-custom').hidden}`);
+      const customRadio = q('#sp-datamove input[value="custom"]');
+      customRadio.checked = true;
+      fire(customRadio, 'change');
+      await wait(40);
+      log('picking a custom folder reveals the path field',
+        !q('#sp-move-custom').hidden, `hidden=${q('#sp-move-custom').hidden}`);
+      // The path hint has to survive the template literal it is written in: a
+      // single backslash is an escape there, so `D:\RustBox` renders as
+      // `D:RustBox`, with no separator at all. That shipped once.
+      const hint = q('#sp-move-target').placeholder;
+      log('the path hint keeps its separator', /^[A-Za-z]:[\\/]/.test(hint), hint);
+      const dfltRadio = q('#sp-datamove input[value="default"]');
+      dfltRadio.checked = true;
+      fire(dfltRadio, 'change');
+      await wait(40);
+      log('going back to the default hides the path field again',
+        q('#sp-move-custom').hidden, `hidden=${q('#sp-move-custom').hidden}`);
+
       // ---- settings: MCP guides follow the bind mode ----------------------
       // One guide on loopback, three on a published port: a client on this
       // machine, one on the LAN and one outside all need a different address.

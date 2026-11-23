@@ -43,7 +43,10 @@
   color: var(--text);
 }
 /* Save confirmation sits next to the title, not in a toast: the Save button is
-   right there and the two belong to the same gesture. */
+   right there and the two belong to the same gesture.
+   One line for a confirmation, but a failure is allowed to wrap: those messages
+   name a path or a version and end with what to do about it, and ellipsis cut
+   off exactly that part. */
 .sp-flash {
   font-size: 11.5px;
   color: var(--accent);
@@ -53,6 +56,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sp-flash.bad {
+  max-width: 520px;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 1.35;
+  text-align: right;
 }
 .sp-flash.on { opacity: 1; }
 .sp-head .sp-spacer { flex: 1; }

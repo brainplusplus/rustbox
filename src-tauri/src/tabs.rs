@@ -1,10 +1,11 @@
 use crate::config::{App, Engine, ProfileMode};
+#[cfg(feature = "wry")]
 use crate::paths;
 use crate::settings::{LinkTarget, Resolved};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 use webview2_com::{
   Microsoft::Web::WebView2::Win32::ICoreWebView2,
   take_pwstr,
@@ -377,7 +378,7 @@ fn emit_nav(
 /// navigates to the same URL, so the URL never changes and `SourceChanged` can
 /// stay silent. Without this event the reload button has no visible effect at
 /// all, which makes a working reload look like a dead button.
-#[cfg(windows)]
+#[cfg(any(windows, feature = "cef"))]
 fn emit_loading(handle: &tauri::AppHandle, app_id: &str, tab_id: &str, loading: bool) {
   use tauri::Emitter;
   let _ = handle.emit(
@@ -410,7 +411,7 @@ fn emit_title(handle: &tauri::AppHandle, app_id: &str, tab_id: &str, title: &str
 /// Emit the tab's live navigation state (url + history availability) to the
 /// main UI so the address bar and the back/forward buttons follow the tab the
 /// way a real browser's chrome does.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 fn emit_nav_state(handle: &tauri::AppHandle, app_id: &str, tab_id: &str, core: &ICoreWebView2) {
   let mut src = windows_core::PWSTR::null();
   if unsafe { core.Source(&mut src) }.is_err() {
@@ -434,7 +435,7 @@ fn emit_nav_state(handle: &tauri::AppHandle, app_id: &str, tab_id: &str, core: &
 /// `NavigationStarting`/`NavigationCompleted` also drive the toolbar's loading
 /// state. A reload is the reason: it navigates to the URL the tab already has,
 /// so every other event here stays quiet and the button looked dead.
-#[cfg(windows)]
+#[cfg(all(feature = "wry", windows))]
 fn watch_tab_navigation(
   win: &WebviewWindow,
   app_id: String,
@@ -446,7 +447,10 @@ fn watch_tab_navigation(
       HistoryChangedEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
       SourceChangedEventHandler,
     };
-    let core = match unsafe { platform.controller().CoreWebView2() } {
+    let Some(wv) = platform.downcast_ref::<tauri_runtime_wry::Webview>() else {
+      return;
+    };
+    let core = match unsafe { wv.controller().CoreWebView2() } {
       Ok(core) => core,
       Err(_) => return,
     };
@@ -506,17 +510,21 @@ fn watch_tab_navigation(
   });
 }
 
-/// Non-Windows navigation watcher.
+/// Navigation watcher for engines that expose no URL-change event through Tauri.
 ///
-/// WebKit (WKWebView / WebKitGTK) exposes no equivalent of WebView2's
-/// `SourceChanged` / `HistoryChanged` events through Tauri, so the URL is
-/// polled instead. Polling is not elegant, but it is the only portable option
-/// short of taking a direct dependency on the platform webview crates, and it
-/// keeps the address bar honest for SPA navigations that never fire a load.
+/// Two cases share it:
 ///
-/// `canBack` / `canForward` stay false: WebKit history state is not reachable
-/// from here, so the buttons stay disabled rather than lying about availability.
-#[cfg(not(windows))]
+/// * **WebKit** (WKWebView / WebKitGTK) has no equivalent of WebView2's
+///   `SourceChanged` / `HistoryChanged` events, so the URL is polled. `canBack`
+///   / `canForward` stay false: WebKit history state is not reachable from
+///   here, so the buttons stay disabled rather than lying about availability.
+/// * **Chromium** (CEF) does report frame events, but they arrive on the CEF UI
+///   thread, where reading the URL or history back through Tauri would wait on
+///   the same loop and deadlock. So the address bar is polled here too, and
+///   history *is* read because Tauri exposes it portably. The loading spinner
+///   does not have to wait for the poll: CEF's `LoadingStateChanged` drives it
+///   directly (see `cef_frame_events`).
+#[cfg(any(all(feature = "wry", not(windows)), feature = "cef"))]
 fn watch_tab_navigation(
   win: &WebviewWindow,
   app_id: String,
@@ -546,7 +554,17 @@ fn watch_tab_navigation(
         let url = url.to_string();
         if url != last {
           last = url.clone();
-          emit_nav(&handle, &app_id, &tab_id, &url, false, false);
+          // Only Chromium can answer this; on WebKit the calls would report a
+          // history the engine does not expose, so they are not made at all.
+          let (back, forward) = if cfg!(feature = "cef") {
+            (
+              win.can_go_back().unwrap_or(false),
+              win.can_go_forward().unwrap_or(false),
+            )
+          } else {
+            (false, false)
+          };
+          emit_nav(&handle, &app_id, &tab_id, &url, back, forward);
         }
       }
       std::thread::sleep(std::time::Duration::from_millis(700));
@@ -684,6 +702,10 @@ static PENDING_OPENS: Mutex<Vec<PendingOpen>> = Mutex::new(Vec::new());
 /// and repeating it on every open would train the user to ignore it. The notice
 /// is informational — tabs open regardless — so there is nothing to act on more
 /// than once.
+///
+/// The Chromium build has no system-installed runtime to swap, so the whole
+/// notice is compiled out there.
+#[cfg(feature = "wry")]
 static SWAP_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
 
@@ -968,6 +990,10 @@ fn schedule_open(handle: &tauri::AppHandle, pending: PendingOpen) {
 /// gate — the tab opens either way — so the only cost of getting this wrong is
 /// noise: telling the user about an update they cannot act on right now, or
 /// never telling them at all.
+///
+/// Only the WebView2 build can have a pending runtime update; the Chromium build
+/// carries its runtime inside the engine directory.
+#[cfg(any(feature = "wry", test))]
 fn should_announce_swap(
   reveals_existing: bool,
   already_announced: bool,
@@ -1017,7 +1043,10 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
   // since launch. Checking before the build — rather than after it fails — keeps
   // the tab from ever reaching a WebView2 call that would fail, and avoids a
   // retry that would have to re-register the same window label.
-  #[cfg(windows)]
+  //
+  // None of this applies to the Chromium build: CEF ships its own runtime inside
+  // the engine directory, so there is no system-installed version to swap.
+  #[cfg(all(feature = "wry", windows))]
   if crate::webview2_skew::pinned_folder_missing() {
     crate::webview2_skew::clear_runtime_pin();
     shell_log(&format!(
@@ -1035,19 +1064,22 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
   // the only thing left to do here.
   //
   // Revealing an app that is already open creates no webview, so it is exempt.
-  let reveals_existing = kind == OpenKind::Main && tabs(|m| m.contains_key(&app_id));
-  let already_announced = SWAP_NOTICE_SHOWN.load(std::sync::atomic::Ordering::SeqCst);
-  // Reading a few directory entries once per open is negligible, and fetching it
-  // unconditionally keeps `should_announce_swap` the single authority.
-  let skew = crate::webview2_skew::current_skew();
-  if should_announce_swap(reveals_existing, already_announced, warm, skew.is_some())
-    && let Some(skew) = skew
+  #[cfg(feature = "wry")]
   {
-    SWAP_NOTICE_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-    // The log gets the sentence, not just the versions: whoever reads it later
-    // needs to know which runtime is in use and which one is waiting.
-    shell_log(&format!("runtime update waiting: {}", skew.explanation()));
-    emit_runtime_swap(handle, &app_id, &skew);
+    let reveals_existing = kind == OpenKind::Main && tabs(|m| m.contains_key(&app_id));
+    let already_announced = SWAP_NOTICE_SHOWN.load(std::sync::atomic::Ordering::SeqCst);
+    // Reading a few directory entries once per open is negligible, and fetching it
+    // unconditionally keeps `should_announce_swap` the single authority.
+    let skew = crate::webview2_skew::current_skew();
+    if should_announce_swap(reveals_existing, already_announced, warm, skew.is_some())
+      && let Some(skew) = skew
+    {
+      SWAP_NOTICE_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+      // The log gets the sentence, not just the versions: whoever reads it later
+      // needs to know which runtime is in use and which one is waiting.
+      shell_log(&format!("runtime update waiting: {}", skew.explanation()));
+      emit_runtime_swap(handle, &app_id, &skew);
+    }
   }
 
   // Decide the tab id and label.
@@ -1206,14 +1238,19 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
   // options differ from those already in use for the same user data folder
   // (HRESULT 0x8007139F) — so a proxy there is reported instead of silently
   // doing nothing.
-  // Two channels carry the same proxy, on purpose:
+  // Two channels carry the same proxy, and which ones are used depends on the
+  // engine:
   //
-  //   `proxy_url`    the portable one. It is the only one macOS and Linux have,
-  //                  because `additional_browser_args` is Windows-only there.
-  //   `--proxy-server` in the argument string  the one that actually applies on
-  //                  Windows, because setting that string replaces the default
-  //                  wry would otherwise have appended the proxy to. Without it
-  //                  the app would look proxied and connect directly.
+  //   `proxy_url`            every engine takes this. Chromium applies it to the
+  //                          webview's own request context, which is exactly the
+  //                          per-app isolation RustBox wants.
+  //   `--proxy-server`       Windows/WebView2 only. wry builds the switch from
+  //                          its own default argument string, and RustBox
+  //                          replaces that string, so the proxy has to be in it
+  //                          or the app would look proxied and connect directly.
+  //                          Chromium cannot use a per-webview argument string;
+  //                          its switches are process-wide (`engine::apply`).
+  #[cfg(all(feature = "wry", windows))]
   let mut proxy_uri: Option<String> = None;
   let mut proxy_url: Option<tauri::Url> = None;
   match resolve_for(handle, &app) {
@@ -1228,7 +1265,7 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
       ),
     ),
     Resolved::Use(proxy) => {
-      if app.profile_mode == ProfileMode::Light {
+      if app.profile_mode == ProfileMode::Light && !cfg!(feature = "cef") {
         emit_tab_error(
           handle,
           &format!(
@@ -1241,7 +1278,10 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         let uri = crate::external::resolve_proxy_uri(&proxy);
         match tauri::Url::parse(&uri) {
           Ok(url) => {
-            proxy_uri = Some(uri);
+            #[cfg(all(feature = "wry", windows))]
+            {
+              proxy_uri = Some(uri);
+            }
             proxy_url = Some(url);
           }
           Err(e) => emit_tab_error(
@@ -1259,11 +1299,6 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     tauri::WebviewUrl::External(url),
   )
   .title(format!("{} - RustBox", app.name))
-  // Every RustBox webview carries the same switches, plus this app's proxy when
-  // it has one. The switches are what keep a hidden tab alive: without them
-  // WebView2 backgrounds the renderer, and a mail or chat app stops servicing
-  // its own connection and shows "trying to reconnect" until it is reloaded.
-  .additional_browser_args(&crate::webview_args::with_proxy(proxy_uri.as_deref()))
   // Tauri's own drag-drop handler registers an OLE drop target on the window,
   // and on Windows that swallows the page's HTML5 drag-and-drop: WebView2's
   // controller is told `SetAllowExternalDrop(false)` and in-page drags stop
@@ -1294,6 +1329,38 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     move |_win, title| emit_title(&h, &a, &t, &title)
   });
 
+  // WebView2 takes the shared switches, plus this app's proxy when it has one,
+  // as one argument string per webview. They are what keep a hidden tab alive:
+  // without them WebView2 backgrounds the renderer, and a mail or chat app stops
+  // servicing its own connection and shows "trying to reconnect" until it is
+  // reloaded. Chromium's command line is per process, not per webview, so on the
+  // CEF build the same switches come from `engine::apply` instead.
+  #[cfg(all(feature = "wry", windows))]
+  {
+    builder = builder.additional_browser_args(&crate::webview_args::with_proxy(proxy_uri.as_deref()));
+  }
+
+  // Chromium reports load state as a native frame event, so the toolbar spinner
+  // does not have to wait for the 700 ms URL poll. Only the main frame matters:
+  // an ad iframe finishing does not mean the page finished. CEF delivers this on
+  // its UI thread, so it must return immediately - `emit` is a channel send and
+  // is safe from there.
+  #[cfg(feature = "cef")]
+  {
+    use tauri_runtime_cef::{FrameEventKind, WebviewWindowBuilderCefExt};
+    let h = handle.clone();
+    let a = app_id.clone();
+    let t = tab_id.clone();
+    builder = builder.on_frame_event(move |event| {
+      if !event.is_main {
+        return;
+      }
+      if let FrameEventKind::LoadingStateChanged { is_loading } = event.kind {
+        emit_loading(&h, &a, &t, is_loading);
+      }
+    });
+  }
+
   // Per-app storage isolation, two modes:
   //
   // `Isolated` gives the app its own webview data store: cookies, localStorage,
@@ -1317,7 +1384,17 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
   // so the old "do NOT set data_directory" warning no longer applies.
   match app.profile_mode {
     ProfileMode::Isolated => {
-      #[cfg(target_os = "macos")]
+      // `Isolated` asks for this app's own site data, with no sharing at all.
+      //
+      // Chromium always has one browser process shared by every request
+      // context, so the isolation that exists there is the context itself.
+      #[cfg(feature = "cef")]
+      {
+        if let Some(dir) = crate::engine::app_data_directory(&app_id) {
+          builder = builder.data_directory(dir);
+        }
+      }
+      #[cfg(all(feature = "wry", target_os = "macos"))]
       {
         // WKWebView has no per-webview data directory, so the identifier is the
         // only way to keep one app's session out of another's. Requires macOS
@@ -1326,13 +1403,23 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         // UI can say so instead of silently pretending isolation happened.
         builder = builder.data_store_identifier(paths::data_store_identifier(&app_id));
       }
-      #[cfg(not(target_os = "macos"))]
+      #[cfg(all(feature = "wry", not(target_os = "macos")))]
       {
         builder = builder.data_directory(paths::ensure(paths::embedded_profile(&app_id)));
       }
     }
     ProfileMode::Light => {
-      #[cfg(windows)]
+      // `Light` asks for a shared runtime with per-app site data.
+      //
+      // That is what a Chromium build always does, so on CEF it is the same
+      // call as `Isolated`: one browser process, one request context per app.
+      #[cfg(feature = "cef")]
+      {
+        if let Some(dir) = crate::engine::app_data_directory(&app_id) {
+          builder = builder.data_directory(dir);
+        }
+      }
+      #[cfg(all(feature = "wry", windows))]
       {
         // The profile name deliberately does NOT travel through
         // `additional_browser_args`: WebView2 requires every webview that
@@ -1341,9 +1428,15 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
         // with HRESULT(0x8007139F). The patched tauri-runtime-wry reads the
         // name from a label-keyed registry and applies it as a controller
         // option instead (see src-tauri/Cargo.toml).
-        tauri_runtime_wry::set_webview_profile_name(&label, Some(paths::profile_name(&app_id)));
+        //
+        // The folder is the shell's because Tauri forces `app_local_data_dir()`
+        // for a webview without its own directory, and `main` points that at the
+        // same root this process resolved (`appDirectoriesOverride`). Hard-coding
+        // the root here instead would create a second environment for the same
+        // folder, which WebView2 rejects.
+        crate::engine::set_profile_name(&label, &app_id);
       }
-      #[cfg(not(windows))]
+      #[cfg(all(feature = "wry", not(windows)))]
       {
         // WebView2 multi-profile has no equivalent in WKWebView or WebKitGTK,
         // so Light degrades to the `Isolated` path rather than silently sharing
@@ -1550,8 +1643,7 @@ fn build_tab_window(handle: &tauri::AppHandle, pending: PendingOpen) {
     Err(e) => {
       // The registration is consumed on success; drop it on failure so a later
       // retry with the same label does not reuse a stale name.
-      #[cfg(windows)]
-      tauri_runtime_wry::set_webview_profile_name(&label, None);
+      crate::engine::clear_profile_name(&label);
       // `RPC_E_DISCONNECTED` on webview creation has one dominant cause that is
       // not a bug in this app: Windows swapped the WebView2 runtime while this
       // process was running. That is now only reachable when pinning was skipped
@@ -1721,7 +1813,10 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
       // The label is per request: a fixed one collided with the chooser that
       // was still closing, and the failed build then looked like a dead link.
       let label = choice_label(id);
-      let builder = tauri::WebviewWindowBuilder::new(
+      // `mut` is only used by the WebView2 arm below; the Chromium build has no
+      // per-webview argument string to add.
+      #[allow(unused_mut)]
+      let mut builder = tauri::WebviewWindowBuilder::new(
         &h2,
         label.as_str(),
         tauri::WebviewUrl::App(page.into()),
@@ -1739,15 +1834,20 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
       // is a dialog the user never sees and a link that appears to do nothing.
       .always_on_top(true)
       .inner_size(w, h)
-      // The chooser runs in the shell's own environment (it has no data
-      // directory of its own), so its browser arguments have to match the
-      // shell window byte for byte or WebView2 refuses to create it.
-      .additional_browser_args(crate::webview_args::BASE)
       // Same rule as every other webview: Tauri's drag-drop handler replaces
       // WebView2's drop target, which is what breaks HTML5 drag and drop on
       // Windows. Nothing in RustBox reads `DragDropEvent`.
       .disable_drag_drop_handler()
       .position(px as f64 / scale, py as f64 / scale);
+      // The chooser runs in the shell's own environment (it has no data
+      // directory of its own), so its browser arguments have to match the
+      // shell window byte for byte or WebView2 refuses to create it. Chromium
+      // has no per-webview argument string; its switches are already on the
+      // process command line (see `engine::apply`).
+      #[cfg(feature = "wry")]
+      {
+        builder = builder.additional_browser_args(crate::webview_args::BASE);
+      }
       #[cfg(windows)]
       let builder = match builder.owner(&mwin) {
         Ok(b) => b,
@@ -1890,9 +1990,18 @@ pub(crate) fn trace_line(message: &str) {
 /// Why a webview could not be created, when the cause is a WebView2 runtime swap.
 ///
 /// Kept as a thin wrapper so the call sites read as "is this the runtime-swap
-/// case?" and the version comparison lives in one tested place.
+/// case?" and the version comparison lives in one tested place. The Chromium
+/// build has no system-installed runtime, so nothing can be swapped out from
+/// under it and this is always `None` there.
 fn runtime_swap_explanation() -> Option<String> {
-  crate::webview2_skew::runtime_swap_explanation()
+  #[cfg(feature = "wry")]
+  {
+    crate::webview2_skew::runtime_swap_explanation()
+  }
+  #[cfg(not(feature = "wry"))]
+  {
+    None
+  }
 }
 
 /// Tear down every chooser window that is up.
@@ -2485,6 +2594,7 @@ fn emit_tab_error(handle: &tauri::AppHandle, message: &str) {
 /// never asked about reads as noise. Informational only: the tab opens on the
 /// pinned runtime either way, and nothing restarts until the user says so — a
 /// window that vanishes mid-task reads as a crash.
+#[cfg(feature = "wry")]
 fn emit_runtime_swap(
   handle: &tauri::AppHandle,
   app_id: &str,
@@ -2506,6 +2616,7 @@ fn emit_runtime_swap(
 }
 
 /// The user's display name for an app, for prompts that have to name it.
+#[cfg(feature = "wry")]
 fn app_name(handle: &tauri::AppHandle, app_id: &str) -> Option<String> {
   use tauri::Manager;
   let state: tauri::State<crate::config::AppState> = handle.state();
@@ -2544,6 +2655,18 @@ pub fn probe_open_all(handle: &tauri::AppHandle) {
     Ok(cfg) => cfg.apps.clone(),
     Err(_) => return,
   };
+  // The UI reports where the content area actually is, and a probe tab belongs
+  // there like any other. It used to be pinned to a fixed 800x600 at y=60, which
+  // put every probe snapshot in a white box that covered only part of the page
+  // and looked like a layout bug. The fixed rect survives only as the fallback
+  // for a window that has not reported a rect yet, because a tab built at zero
+  // size would never paint at all.
+  let reported = *CONTENT_RECT.lock().unwrap();
+  let rect = if reported.2 > 0.0 && reported.3 > 0.0 {
+    reported
+  } else {
+    (0.0, 60.0, 800.0, 600.0)
+  };
   for app in apps {
     if app.engine != Engine::OsWebview || !app.enabled {
       continue;
@@ -2553,7 +2676,7 @@ pub fn probe_open_all(handle: &tauri::AppHandle) {
       kind: OpenKind::Main,
       url: None,
       title: None,
-      rect: (0.0, 60.0, 800.0, 600.0),
+      rect,
       warm: false,
     });
   }
@@ -2695,12 +2818,14 @@ pub fn navigate(
     return Ok(());
   };
 
-  #[cfg(windows)]
+  #[cfg(all(feature = "wry", windows))]
   {
     win
       .with_webview(move |platform| {
-        let controller = platform.controller();
-        let core = match unsafe { controller.CoreWebView2() } {
+        let Some(wv) = platform.downcast_ref::<tauri_runtime_wry::Webview>() else {
+          return;
+        };
+        let core = match unsafe { wv.controller().CoreWebView2() } {
           Ok(core) => core,
           Err(_) => return,
         };
@@ -2722,7 +2847,19 @@ pub fn navigate(
       .map_err(|e| e.to_string())
   }
 
-  #[cfg(not(windows))]
+  // Chromium implements these natively, and its history spans the whole tab, so
+  // a cross-origin hop is not a barrier the way it was for WebKit.
+  #[cfg(feature = "cef")]
+  {
+    match action.as_str() {
+      "back" => win.go_back().map_err(|e| e.to_string()),
+      "forward" => win.go_forward().map_err(|e| e.to_string()),
+      "reload" => win.reload().map_err(|e| e.to_string()),
+      _ => Ok(()),
+    }
+  }
+
+  #[cfg(all(feature = "wry", not(windows)))]
   {
     match action.as_str() {
       // `reload` maps to a native call that works everywhere.
@@ -2773,17 +2910,19 @@ pub fn navigate_window(win: &WebviewWindow, url: &str) -> Result<(), String> {
 
 /// Mute/unmute the app's tab.
 ///
-/// Windows uses `ICoreWebView2_8::SetIsMuted`. Tauri exposes no mute API for
-/// WKWebView or WebKitGTK, so on those platforms this reports the limitation
-/// instead of pretending the tab was muted.
+/// The two engines reach the same outcome through different APIs: WebView2 has
+/// `ICoreWebView2_8::SetIsMuted`, Chromium has `BrowserHost::set_audio_muted`.
+/// Both are per-browser, which is why every window of the app is set: muting an
+/// app that is playing audio in a background sub-tab is the request the menu
+/// makes. WebKit (WKWebView / WebKitGTK) exposes neither through Tauri, so there
+/// this reports the limitation instead of pretending the tab was muted.
 #[tauri::command]
 pub fn set_tab_muted(
   app_id: String,
   muted: bool,
   app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-  // Mute every window of the app, not just the visible tab: muting an app that
-  // is playing audio in a background sub-tab is the request the menu makes.
+  // Mute every window of the app, not just the visible tab.
   let labels: Vec<String> = tabs(|m| {
     m.get(&app_id)
       .map(|a| a.tabs.iter().map(|t| t.label.clone()).collect())
@@ -2793,7 +2932,7 @@ pub fn set_tab_muted(
     return Ok(());
   }
 
-  #[cfg(windows)]
+  #[cfg(all(feature = "wry", windows))]
   {
     for label in labels {
       let Some(win) = app_handle.get_webview_window(&label) else {
@@ -2803,9 +2942,11 @@ pub fn set_tab_muted(
         .with_webview(move |platform| {
           use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8;
           use windows_core::Interface;
-          let controller = platform.controller();
+          let Some(wv) = platform.downcast_ref::<tauri_runtime_wry::Webview>() else {
+            return;
+          };
           unsafe {
-            if let Ok(core) = controller.CoreWebView2()
+            if let Ok(core) = wv.controller().CoreWebView2()
               && let Ok(web8) = core.cast::<ICoreWebView2_8>()
             {
               let _ = web8.SetIsMuted(muted);
@@ -2817,7 +2958,30 @@ pub fn set_tab_muted(
     Ok(())
   }
 
-  #[cfg(not(windows))]
+  #[cfg(feature = "cef")]
+  {
+    use tauri_runtime_cef::WebviewCefExt;
+    use tauri_runtime_cef::cef::{ImplBrowser, ImplBrowserHost};
+
+    for label in labels {
+      let Some(win) = app_handle.get_webview_window(&label) else {
+        continue;
+      };
+      // Runs on CEF's UI thread, where the browser host must be touched. There
+      // is no return value to wait for: the command reports only that the mute
+      // was handed over, which is the same guarantee the WebView2 path gives.
+      win
+        .with_cef_webview(move |webview| {
+          if let Some(host) = webview.browser().host() {
+            host.set_audio_muted(i32::from(muted));
+          }
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+  }
+
+  #[cfg(all(feature = "wry", not(windows)))]
   {
     let _ = (labels, muted);
     Err("muting a tab is not supported on this platform yet".to_string())
@@ -2898,7 +3062,10 @@ pub fn ctx_menu_window(
       let url = tauri::WebviewUrl::App(
         format!("ctx.html?app={app_id0}&tab={tab_id0}").into(),
       );
-      let builder = tauri::WebviewWindowBuilder::new(&h2, "ctx-menu", url)
+      // `mut` is only used by the WebView2 arm below; the Chromium build has no
+      // per-webview argument string to add.
+      #[allow(unused_mut)]
+      let mut builder = tauri::WebviewWindowBuilder::new(&h2, "ctx-menu", url)
         .title("ctx-menu")
         .decorations(false)
         .skip_taskbar(true)
@@ -2916,11 +3083,15 @@ pub fn ctx_menu_window(
         // modal in intent, so it is the one window here that should win.
         .always_on_top(true)
         .inner_size(MW_CSS, MH_MAX_CSS)
-        // Shares the shell's environment, so the browser arguments must match
-        // it exactly (WebView2 rejects a mismatched second environment).
-        .additional_browser_args(crate::webview_args::BASE)
         .disable_drag_drop_handler()
         .position(px0 as f64 / scale0, py0 as f64 / scale0);
+      // Shares the shell's environment, so the browser arguments must match it
+      // exactly (WebView2 rejects a mismatched second environment). Chromium
+      // has no per-webview argument string; its switches are process-wide.
+      #[cfg(feature = "wry")]
+      {
+        builder = builder.additional_browser_args(crate::webview_args::BASE);
+      }
       let Some(mwin) = h2.get_webview_window("main") else { return };
       #[cfg(windows)]
       let builder = match builder.owner(&mwin) {
