@@ -174,6 +174,45 @@ jobs:
           }
           "CEF_PATH=$cefPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # `cef-dll-sys` compiles the CEF wrapper through CMake and Ninja, and both
+      # read the MSVC include and library paths from the environment rather than
+      # baking them into the build files. The runner image has Visual Studio
+      # installed but does not load it into the shell, so without this the
+      # Chromium build stops at `build-installer.mjs`'s INCLUDE guard on Windows
+      # with "the MSVC environment is not loaded". A local build gets the same
+      # environment from a `vcvars64.bat` prompt.
+      - name: load the MSVC environment
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "vswhere not found at $vswhere" }
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw 'no Visual Studio installation with the C++ toolset' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+
+          # Only the variables the C++ toolchain needs. Writing the whole `set`
+          # dump back into GITHUB_ENV would echo the runner's own variables into
+          # the job environment.
+          $wanted = @(
+            'INCLUDE', 'LIB', 'LIBPATH', 'PATH', 'VCToolsInstallDir',
+            'VCINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion',
+            'VSCMD_ARG_TGT_ARCH'
+          )
+          $exported = 0
+          $out = cmd /c "`"$vcvars`" >nul 2>&1 && set"
+          foreach ($line in $out) {
+            if ($line -match '^([^=]+)=(.*)$' -and $wanted -contains $matches[1]) {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              $exported++
+            }
+          }
+          if ($exported -eq 0) { throw 'vcvars64.bat exported none of the expected variables' }
+          Write-Host "exported $exported MSVC variables"
+
       # build-installer.mjs builds the MCP sidecar first and stages it under the
       # triple the bundler will look for, then runs `cargo tauri build`. Doing it by
       # hand here would drift from what a local build does.
