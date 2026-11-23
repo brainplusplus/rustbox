@@ -3,10 +3,14 @@
 // Guards the sub-tab strip's two rules:
 //
 //  1. The first sub-tab is the app itself: it is pinned, has no close button,
-//     and cannot be dragged — the same "this one is the anchor" idea that
-//     already stops it being closed.
-//  2. Every other sub-tab can be dragged, and a drop names the right tab, the
+//     and cannot be moved - the same "this one is the anchor" idea that already
+//     stops it being closed.
+//  2. Every other sub-tab can be moved, and the request names the right tab, the
 //     right target and the right side.
+//
+// The strip reorders from pointer events, not HTML5 drag and drop: under the CEF
+// engine the page never receives the `drop` the native drag loop owes it, so a
+// drag-and-drop reorder cannot commit there. This probe drives pointer events.
 //
 // What this cannot prove is that the backend reorders; that is
 // `tabs::reorder_tests` in Rust. Here the assertion is the strip's own wiring.
@@ -46,22 +50,47 @@
   const q = (s) => document.querySelector(s);
   const qa = (s) => [...document.querySelectorAll(s)];
 
-  // Horizontal drop position decides before/after, so the event needs clientX.
-  function dragEvent(type, el, { clientX, clientY, dataTransfer } = {}) {
-    const ev = new Event(type, { bubbles: true, cancelable: true });
-    if (clientX !== undefined) ev.clientX = clientX;
-    if (clientY !== undefined) ev.clientY = clientY;
-    if (dataTransfer) Object.defineProperty(ev, 'dataTransfer', { value: dataTransfer });
-    el.dispatchEvent(ev);
+  // The strip reorders from pointer events (see `enablePointerReorder`), so the
+  // probe replays a mouse: press, cross the threshold, hover the target side,
+  // release. `elementFromPoint` picks the target, so the moves carry real
+  // coordinates from the chip rectangles.
+  function pointerEvent(type, target, x, y) {
+    const ev = new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true,
+      button: 0,
+      buttons: type === 'pointerup' ? 0 : 1,
+      clientX: x,
+      clientY: y,
+    });
+    (target || window).dispatchEvent(ev);
     return ev;
   }
 
-  function makeDataTransfer() {
-    try {
-      return new DataTransfer();
-    } catch (_) {
-      return { effectAllowed: '', dropEffect: '', setData() {}, getData() { return ''; } };
+  // Press the middle of `from`, drag onto the left or right edge of `to`, and
+  // report the marker class painted there.
+  async function pressAndHover(from, to, before) {
+    const a = from.getBoundingClientRect();
+    const b = to.getBoundingClientRect();
+    const y = b.top + b.height / 2;
+    const x0 = a.left + a.width / 2;
+    const x1 = before ? b.left + 2 : b.right - 2;
+    pointerEvent('pointerdown', from, x0, a.top + a.height / 2);
+    for (const f of [0.2, 0.45, 0.7, 0.9, 1]) {
+      pointerEvent('pointermove', window, x0 + (x1 - x0) * f, y);
+      await wait(15);
     }
+    return to.className;
+  }
+
+  function releaseAt(to, before) {
+    const b = to.getBoundingClientRect();
+    const x = before ? b.left + 2 : b.right - 2;
+    pointerEvent('pointerup', window, x, b.top + b.height / 2);
   }
 
   async function run() {
@@ -93,74 +122,62 @@
       log('the pinned sub-tab has no close button',
         pinned && !pinned.querySelector('[data-close]'),
         pinned ? 'close=' + !!pinned.querySelector('[data-close]') : 'no chip');
-      // The anchor cannot move, for the same reason it cannot close.
-      log('the pinned sub-tab cannot be dragged',
-        pinned && pinned.getAttribute('draggable') === 'false',
-        pinned ? 'draggable=' + pinned.getAttribute('draggable') : 'no chip');
-      log('every other sub-tab can be dragged',
-        chips.filter((c) => !c.classList.contains('pinned'))
-          .every((c) => c.getAttribute('draggable') === 'true'),
-        chips.map((c) => c.dataset.tab + ':' + c.getAttribute('draggable')).join(','));
+      // The anchor cannot move, for the same reason it cannot close. The strip no
+      // longer advertises draggability as an attribute (nothing uses HTML5 drag
+      // and drop any more), so the pinned chip is checked by behaviour below: a
+      // press on it must not start a move.
+      log('no chip advertises HTML5 drag and drop',
+        qa('#tab-strip .sub-tab').every((c) => !c.hasAttribute('draggable')),
+        qa('#tab-strip .sub-tab').map((c) => c.dataset.tab + ':' + c.getAttribute('draggable')).join(','));
 
-      // --- right half inserts after -------------------------------------
+      // --- right edge inserts after -------------------------------------
       const from = q('.sub-tab[data-tab="t3"]');
       const to = q('.sub-tab[data-tab="t2"]');
-      const dt = makeDataTransfer();
-      const r = to.getBoundingClientRect();
-      dragEvent('dragstart', from, { dataTransfer: dt });
-      dragEvent('dragover', to, { clientX: r.right - 2, dataTransfer: dt });
+      const markerClass = await pressAndHover(from, to, false);
       log('dragging over the right half shows an insert-after marker',
-        to.classList.contains('drop-after'), 'class=' + to.className);
-      dragEvent('drop', to, { clientX: r.right - 2, dataTransfer: dt });
-      dragEvent('dragend', from, { dataTransfer: dt });
-      await wait(200);
+        /\bdrop-after\b/.test(markerClass), 'class=' + markerClass);
+      releaseAt(to, false);
+      await wait(250);
 
       const sent = (window.__probeReorders || [])[0];
-      log('dropping asks the backend to reorder',
+      log('releasing asks the backend to reorder',
         !!sent && sent.tabId === 't3' && sent.targetId === 't2' && sent.after === true,
         JSON.stringify(sent || null));
       log('the reorder names the app it belongs to',
         !!sent && sent.appId === 'app-a', sent ? sent.appId : 'none');
 
-      // --- left half inserts before -------------------------------------
+      // --- left edge inserts before -------------------------------------
       (window.__probeReorders || []).length = 0;
       const from2 = q('.sub-tab[data-tab="t2"]');
       const to2 = q('.sub-tab[data-tab="t3"]');
-      const dt2 = makeDataTransfer();
-      const r2 = to2.getBoundingClientRect();
-      dragEvent('dragstart', from2, { dataTransfer: dt2 });
-      dragEvent('dragover', to2, { clientX: r2.left + 2, dataTransfer: dt2 });
+      const markerClass2 = await pressAndHover(from2, to2, true);
       log('dragging over the left half shows an insert-before marker',
-        to2.classList.contains('drop-before'), 'class=' + to2.className);
-      dragEvent('drop', to2, { clientX: r2.left + 2, dataTransfer: dt2 });
-      dragEvent('dragend', from2, { dataTransfer: dt2 });
-      await wait(200);
+        /\bdrop-before\b/.test(markerClass2), 'class=' + markerClass2);
+      releaseAt(to2, true);
+      await wait(250);
       const sent2 = (window.__probeReorders || [])[0];
-      log('dropping on the left half inserts before the target',
+      log('releasing on the left half inserts before the target',
         !!sent2 && sent2.after === false, JSON.stringify(sent2 || null));
 
-      // --- a drop on itself is a no-op ----------------------------------
+      // --- a release on the chip itself is a no-op -----------------------
       (window.__probeReorders || []).length = 0;
       const self = q('.sub-tab[data-tab="t2"]');
-      const dt3 = makeDataTransfer();
-      dragEvent('dragstart', self, { dataTransfer: dt3 });
-      dragEvent('drop', self, { dataTransfer: dt3 });
-      dragEvent('dragend', self, { dataTransfer: dt3 });
-      await wait(150);
-      log('dropping a tab on itself sends nothing',
+      const sr = self.getBoundingClientRect();
+      pointerEvent('pointerdown', self, sr.left + sr.width / 2, sr.top + sr.height / 2);
+      await wait(20);
+      pointerEvent('pointerup', window, sr.left + sr.width / 2, sr.top + sr.height / 2);
+      await wait(200);
+      log('pressing and releasing a tab in place sends nothing',
         (window.__probeReorders || []).length === 0,
         (window.__probeReorders || []).length + ' requests');
 
-      // The pinned chip refuses to start a drag at all.
+      // The pinned chip refuses to start a move at all.
       (window.__probeReorders || []).length = 0;
       const pinChip = q('.sub-tab.pinned');
-      const dt4 = makeDataTransfer();
       const target = q('.sub-tab[data-tab="t3"]');
-      const r4 = target.getBoundingClientRect();
-      dragEvent('dragstart', pinChip, { dataTransfer: dt4 });
-      dragEvent('drop', target, { clientX: r4.left + 2, dataTransfer: dt4 });
-      dragEvent('dragend', pinChip, { dataTransfer: dt4 });
-      await wait(150);
+      await pressAndHover(pinChip, target, true);
+      releaseAt(target, true);
+      await wait(200);
       log('the pinned tab never becomes the thing being moved',
         (window.__probeReorders || []).length === 0,
         (window.__probeReorders || []).length + ' requests');

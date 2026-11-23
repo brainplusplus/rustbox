@@ -30,26 +30,51 @@
   const iconOrder = () =>
     [...document.querySelectorAll('.app-icon-btn')].map((b) => b.dataset.id);
 
-  // The UI listens for real drag events, so the probe dispatches them. A
-  // DataTransfer is required by dragstart; jsdom-less browsers have one, but
-  // headless Chrome needs it constructed explicitly.
-  function dragEvent(type, el, { clientY, dataTransfer } = {}) {
-    const ev = new Event(type, { bubbles: true, cancelable: true });
-    if (clientY !== undefined) ev.clientY = clientY;
-    if (dataTransfer) {
-      Object.defineProperty(ev, 'dataTransfer', { value: dataTransfer });
-    }
-    el.dispatchEvent(ev);
+  // The UI reorders from pointer events, not HTML5 drag and drop: the CEF engine
+  // never delivers the `drop` the native drag loop owes the page, so a reorder
+  // built on `drop` commits nothing there. The helpers below replay what a mouse
+  // sends - press, cross the 4px threshold, hover the target, release - and the
+  // reorder hit-tests with `elementFromPoint`, so the moves are dispatched at the
+  // coordinates of the element being crossed.
+  function pointerEvent(type, target, x, y) {
+    const ev = new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true,
+      button: 0,
+      buttons: type === 'pointerup' ? 0 : 1,
+      clientX: x,
+      clientY: y,
+    });
+    (target || window).dispatchEvent(ev);
     return ev;
   }
 
-  function makeDataTransfer() {
-    try {
-      return new DataTransfer();
-    } catch (_) {
-      // Minimal stand-in if DataTransfer is unavailable.
-      return { effectAllowed: '', dropEffect: '', setData() {}, getData() { return ''; } };
+  // Press the middle of `from`, drag onto the upper or lower edge of `to`, and
+  // report the marker class painted there. The release is separate so the caller
+  // can assert on the preview before committing it.
+  async function pressAndHover(from, to, before) {
+    const a = from.getBoundingClientRect();
+    const b = to.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y0 = a.top + a.height / 2;
+    const y1 = before ? b.top + 2 : b.bottom - 2;
+    pointerEvent('pointerdown', from, a.left + a.width / 2, y0);
+    for (const f of [0.2, 0.45, 0.7, 0.9, 1]) {
+      pointerEvent('pointermove', window, x, y0 + (y1 - y0) * f);
+      await wait(15);
     }
+    return to.className;
+  }
+
+  function releaseAt(to, before) {
+    const b = to.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = before ? b.top + 2 : b.bottom - 2;
+    pointerEvent('pointerup', window, x, y);
   }
 
   async function run() {
@@ -138,7 +163,7 @@
           'class=' + q('.app-icon-btn[data-id="app-a"]').className);
       }
 
-      // --- drag reorder ----------------------------------------------------
+      // --- pointer reorder ------------------------------------------------
       // Needs the three-app fixture; a caller that passes fewer apps gets the
       // startup checks only, so the probe never fails on missing elements.
       if (expected < 3) return finish();
@@ -146,20 +171,16 @@
       const before = iconOrder();
       const fromEl = q('.app-icon-btn[data-id="app-c"]');
       const toEl = q('.app-icon-btn[data-id="app-a"]');
-      const dt = makeDataTransfer();
-      const rect = toEl.getBoundingClientRect();
-      // Upper half of the target = insert before it.
-      dragEvent('dragstart', fromEl, { dataTransfer: dt });
-      dragEvent('dragover', toEl, { clientY: rect.top + 2, dataTransfer: dt });
-      const markerShown = toEl.classList.contains('drop-before');
+      // Upper edge of the target = insert before it.
+      const markerClass = await pressAndHover(fromEl, toEl, true);
+      const markerShown = /\bdrop-before\b/.test(markerClass);
       log('dragging over the top half shows an insert-before marker', markerShown,
-        'class=' + toEl.className);
-      dragEvent('drop', toEl, { clientY: rect.top + 2, dataTransfer: dt });
-      dragEvent('dragend', fromEl, { dataTransfer: dt });
-      await wait(120);
+        'class=' + markerClass);
+      releaseAt(toEl, true);
+      await wait(200);
 
       const after = iconOrder();
-      log('dropping moves the icon to the requested slot',
+      log('releasing moves the icon to the requested slot',
         after[0] === 'app-c' && after.length === before.length, after.join(','));
       log('the moved app is no longer in its old slot', after.indexOf('app-c') === 0, after.join(','));
 
@@ -169,36 +190,32 @@
       const savedIds = last.map((a) => a.id);
       log('the new order is persisted', savedIds.join(',') === after.join(','), savedIds.join(','));
 
-      // --- lower-half drop inserts after --------------------------------
+      // --- lower half inserts after ----------------------------------------
       const from2 = q('.app-icon-btn[data-id="app-a"]');
       const to2 = q('.app-icon-btn[data-id="app-b"]');
-      const dt2 = makeDataTransfer();
-      const r2 = to2.getBoundingClientRect();
-      dragEvent('dragstart', from2, { dataTransfer: dt2 });
-      dragEvent('dragover', to2, { clientY: r2.bottom - 2, dataTransfer: dt2 });
-      const afterMarker = to2.classList.contains('drop-after');
+      const afterClass = await pressAndHover(from2, to2, false);
+      const afterMarker = /\bdrop-after\b/.test(afterClass);
       log('dragging over the bottom half shows an insert-after marker', afterMarker,
-        'class=' + to2.className);
-      dragEvent('drop', to2, { clientY: r2.bottom - 2, dataTransfer: dt2 });
-      dragEvent('dragend', from2, { dataTransfer: dt2 });
-      await wait(120);
+        'class=' + afterClass);
+      releaseAt(to2, false);
+      await wait(200);
 
       const after2 = iconOrder();
       const aPos = after2.indexOf('app-a');
       const bPos = after2.indexOf('app-b');
-      log('dropping on the lower half places the icon after the target',
+      log('releasing on the lower half places the icon after the target',
         aPos === bPos + 1, after2.join(','));
 
-      // --- a drop onto itself is a no-op ---------------------------------
+      // --- a release on the item itself is a no-op -------------------------
       const selfEl = q('.app-icon-btn[data-id="app-b"]');
-      const dt3 = makeDataTransfer();
       const snapshot = iconOrder().join(',');
-      dragEvent('dragstart', selfEl, { dataTransfer: dt3 });
-      dragEvent('drop', selfEl, { clientY: 0, dataTransfer: dt3 });
-      dragEvent('dragend', selfEl, { dataTransfer: dt3 });
-      await wait(80);
-      log('dropping an icon on itself changes nothing', iconOrder().join(',') === snapshot,
-        iconOrder().join(','));
+      const sr = selfEl.getBoundingClientRect();
+      pointerEvent('pointerdown', selfEl, sr.left + sr.width / 2, sr.top + sr.height / 2);
+      await wait(20);
+      pointerEvent('pointerup', window, sr.left + sr.width / 2, sr.top + sr.height / 2);
+      await wait(120);
+      log('pressing and releasing an icon in place changes nothing',
+        iconOrder().join(',') === snapshot, iconOrder().join(','));
     } catch (e) {
       log('probe threw', false, (e && (e.message || e)) || e);
     }
