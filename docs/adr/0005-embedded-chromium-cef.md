@@ -2396,3 +2396,70 @@ are present, decrypt to the same 153-byte values as the WebView2 jars, and expir
 in 371 days. Google reports the accounts as "Signed out", which is a server-side
 invalidation, the same class as 25.7. Removing extension directories and registry
 keys cannot touch a cookie jar.
+
+## 28. The two things the engine switch broke that no test could see (2026-11-23)
+
+Both were reported as "it worked before CEF". Both were engine-specific, both were
+reproduced before anything was changed, and neither is reachable through CDP, which
+is why they survived 306 green tests.
+
+### 28.1 The link chooser froze the whole app
+
+Clicking a `target=_blank` link brought up the "RustBox is not responding" dialog.
+`show_link_chooser` reaches `open_choice_window` from inside CEF's `OnBeforePopup`,
+and the external message pump runs that callback from the message-only window's
+`wnd_proc`. winit installs its dispatch guard in winit's own callbacks, not there,
+so every blocking getter (`scale_factor`, and `outer_position`/`outer_size`/
+`inner_size` through `content_rect_physical`) queued its request for the main
+thread and then blocked waiting for it - on the only thread that could drain the
+queue. Not slow: deadlocked, on the first link click.
+
+The fix moves the measurement, not the getter: only the cached `CONTENT_RECT` is
+read at the call site, and the physical rect plus the scale factor are computed
+inside the existing `run_on_main_thread` closure, where the guard is active and
+the getters answer inline. WebView2 dispatch always installed the guard, which is
+why the same code never hung there.
+
+### 28.2 HTML5 drag and drop never got its `drop`
+
+Dragging an app icon in the sidebar, or a chip in the tab strip, moved nothing.
+Measured with a real cursor (`scripts/probe-drag-real.ps1`, which presses with
+`mouse_event` and reads back the events the page saw):
+
+| Path | Events the page receives |
+|---|---|
+| CDP `Input.dispatchMouseEvent` | `dragstart`, `drag`, `dragenter`, `dragover`, `drop`, `dragend` |
+| Real cursor, WebView2 | the same complete sequence |
+| Real cursor, CEF | `dragstart`, 54 `drag`, `dragover` on the zone, then `drag@0,0`, `dragend` |
+
+The page always got the first half and never the `drop`. Chromium owes the page
+that drop from the browser-side OLE drag loop, and the CEF runtime's drag bridge
+only completes the loop for external *file* drops, so a reorder built on
+`drop` could not commit on CEF no matter what the markup was. CDP cannot show this
+because it injects at the renderer, past the browser process that fails.
+
+Both lists therefore reorder from pointer events (`enablePointerReorder` in
+`ui/index.html`), which reach the page over either engine's input path: pointerdown
+records the item, a 4px threshold separates a drag from a click, the target half
+decides insert-before or insert-after, `pointerup` commits, Escape cancels, and the
+click that follows the release is suppressed so the moved item is not also
+activated. The HTML5 handlers and the `draggable` attributes are gone, and
+`scripts/check-ui.js` fails the build if either comes back.
+`scripts/probe-pointer-real.ps1` drives that shipping function with a real cursor
+on CEF and confirms `item-1` lands after `item-4`.
+
+### 28.3 What the pointer reorder does not do
+
+It does not drag an item out of the sidebar, and it does not accept a file or a
+link dropped onto the page from Explorer or another browser. That is a different
+path - the OS drag source, delivered by the runtime's own drop handler - and it was
+never the reported problem.
+
+### 28.4 Unmeasured
+
+Whether the `OnBeforePopup` queue-forever behaviour also affects the context-menu
+window, which is deferred the same way but was never observed hanging. Whether any
+other call site reads a blocking getter from a CEF callback; nothing swept the
+codebase for that pattern, only the two paths the user hit. How the pointer reorder
+behaves with a touch screen or a pen, which raise pointer events with a different
+`pointerType` and were not tested.
