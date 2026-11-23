@@ -1802,14 +1802,20 @@ fn show_link_chooser(handle: &tauri::AppHandle, app_id: &str, from_tab: &str, ur
 /// same deferred way the context menu is, for the same wry#583 reason.
 fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &str) {
   use tauri::Manager;
-  let Some(main) = handle.get_webview_window("main") else {
+  if handle.get_webview_window("main").is_none() {
     return;
-  };
+  }
+  // Only cheap state is read at the call site. `scale_factor`, `outer_position`,
+  // `outer_size` and `inner_size` are blocking getters: each one posts a request
+  // to the main thread and waits for the answer. `show_link_chooser` reaches
+  // this function from inside CEF's `OnBeforePopup`, which the external message
+  // pump runs from the message-only window's `wnd_proc` - a place where winit
+  // has no dispatch guard installed. There a getter cannot be answered inline,
+  // so its request is queued and the main thread then blocks waiting for it on
+  // the only thread that could drain the queue: the deadlock the user sees as
+  // "RustBox is not responding". Measure the rect in the deferred task below
+  // instead, where the guard is active and the getters answer immediately.
   let (x, y, w, h) = *CONTENT_RECT.lock().unwrap();
-  let Ok((px, py, pw, ph)) = content_rect_physical(&main, x, y, w, h) else {
-    return;
-  };
-  let scale = main.scale_factor().unwrap_or(1.0);
   let h0 = handle.clone();
   let app_id = app_id.to_string();
   let url = url.to_string();
@@ -1825,6 +1831,14 @@ fn open_choice_window(handle: &tauri::AppHandle, id: u64, app_id: &str, url: &st
       let Some(mwin) = h2.get_webview_window("main") else {
         return;
       };
+      // Safe here: this runs as a queued main-thread task, i.e. inside a winit
+      // callback that installed the dispatch guard, so these getters answer
+      // inline instead of waiting on a queue only this thread can drain. See the
+      // comment in `open_choice_window`.
+      let Ok((px, py, pw, ph)) = content_rect_physical(&mwin, x, y, w, h) else {
+        return;
+      };
+      let scale = mwin.scale_factor().unwrap_or(1.0);
       // Closing the previous chooser is done here, on a fresh main-thread task,
       // and not at the call site. `show_link_chooser` runs inside WebView2's
       // new-window dispatch, and destroying a WebView2 controller from there
