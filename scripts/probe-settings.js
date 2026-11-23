@@ -265,6 +265,36 @@
       log('going back to the default hides the path field again',
         q('#sp-move-custom').hidden, `hidden=${q('#sp-move-custom').hidden}`);
 
+      // Saving a custom folder has to *look* saved. The request lives in the
+      // backend's live config and is only carried out on the next start, so the
+      // pane has to show it as queued; falling back to "Default folder" here was
+      // read as "I chose a folder and it still points at the default one".
+      customRadio.checked = true;
+      fire(customRadio, 'change');
+      q('#sp-move-target').value = 'D:\\RustBoxData';
+      fire(q('#sp-move-target'), 'input');
+      await wait(40);
+      q('#sp-move-apply').click();
+      await wait(120);
+      log('a saved move keeps the custom choice selected',
+        !!q('#sp-datamove input[value="custom"]').checked, 'custom checked');
+      log('the queued folder stays in the path field',
+        q('#sp-move-target').value === 'D:\\RustBoxData', q('#sp-move-target').value);
+      log('the queued move says so',
+        /queued/i.test(q('#sp-move-state').textContent),
+        q('#sp-move-state').textContent.trim().slice(0, 120));
+      log('the button stops offering a move that is already queued',
+        q('#sp-move-apply').disabled && /queued/i.test(q('#sp-move-apply').textContent),
+        `disabled=${q('#sp-move-apply').disabled} "${q('#sp-move-apply').textContent}"`);
+      log('the cancel route appears once a move is queued',
+        !q('#sp-move-cancel').hidden, `hidden=${q('#sp-move-cancel').hidden}`);
+      q('#sp-move-cancel').click();
+      await wait(120);
+      log('cancelling clears the queue and returns to the default choice',
+        !q('#sp-move-state').textContent.trim().startsWith('A move to')
+          && !!q('#sp-datamove input[value="default"]').checked,
+        q('#sp-move-state').textContent.trim().slice(0, 80));
+
       // ---- settings: MCP guides follow the bind mode ----------------------
       // One guide on loopback, three on a published port: a client on this
       // machine, one on the LAN and one outside all need a different address.

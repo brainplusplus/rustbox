@@ -338,14 +338,28 @@ async fn pick_data_folder(start_in: Option<String>) -> Result<Option<String>, St
 
 /// Record a data-folder move for the next start, or fail with the reason now.
 #[tauri::command]
-fn move_data_folder(target: Option<String>, state: tauri::State<AppState>) -> Result<String, String> {
-    data_root::schedule(target.as_deref(), &state.config_path)
+async fn move_data_folder(
+    target: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    // Planned off the IPC thread: the checks walk the whole data folder (110k
+    // files, ~12 GB measured) to learn whether the target drive has room, and a
+    // sync command would freeze the settings pane for the length of that walk.
+    // The lock is still taken only for the write, never across the checks.
+    let to = tauri::async_runtime::spawn_blocking(move || data_root::plan(target.as_deref()))
+        .await
+        .map_err(|e| format!("the folder check crashed: {e}"))??;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let path = state.config_path.clone();
+    data_root::schedule(to, &mut cfg, &path)
 }
 
 /// Forget a data-folder move the user changed their mind about.
 #[tauri::command]
 fn cancel_data_move(state: tauri::State<AppState>) -> Result<String, String> {
-    data_root::cancel(&state.config_path)
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let path = state.config_path.clone();
+    data_root::cancel(&mut cfg, &path)
 }
 
 /// State of a pending or failed move, so the pane can show it.

@@ -711,7 +711,7 @@
         </div>
         ${!installed && !unrunnable ? `<p class="sp-note warn">The Chromium engine is not downloaded yet. Pick it, then install it below.</p>` : ''}
         ${pending ? `<p class="sp-note warn">You picked ${chosen === 'chromium' ? 'Chromium' : 'the system webview'}, but this window is still running ${runningChromium ? 'Chromium' : 'the system webview'}. The change applies when RustBox restarts — every open tab reloads then.</p>` : ''}
-        <p class="sp-note">This window is running: <code>${esc(e.running || 'unknown')}</code>. Switching is a restart, not a live switch: one process can only run one engine, because Chromium's library has to be loaded before the program's own code runs.</p>
+        <p class="sp-note">This window is running: <code>${esc(e.running || 'unknown')}</code>. Switching is a restart, not a live switch: one process can only run one engine, because Chromium's library has to be loaded before the program's own code runs. Your apps' sessions are carried across the restart — cookies, plus the storage a chat app keeps its device pairing in — so switching usually does not sign you out. A site that keeps its login somewhere else may still ask once.</p>
       </div>
 
       <div class="sp-card">
@@ -3191,8 +3191,16 @@
       // twice, so it says so by being disabled instead of failing on click.
       const value = target ? target.value.trim() : '';
       const alreadyDefault = !!(current && !current.moved);
-      apply.disabled = custom ? (!value || (current && value === current.root)) : alreadyDefault;
-      apply.textContent = custom ? 'Move on next start' : 'Use the default folder';
+      // A move already queued for this exact folder is not something to ask
+      // again: saying "Move on next start" after it was scheduled reads as
+      // "the click did nothing".
+      const queued = !!(current && current.pending && value && value === current.pending);
+      apply.disabled = custom
+        ? (!value || (current && value === current.root) || queued)
+        : alreadyDefault;
+      apply.textContent = queued
+        ? 'Move is queued'
+        : (custom ? 'Move on next start' : 'Use the default folder');
     };
 
     const refresh = () => {
@@ -3204,12 +3212,17 @@
             defaultDesc.textContent = m.defaultRoot || 'The folder RustBox uses unless you move it.';
           }
           // Reflect where the data actually is, so the radios open on the truth
-          // rather than always on "Default folder".
+          // rather than always on "Default folder". A queued move counts as the
+          // answer the user gave: flipping the radio back to "Default folder"
+          // until the restart made a successful save look like it did nothing.
           const moved = card.querySelector('input[value="custom"]');
           const dflt = card.querySelector('input[value="default"]');
           if (m.moved) {
             if (moved) moved.checked = true;
             if (target && !target.value) target.value = m.root || '';
+          } else if (m.pending) {
+            if (moved) moved.checked = true;
+            if (target && !target.value) target.value = m.pending;
           } else if (dflt) {
             dflt.checked = true;
           }

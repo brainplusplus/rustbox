@@ -82,6 +82,10 @@ windows-sys = { version = "0.61", features = [
     # Reading the WebView2 `BrowserExecutableFolder` policy, so a runtime pin
     # never overrides a folder an administrator deliberately selected.
     "Win32_System_Registry",
+    # `GetDiskFreeSpaceExW`, so a data-folder move can be refused at the moment
+    # the user picks the folder instead of half-copying 12 GB onto a small disk
+    # and only then failing at the next start.
+    "Win32_Storage_FileSystem",
     # `CryptProtectData`/`BCrypt*` for the cross-engine cookie migration: the
     # cookie key is DPAPI-wrapped and the values are AES-256-GCM, and Windows'
     # own CNG is the only AES in the dependency graph.

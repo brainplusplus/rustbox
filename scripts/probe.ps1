@@ -391,10 +391,27 @@ window.__TAURI__ = {
       // The Data folder card is part of General, so it asks for this on open.
       // Without a stub it paints "Could not read the data folder state", which
       // is indistinguishable from a real failure.
-      case 'data_move_state': return {
+      case 'data_move_state': return window.__probeDataMove || {
         pending: null, error: null, reverted: null,
         root: 'C:\\x', defaultRoot: 'C:\\x', moved: false
       };
+      // Recording a move has to show up in the next `data_move_state`, the way
+      // the real backend keeps it in the live config. A stub that forgot would
+      // hide the bug this covers: after a successful save the pane reported
+      // "nothing queued" and the radios fell back to "Default folder".
+      case 'move_data_folder': {
+        window.__probeDataMove = {
+          pending: args.target, error: null, reverted: null,
+          root: 'C:\\x', defaultRoot: 'C:\\x', moved: false
+        };
+        (window.__probeDataMoves = window.__probeDataMoves || []).push(args.target);
+        return `RustBox will move its data to ${args.target} the next time it starts.`;
+      }
+      case 'cancel_data_move': {
+        window.__probeDataMove = null;
+        return 'The move was cancelled. Nothing was copied.';
+      }
+      case 'pick_data_folder': return 'D:\\RustBoxData';
       // The engine picker now lives inside General, so the pane reads this on
       // open. A null here would render the "could not read the engine state"
       // card and hide the controls the probe is meant to see.
