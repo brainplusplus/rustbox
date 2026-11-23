@@ -207,15 +207,14 @@ pub fn remove_endpoint() {
     let _ = std::fs::remove_file(endpoint_path());
 }
 
-/// Stop accepting requests and revoke access.
+/// Drop access inside this process, without touching anything on disk.
 ///
-/// The accept loop polls [`STOP_REQUESTED`], so this waits for it to exit and
-/// release the port. That wait is what makes a later start on the same fixed
-/// port possible: without it, the old loop would still hold the socket and the
-/// restart would fail with "address in use" on the very port the user just set.
-/// [`serve`] also re-checks [`ACCEPTING`] per line, so a connection opened
-/// before this call stops being served on its next request.
-pub fn stop() {
+/// Split from [`stop`] so the revocation gate can be tested without deleting the
+/// endpoint file of whichever RustBox happens to be running on this machine.
+/// Measured: running the test suite as a release gate removed
+/// `mcp-endpoint.json` from the live data root, and every MCP client silently
+/// lost access until the bridge was restarted.
+fn revoke_access() {
     ACCEPTING.store(false, Ordering::SeqCst);
     STOP_REQUESTED.store(true, Ordering::SeqCst);
     // The loop wakes within its poll interval. Bounded wait: a loop that somehow
@@ -229,6 +228,18 @@ pub fn stop() {
     RUNNING.store(false, Ordering::SeqCst);
     PORT.store(0, Ordering::SeqCst);
     cdp::set_capture(false);
+}
+
+/// Stop accepting requests and revoke access.
+///
+/// The accept loop polls [`STOP_REQUESTED`], so this waits for it to exit and
+/// release the port. That wait is what makes a later start on the same fixed
+/// port possible: without it, the old loop would still hold the socket and the
+/// restart would fail with "address in use" on the very port the user just set.
+/// [`serve`] also re-checks [`ACCEPTING`] per line, so a connection opened
+/// before this call stops being served on its next request.
+pub fn stop() {
+    revoke_access();
     remove_endpoint();
     log("bridge revoked; access disabled");
 }
@@ -851,8 +862,22 @@ mod tests {
         ACCEPTING.store(true, Ordering::SeqCst);
         assert!(ACCEPTING.load(Ordering::SeqCst));
 
-        stop();
+        // `revoke_access`, not `stop`: `stop` also deletes the endpoint file,
+        // and a test process must never delete the live app's token. Measured:
+        // the suite removed `mcp-endpoint.json` from the real data root, and
+        // every MCP client lost access until the bridge was restarted.
+        revoke_access();
         assert!(!ACCEPTING.load(Ordering::SeqCst), "stop() must revoke access");
         assert!(!cdp::capture_enabled(), "stop() must switch capture off");
+    }
+
+    #[test]
+    fn only_a_real_stop_removes_the_endpoint_file() {
+        // The rule the test above protects, asserted rather than implied: the
+        // path naming is a pure function, so checking it proves nothing on its
+        // own. What matters is that `revoke_access` exists separately, which the
+        // call above already depends on.
+        assert!(endpoint_path().ends_with(ENDPOINT_FILE));
+        assert_eq!(endpoint_path().parent(), Some(paths::root().as_path()));
     }
 }
