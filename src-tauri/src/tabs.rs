@@ -312,6 +312,50 @@ fn resolve_for(handle: &tauri::AppHandle, app: &App) -> Resolved {
   crate::settings::resolve(&cfg.settings, app, index)
 }
 
+/// Where the main window's client area starts on screen, in physical pixels.
+///
+/// Deliberately not `inner_position()`. That call answers correctly on the
+/// WebView2 runtime and answers nothing at all on the Chromium one:
+/// `tauri-runtime-cef` maps it to winit's `surface_position`, whose Windows
+/// implementation is `GetClientRect` — a rectangle whose origin is `(0, 0)` by
+/// definition, so the value never carries a screen position. Measured on the
+/// CEF build: every tab overlay landed exactly one title bar (23 px) above the
+/// content rect and therefore covered the sub-tab strip, which still occupied
+/// its space and showed only a sliver of itself.
+///
+/// The frame is centred horizontally and the title bar takes whatever height is
+/// left, which is how winit itself turns an outer rectangle into a client
+/// origin. Checked against `ClientToScreen` on a maximized window: outer
+/// `-8,-8 1936x1048`, client `0,23 1920x1009`, and the arithmetic below
+/// reproduces `0,23` exactly.
+fn client_origin(win: &WebviewWindow) -> Result<(i32, i32), String> {
+  let outer = win.outer_position().map_err(|e| e.to_string())?;
+  let outer_size = win.outer_size().map_err(|e| e.to_string())?;
+  let inner_size = win.inner_size().map_err(|e| e.to_string())?;
+  Ok(client_offset(
+    (outer.x, outer.y),
+    (outer_size.width, outer_size.height),
+    (inner_size.width, inner_size.height),
+  ))
+}
+
+/// Turn an outer rectangle into the client origin.
+///
+/// Split out from [`client_origin`] because this arithmetic is the part that can
+/// be wrong, and it can be checked without a live window.
+fn client_offset(
+  outer: (i32, i32),
+  outer_size: (u32, u32),
+  inner_size: (u32, u32),
+) -> (i32, i32) {
+  let border_x = outer_size.0.saturating_sub(inner_size.0) / 2;
+  let border_y = outer_size
+    .1
+    .saturating_sub(inner_size.1)
+    .saturating_sub(border_x);
+  (outer.0 + border_x as i32, outer.1 + border_y as i32)
+}
+
 /// Content rect (logical CSS px) -> physical screen rect, relative to the main
 /// window's client area (the main webview fills the client area exactly).
 fn content_rect_physical(
@@ -322,10 +366,10 @@ fn content_rect_physical(
   height: f64,
 ) -> Result<(i32, i32, u32, u32), String> {
   let scale = main.scale_factor().map_err(|e| e.to_string())?;
-  let inner = main.inner_position().map_err(|e| e.to_string())?;
+  let (origin_x, origin_y) = client_origin(main)?;
   Ok((
-    inner.x + (x * scale).round() as i32,
-    inner.y + (y * scale).round() as i32,
+    origin_x + (x * scale).round() as i32,
+    origin_y + (y * scale).round() as i32,
     (width * scale).round() as u32,
     (height * scale).round() as u32,
   ))
@@ -3028,11 +3072,12 @@ pub fn ctx_menu_window(
   // later.
   const MH_MAX_CSS: f64 = 460.0;
   // `x`/`y` arrive as CSS px relative to the main window's client area, so the
-  // client origin (inner_position, physical px) is the right anchor, and the
-  // offsets must be scaled by the DPI factor before adding them.
-  let inner = main.inner_position().map_err(|e| e.to_string())?;
-  let sx = inner.x + (x as f64 * scale).round() as i32;
-  let sy = inner.y + (y as f64 * scale).round() as i32;
+  // client origin (physical px) is the right anchor, and the offsets must be
+  // scaled by the DPI factor before adding them. `client_origin` rather than
+  // `inner_position`, which the Chromium runtime cannot answer (see its doc).
+  let (origin_x, origin_y) = client_origin(&main)?;
+  let sx = origin_x + (x as f64 * scale).round() as i32;
+  let sy = origin_y + (y as f64 * scale).round() as i32;
   let (mon_x, mon_y, mon_w, mon_h) = monitor_bounds(&main);
   // Open to the right of / level with the cursor, like a native tray menu. The
   // vertical clamp is applied again in `ctx_menu_fit`, against the real height.
@@ -3940,5 +3985,46 @@ mod registry_lock_tests {
       "list_tabs must carry the surfaces out of the lock and read their \
        visibility afterwards, instead of asking a window while the registry is held"
     );
+  }
+}
+
+/// The tab overlays are positioned from the main window's client origin, and the
+/// Chromium runtime cannot report that origin.
+///
+/// `tauri-runtime-cef` implements `inner_position` as winit's
+/// `surface_position`, which is `GetClientRect`: a rectangle whose origin is
+/// `(0, 0)` by definition, so the answer is a screen position only by accident
+/// and never on the engine that matters here. Using it put every tab overlay one
+/// title bar too high — measured 23 px — so the strip under the toolbar was
+/// covered by the page it belonged to and looked missing.
+#[cfg(test)]
+mod client_origin_tests {
+  use super::client_offset;
+
+  /// The measured maximized window from the user's machine: outer `-8,-8`
+  /// `1936x1048`, client `1920x1009` starting at `0,23` on screen.
+  #[test]
+  fn a_maximized_window_resolves_to_its_real_client_origin() {
+    assert_eq!(client_offset((-8, -8), (1936, 1048), (1920, 1009)), (0, 23));
+  }
+
+  /// A plain windowed app: 8 px of border on each side, 31 px of title bar.
+  #[test]
+  fn a_windowed_frame_centres_the_border_and_puts_the_rest_on_top() {
+    assert_eq!(client_offset((100, 100), (1000, 700), (984, 661)), (108, 131));
+  }
+
+  /// A borderless window has no frame at all, so the origin is the outer one.
+  #[test]
+  fn a_decorless_window_has_no_offset() {
+    assert_eq!(client_offset((40, 40), (800, 600), (800, 600)), (40, 40));
+  }
+
+  /// A client larger than its frame cannot happen on Windows, but the
+  /// arithmetic must not turn a surprise into a negative offset that throws the
+  /// overlays off screen.
+  #[test]
+  fn a_client_bigger_than_its_frame_falls_back_to_no_offset() {
+    assert_eq!(client_offset((10, 10), (500, 400), (600, 500)), (10, 10));
   }
 }
