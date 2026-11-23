@@ -63,7 +63,7 @@
      a monochrome glyph) reads as a missing app rather than a closed one. The
      resting fill is one step below `--surface-2`, which is what the selected
      socket uses, so "idle" and "open" stay legible as different states. */
-  .app-icon-btn { position: relative; flex: 0 0 auto; width: 44px; height: 44px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; background: var(--icon-socket); box-shadow: inset 0 0 0 1px var(--tile-edge); transition: background .15s, box-shadow .15s, transform .1s; -webkit-user-drag: element; user-select: none; }
+  .app-icon-btn { position: relative; flex: 0 0 auto; width: 44px; height: 44px; border-radius: var(--radius); display: flex; align-items: center; justify-content: center; background: var(--icon-socket); box-shadow: inset 0 0 0 1px var(--tile-edge); transition: background .15s, box-shadow .15s, transform .1s; -webkit-user-drag: none; user-select: none; }
   .app-icon-btn:hover { background: var(--icon-socket-hover); box-shadow: inset 0 0 0 1px var(--border); }
   .app-icon-btn:active { transform: scale(.92); }
   .app-icon-btn.active { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border); }
@@ -812,17 +812,6 @@ function activeTabIdOf(appId) {
   return appTabs(appId)?.active || 'main';
 }
 
-// The sub-tab being dragged, if any. Kept beside the sidebar's own `dragId`
-// rather than shared: a sidebar drag must never look like a strip drag, or
-// dropping an app icon on a chip would try to reorder a tab.
-let subDragId = null;
-
-// Drop markers are one state, so they are cleared everywhere before one is set.
-function clearSubDropMarkers() {
-  document.querySelectorAll('.sub-tab.drop-before, .sub-tab.drop-after')
-    .forEach(el => el.classList.remove('drop-before', 'drop-after'));
-}
-
 // Drop every navigation fact about an app, all its sub-tabs included. Called
 // when the app's windows are gone: keeping the entries would let a reopened tab
 // show the URL it had before it was closed.
@@ -843,8 +832,10 @@ let activeId = null;
 // The tab that was open when the window last closed, so a restart lands where
 // the user left off instead of always jumping to the first sidebar entry.
 let lastActiveId = null;
-// App id currently being dragged in the sidebar, or null.
-let dragId = null;
+// When the last pointer reorder ended. The `click` that follows a reorder must
+// not also activate the item that was just moved.
+let dragEndedAt = 0;
+const dragJustEnded = () => Date.now() - dragEndedAt < 350;
 let editingId = null; // null = new
 let firstRun = false;
 
@@ -896,59 +887,128 @@ function iconHtml(app, cls) {
 function renderSidebar() {
   const list = $('#app-list');
   list.innerHTML = apps.map((a, i) => `
-    <button class="app-icon-btn ${a.id === activeId ? 'active' : ''} ${a.enabled === false ? 'disabled' : ''}" data-id="${esc(a.id)}" data-index="${i}" draggable="true" title="${esc(a.name)}${a.enabled === false ? ' (disabled)' : ''}">
+    <button class="app-icon-btn ${a.id === activeId ? 'active' : ''} ${a.enabled === false ? 'disabled' : ''}" data-id="${esc(a.id)}" data-index="${i}" title="${esc(a.name)}${a.enabled === false ? ' (disabled)' : ''}">
       ${iconHtml(a, '')}
     </button>`).join('');
   list.querySelectorAll('.app-icon-btn').forEach(btn => {
-    btn.addEventListener('click', () => activate(btn.dataset.id));
+    btn.addEventListener('click', () => {
+      // The pointerup that ends a reorder is also the first half of a click.
+      if (dragJustEnded()) return;
+      activate(btn.dataset.id);
+    });
     btn.addEventListener('contextmenu', (e) => { e.preventDefault(); openCtxMenu(apps.find(a => a.id === btn.dataset.id), e.clientX, e.clientY); });
   });
-  // Drag state lives on the element, so a re-render (which rebuilds the buttons)
-  // cannot leave a stale handler pointing at a removed node.
-  list.querySelectorAll('.app-icon-btn').forEach(btn => {
-    btn.draggable = true;
-    btn.addEventListener('dragstart', (e) => {
-      dragId = btn.dataset.id;
-      // The drag image is the button itself; without setting data the drop
-      // target cannot tell a reorder from a drag out of the window.
-      e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', dragId); } catch (_) {}
-      btn.classList.add('dragging');
-    });
-    btn.addEventListener('dragend', () => {
-      dragId = null;
-      clearDropMarkers();
-      btn.classList.remove('dragging');
-    });
-    btn.addEventListener('dragover', (e) => {
-      if (!dragId || dragId === btn.dataset.id) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      // Which side of the target the pointer is on decides insert-before or
-      // insert-after, so dropping on the lower half moves the icon down.
-      const r = btn.getBoundingClientRect();
-      const after = e.clientY > r.top + r.height / 2;
-      clearDropMarkers();
-      btn.classList.add(after ? 'drop-after' : 'drop-before');
-    });
-    btn.addEventListener('dragleave', () => btn.classList.remove('drop-before', 'drop-after'));
-    btn.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      const from = dragId;
-      clearDropMarkers();
-      if (!from || from === btn.dataset.id) return;
-      const r = btn.getBoundingClientRect();
-      const after = e.clientY > r.top + r.height / 2;
-      await reorderApp(from, btn.dataset.id, after);
-    });
+  // The order is changed from pointer events, not HTML5 drag and drop, because
+  // the CEF engine never delivers the `drop` that the native drag loop owes the
+  // page (see `enablePointerReorder`). The handler lives on the list, so a
+  // re-render of the buttons cannot leave a stale one behind.
+  enablePointerReorder({
+    container: list,
+    itemSelector: '.app-icon-btn',
+    horizontal: false,
+    commit: (from, to, after) => reorderApp(from.dataset.id, to.dataset.id, after),
   });
 }
 
-// Drop marker highlight is a single state, so it is cleared everywhere before
-// being applied to one button; otherwise two markers can stay lit.
-function clearDropMarkers() {
-  document.querySelectorAll('.app-icon-btn.drop-before, .app-icon-btn.drop-after')
+// Reorder a list from pointer events instead of HTML5 drag and drop.
+//
+// Chromium's HTML5 drag and drop needs the browser process to run the OS drag
+// loop and hand the drop back to the page. Under the CEF engine that loop
+// reports `dragstart` and `dragover` and then never reports `drop`, so a drag
+// looks live and commits nothing; the WebView2 build never showed it because
+// that engine completes the loop. Pointer events reach the page in both
+// engines, so the reorder is driven from those instead: press, move past a small
+// threshold to paint the insert marker, release to commit.
+function enablePointerReorder({ container, itemSelector, horizontal, canStart, commit }) {
+  // One set of listeners per container. The sidebar list is rebuilt on every
+  // render and the tab strip re-renders constantly, so attaching per item would
+  // stack duplicate handlers.
+  if (container.dataset.pointerReorder) return;
+  container.dataset.pointerReorder = 'on';
+
+  let source = null;      // item being dragged
+  let target = null;      // item under the pointer
+  let insertAfter = false;
+  let started = false;    // threshold crossed, so this is a drag and not a click
+  let originX = 0;
+  let originY = 0;
+
+  const clearMarkers = () => container
+    .querySelectorAll('.drop-before, .drop-after')
     .forEach(el => el.classList.remove('drop-before', 'drop-after'));
+
+  const reset = () => {
+    if (source) source.classList.remove('dragging');
+    clearMarkers();
+    source = null;
+    target = null;
+    started = false;
+  };
+
+  container.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const el = e.target.closest(itemSelector);
+    if (!el || !container.contains(el)) return;
+    if (canStart && !canStart(el)) return;
+    source = el;
+    target = null;
+    started = false;
+    originX = e.clientX;
+    originY = e.clientY;
+  });
+
+  // Moves and the release are listened for on the window: once the pointer
+  // leaves the list, the item under it is still whatever the cursor is over, and
+  // a release outside the list must still end the drag instead of leaving it
+  // stuck.
+  window.addEventListener('pointermove', (e) => {
+    if (!source) return;
+    if (!started) {
+      // A few pixels of slack keep a plain click a click.
+      if (Math.hypot(e.clientX - originX, e.clientY - originY) < 4) return;
+      started = true;
+      source.classList.add('dragging');
+      // Keep receiving the moves once the pointer leaves the item.
+      try { source.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const hit = under && under.closest(itemSelector);
+    if (!hit || hit === source || !container.contains(hit)) {
+      clearMarkers();
+      target = null;
+      return;
+    }
+    const r = hit.getBoundingClientRect();
+    // Which half of the target the pointer is on decides insert-before or
+    // insert-after, so dropping on the far half moves the item past it.
+    const after = horizontal
+      ? e.clientX > r.left + r.width / 2
+      : e.clientY > r.top + r.height / 2;
+    if (hit === target && after === insertAfter) return;
+    clearMarkers();
+    target = hit;
+    insertAfter = after;
+    hit.classList.add(after ? 'drop-after' : 'drop-before');
+  });
+
+  const finish = (dropped) => {
+    const from = source;
+    const to = target;
+    const after = insertAfter;
+    const moved = started && dropped && !!to && to !== from;
+    reset();
+    if (!moved) return;
+    commit(from, to, after);
+    // The release still produces a click on the item, which would otherwise
+    // activate the app or tab that was just moved.
+    dragEndedAt = Date.now();
+  };
+
+  window.addEventListener('pointerup', () => finish(true));
+  window.addEventListener('pointercancel', () => finish(false));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && source) finish(false);
+  });
 }
 
 /// Move `fromId` next to `toId` and persist the new order.
@@ -2778,7 +2838,6 @@ function renderTabStrip() {
       : `<button class="st-close" data-close="${esc(t.id)}" title="Close tab" tabindex="-1">&times;</button>`;
     return `<div class="sub-tab${active ? ' active' : ''}${t.pinned ? ' pinned' : ''}"
       role="tab" aria-selected="${active}" data-tab="${esc(t.id)}" title="${esc(label)}"
-      draggable="${t.pinned ? 'false' : 'true'}"
       >${lead}<span class="st-label">${esc(label)}</span>${close}</div>`;
   }).join('') + `<button id="tab-add" title="New tab in ${esc(app.name)}" aria-label="New tab">+</button>`;
   if (markup === tabStripMarkup) return;
@@ -2789,6 +2848,8 @@ function renderTabStrip() {
     const tabId = chip.dataset.tab;
     chip.addEventListener('click', (e) => {
       if (e.target.closest('[data-close]')) return;
+      // The pointerup that ends a reorder is also the first half of a click.
+      if (dragJustEnded()) return;
       if (tabId === activeTabIdOf(app.id)) return;
       invoke('activate_sub_tab', { appId: app.id, tabId }).catch(() => {});
     });
@@ -2800,42 +2861,26 @@ function renderTabStrip() {
       e.stopPropagation();
       openCtxMenu(app, e.clientX, e.clientY, tabId);
     });
-    // The first tab is the app itself, so it is not draggable: it is the anchor
-    // the rest of the strip is ordered against, exactly like the sidebar's own
-    // entry. Everything after it can be moved.
-    if (chip.classList.contains('pinned')) return;
-    chip.addEventListener('dragstart', (e) => {
-      subDragId = tabId;
-      e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', tabId); } catch (_) {}
-      chip.classList.add('dragging');
-    });
-    chip.addEventListener('dragend', () => {
-      subDragId = null;
-      clearSubDropMarkers();
-      chip.classList.remove('dragging');
-    });
-    chip.addEventListener('dragover', (e) => {
-      if (!subDragId || subDragId === tabId) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      const r = chip.getBoundingClientRect();
-      const after = e.clientX > r.left + r.width / 2;
-      clearSubDropMarkers();
-      chip.classList.add(after ? 'drop-after' : 'drop-before');
-    });
-    chip.addEventListener('dragleave', () => chip.classList.remove('drop-before', 'drop-after'));
-    chip.addEventListener('drop', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const from = subDragId;
-      clearSubDropMarkers();
-      if (!from || from === tabId) return;
-      const r = chip.getBoundingClientRect();
-      const after = e.clientX > r.left + r.width / 2;
-      invoke('reorder_sub_tab', { appId: app.id, tabId: from, targetId: tabId, after })
-        .catch((err) => showStrip(String(err?.message || err)));
-    });
+  });
+  // The first tab is the app itself, so it is not draggable: it is the anchor
+  // the rest of the strip is ordered against, exactly like the sidebar's own
+  // entry. Everything after it can be moved. Pointer events, not HTML5 drag and
+  // drop: the CEF engine never delivers the `drop` the native loop owes the page.
+  enablePointerReorder({
+    container: strip,
+    itemSelector: '.sub-tab',
+    horizontal: true,
+    canStart: (el) => !el.classList.contains('pinned'),
+    commit: (from, to, after) => {
+      const app = apps.find(a => a.id === activeId);
+      if (!app) return;
+      invoke('reorder_sub_tab', {
+        appId: app.id,
+        tabId: from.dataset.tab,
+        targetId: to.dataset.tab,
+        after,
+      }).catch((err) => showStrip(String(err?.message || err)));
+    },
   });
   strip.querySelectorAll('[data-close]').forEach(btn => {
     btn.addEventListener('click', (e) => {

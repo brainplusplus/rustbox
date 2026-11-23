@@ -62,6 +62,31 @@ for (const file of ['link-choice.html']) {
   }
 }
 
+// ---- reordering: pointer events, not HTML5 drag and drop ---------------
+// The CEF engine reports `dragstart`/`dragover` to the page but never the
+// `drop` the OS drag loop owes it, so a drag-and-drop reorder looks alive and
+// commits nothing. Both lists therefore reorder from pointer events, and a
+// reintroduced HTML5 drag handler would silently break reordering on CEF again.
+if (!/function enablePointerReorder\(/.test(js)) {
+  fail('ui/index.html has no enablePointerReorder(), so the lists cannot be reordered on CEF');
+}
+for (const surface of ['app-list', 'tab-strip']) {
+  if (!new RegExp(`container:\\s*(list|strip)`).test(js)) {
+    fail('enablePointerReorder() is not wired to a list container');
+  }
+}
+for (const handler of ['dragstart', 'dragover', 'dragend']) {
+  if (new RegExp(`addEventListener\\('${handler}'`).test(js)) {
+    fail(
+      `ui/index.html still listens for '${handler}' to reorder: the CEF engine never ` +
+        'delivers the matching drop, so that path cannot commit a reorder',
+    );
+  }
+}
+if (/draggable="true"/.test(html)) {
+  fail('ui/index.html marks an element draggable="true"; reordering does not use HTML5 drag and drop');
+}
+
 // ---- the three surfaces are wired --------------------------------------
 // A missing one leaves a button that does nothing, which is worse than no
 // button at all.
