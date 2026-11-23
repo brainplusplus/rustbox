@@ -84,7 +84,43 @@ pub fn apply(builder: tauri::Builder) -> tauri::Builder {
             cef = cef.command_line_arg(key, value);
         }
     }
+    for (key, value) in cef_only_switches() {
+        cef = cef.command_line_arg(key, value);
+    }
     builder.runtime(cef)
+}
+
+/// Per-profile ceiling for the Chromium HTTP disk cache, in bytes.
+///
+/// Kept as a named constant so the reasoning below has one number to point at.
+const DISK_CACHE_MAX_BYTES: u32 = 128 * 1024 * 1024;
+
+/// Switches that belong to the Chromium build only.
+///
+/// They stay out of `webview_args::BASE` for two reasons: that constant is
+/// mirrored into `tauri.conf.json` and pinned by a test, and WebView2 already
+/// caps its own cache budget, so the switch would be noise in the default build.
+///
+/// `--disk-cache-size`: Chromium has no upper bound on the HTTP disk cache by
+/// default — it grows to roughly 320 MiB per cache backend and stays there.
+/// RustBox gives every app its own backend (`root_cache_path` plus a per-app
+/// request-context cache), so the ceiling multiplies by the number of apps and a
+/// runaway cache in one profile only shows up as a very large `Cache` folder and
+/// a steady stream of rewrites. Measured on this machine: ~14 MB typical, 98 MB
+/// peak, so 128 MiB leaves a healthy profile untouched and only trims the ones
+/// that would otherwise keep growing.
+///
+/// This does *not* address the IndexedDB churn that dominates writes: that is a
+/// site database, not the HTTP cache.
+///
+/// Compiled in both builds so the default build's test run can pin its value;
+/// only the CEF build applies it.
+#[cfg_attr(not(feature = "cef"), allow(dead_code))]
+fn cef_only_switches() -> Vec<(&'static str, Option<String>)> {
+    vec![(
+        "--disk-cache-size",
+        Some(DISK_CACHE_MAX_BYTES.to_string()),
+    )]
 }
 
 /// Register the profile a tab should be created in.
@@ -130,4 +166,48 @@ pub fn clear_profile_name(label: &str) {
 #[cfg(feature = "cef")]
 pub fn app_data_directory(app_id: &str) -> Option<std::path::PathBuf> {
     Some(crate::paths::ensure(crate::paths::cef_profile(app_id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared string is mirrored into `tauri.conf.json`, where an extra
+    /// switch would be harmless on WebView2 but wrong to carry. Keeping the CEF
+    /// switches in their own list is what makes that impossible.
+    #[test]
+    fn cef_only_switches_do_not_leak_into_the_shared_string() {
+        for (key, _) in cef_only_switches() {
+            assert!(
+                !crate::webview_args::BASE.contains(key),
+                "{key} must stay out of webview_args::BASE"
+            );
+        }
+    }
+
+    /// A ceiling at or above Chromium's own default would be ignored, and one
+    /// far below the working set would evict on every request and cause the very
+    /// write amplification this switch is meant to reduce.
+    #[test]
+    fn disk_cache_ceiling_is_below_the_default_and_above_the_working_set() {
+        let switches = cef_only_switches();
+        let (_, value) = switches
+            .iter()
+            .find(|(key, _)| *key == "--disk-cache-size")
+            .expect("the HTTP cache ceiling is applied");
+        let bytes: u64 = value
+            .as_deref()
+            .expect("--disk-cache-size takes a byte count")
+            .parse()
+            .expect("the ceiling is a plain number of bytes");
+        assert_eq!(bytes, u64::from(DISK_CACHE_MAX_BYTES));
+        assert!(
+            bytes <= 320 * 1024 * 1024,
+            "Chromium already caps at ~320 MiB; a larger value would never apply"
+        );
+        assert!(
+            bytes >= 64 * 1024 * 1024,
+            "under 64 MiB the cache evicts constantly and writes more, not less"
+        );
+    }
 }
