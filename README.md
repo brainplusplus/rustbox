@@ -139,6 +139,7 @@ adjectives:
 | [0006](docs/adr/0006-webview2-runtime-pinning.md) | pinning the WebView2 runtime |
 | [0007](docs/adr/0007-remember-open-sub-tabs.md) | remembering open sub-tabs |
 | [0008](docs/adr/0008-data-folder-move-window.md) | moving the data folder, with a window that shows it |
+| [0009](docs/adr/0009-cef-shutdown-drain.md) | the CEF quit crash, and draining CEF before shutdown |
 
 ## Status
 

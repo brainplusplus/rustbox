@@ -153,5 +153,15 @@ required-features = ["cef"]
 # Maintenance: when Tauri is upgraded, re-copy the new tauri-runtime-wry version
 # here and re-apply the patch (search for "rustbox patch"). Delete this block
 # once upstream ships profile support.
+#
+# The CEF runtime is patched for a different reason: its `run()` called
+# `cef::shutdown()` as soon as winit's loop returned, while CEF's queued
+# UI-thread teardown work had nothing left to pump it. With real app profiles
+# that faulted inside `libcef` on roughly every third quit, and the torn LevelDB
+# logged users out of apps. The vendored copy adds a drain before shutdown; see
+# `docs/adr/0009-cef-shutdown-drain.md` and
+# `vendor/tauri-runtime-cef/README.rustbox-patch.md` (which lists the exact
+# changes to re-apply on upgrade).
 [patch.crates-io]
 tauri-runtime-wry = { path = "../vendor/tauri-runtime-wry" }
+tauri-runtime-cef = { path = "../vendor/tauri-runtime-cef" }
