@@ -602,7 +602,7 @@
 
       <div class="sp-card" id="sp-datamove">
         <h3>Data folder</h3>
-        <p class="sp-note">RustBox keeps every app session, the config and the downloaded engine in one folder. Moving it takes a restart, because the browser holds its cookie database open for as long as a window exists — copying it live would give a torn copy.</p>
+        <p class="sp-note">RustBox keeps every app session and the config in one folder. Moving it takes a restart, because the browser holds its cookie database open for as long as a window exists — copying it live would give a torn copy. The engine itself is a program, so it stays where it is installed and is never copied.</p>
         <p class="sp-note" id="sp-move-state">Loading…</p>
         <div class="sp-choices">
           <label class="sp-choice on">

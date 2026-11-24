@@ -573,7 +573,9 @@ pub fn validate_target(from: &Path, to: &Path) -> Result<(), String> {
 /// Whether the folder can receive the data without mixing two workspaces.
 ///
 /// An empty folder is fine, and so is one holding only the locator: that is the
-/// default location on the way back from a moved root.
+/// default location on the way back from a moved root. The engine tree is not
+/// workspace data either, so a default root that still holds its installed
+/// engine is a valid target - refusing it would make the move one-way.
 fn free_for_use(dir: &Path) -> Result<bool, String> {
     if !dir.exists() {
         return Ok(true);
@@ -585,7 +587,8 @@ fn free_for_use(dir: &Path) -> Result<bool, String> {
         // The move's own bookkeeping does not count as "someone else's files":
         // the locator, an error note, and the result of the move that is being
         // retried all live beside the data they describe.
-        if is_bookkeeping(&entry.file_name()) {
+        let name = entry.file_name();
+        if is_bookkeeping(&name) || is_engine_tree(&name) {
             continue;
         }
         return Ok(false);
@@ -702,7 +705,10 @@ fn rollback_result(to: &Path) -> std::io::Result<()> {
     let entries = std::fs::read_dir(to)?;
     let mut first: Option<std::io::Error> = None;
     for entry in entries.flatten() {
-        if is_bookkeeping(&entry.file_name()) {
+        let name = entry.file_name();
+        // The engine tree is a program, not data: undoing a copy must not take
+        // it with it, and on a first move the old root *is* where it lives.
+        if is_bookkeeping(&name) || is_engine_tree(&name) {
             continue;
         }
         let path = entry.path();
@@ -727,8 +733,16 @@ fn rollback_result(to: &Path) -> std::io::Result<()> {
 /// exactly the folder a first move deletes. Removing the folder would take the
 /// pointer with it, and the next launch would find no locator and start on an
 /// empty default folder while the user's data sat in the target.
+///
+/// The same applies to the engine tree, whose base folder is the default root:
+/// deleting that folder wholesale would either fail halfway (the running
+/// engine's own `.exe` is open) or, worse, remove an install that no later
+/// start would restore. When either lives there, the folder is emptied entry by
+/// entry instead of removed.
 fn remove_old_root(current: &Path, locator_dir: &Path) -> std::io::Result<()> {
-    if key(locator_dir) == key(current) {
+    let engines = crate::paths::engines_dir();
+    let engines_inside = key(&engines).starts_with(&format!("{}\\", key(current)));
+    if key(locator_dir) == key(current) || engines_inside {
         rollback_result(current)
     } else {
         std::fs::remove_dir_all(current)
@@ -960,9 +974,13 @@ fn move_root_tracked(
 }
 
 /// Every file under `dir` and its total length, so a copy can be checked rather
-/// than trusted. Bookkeeping files are excluded, since [`copy_tree`] leaves them
-/// behind and the counts would never match.
+/// than trusted. Bookkeeping files and the engine tree are excluded, since
+/// [`copy_tree_tracked`] leaves them behind and the counts would never match.
 fn manifest(dir: &Path) -> Result<MoveReport, String> {
+    manifest_in(dir, true)
+}
+
+fn manifest_in(dir: &Path, top: bool) -> Result<MoveReport, String> {
     let mut report = MoveReport {
         files: 0,
         bytes: 0,
@@ -972,7 +990,7 @@ fn manifest(dir: &Path) -> Result<MoveReport, String> {
     {
         let entry = entry.map_err(|e| format!("could not read {}: {e}", dir.display()))?;
         let name = entry.file_name();
-        if is_bookkeeping(&name) {
+        if is_bookkeeping(&name) || (top && is_engine_tree(&name)) {
             continue;
         }
         let path = entry.path();
@@ -980,7 +998,7 @@ fn manifest(dir: &Path) -> Result<MoveReport, String> {
             .file_type()
             .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
         if kind.is_dir() {
-            let inner = manifest(&path)?;
+            let inner = manifest_in(&path, false)?;
             report.files += inner.files;
             report.bytes += inner.bytes;
         } else if kind.is_file() {
@@ -1000,6 +1018,19 @@ fn is_bookkeeping(name: &std::ffi::OsStr) -> bool {
         || name == ERROR_FILE
         || name == RESULT_FILE
         || name == RUNNING_FILE
+}
+
+/// The installed engine tree, which is a program rather than workspace data.
+///
+/// It is neither copied nor counted: the binaries are the same bytes whatever
+/// folder the profiles are in, and they are 811 MB of a 9.0 GB tree. It is also
+/// never deleted - the engine running this very move has its own `.exe` open
+/// inside it, which is exactly what made the old folder undeletable.
+///
+/// Matched at the top level only: a profile tree cannot own this name, and a
+/// nested match would silently skip a folder a site happens to call `engines`.
+fn is_engine_tree(name: &std::ffi::OsStr) -> bool {
+    name == crate::paths::ENGINES_DIR
 }
 
 /// Why a copy pass ended early.
@@ -1032,7 +1063,7 @@ fn copy_tree_tracked(
         let entry =
             entry.map_err(|e| CopyStop::Failed(format!("could not read {}: {e}", from.display())))?;
         let name = entry.file_name();
-        if top && is_bookkeeping(&name) {
+        if top && (is_bookkeeping(&name) || is_engine_tree(&name)) {
             continue;
         }
         let src = entry.path();
@@ -1648,5 +1679,106 @@ mod tests {
             "an unrelated marker must not delete a folder"
         );
         assert!(!locator.join(RUNNING_FILE).exists(), "the marker is dropped");
+    }
+
+    #[test]
+    fn the_engine_tree_is_not_part_of_the_data_that_moves() {
+        // The engine is a program, not a profile: 811 MB of binaries on a 9.0 GB
+        // tree, the same bytes on every drive. Copying it made a move slower and
+        // left a duplicate the old folder could not delete while it was running.
+        let base = scratch("engines");
+        let from = base.join("from");
+        let to = base.join("to");
+        fs::create_dir_all(from.join("profiles/app-a")).unwrap();
+        fs::write(from.join("profiles/app-a/Cookies"), b"cookie").unwrap();
+        fs::write(from.join("config.json"), b"{}").unwrap();
+        fs::create_dir_all(from.join("engines/cef/154.0.34")).unwrap();
+        fs::write(from.join("engines/cef/154.0.34/libcef.dll"), vec![0u8; 4096]).unwrap();
+
+        let report = move_root(&from, &to).expect("the move ran");
+
+        assert_eq!(report.files, 2, "the cookie and the config, not the engine");
+        assert!(
+            !to.join("engines").exists(),
+            "the engine tree must not be copied to the new folder"
+        );
+        assert!(
+            to.join("profiles/app-a/Cookies").is_file(),
+            "the profiles did move"
+        );
+        assert!(
+            from.join("engines/cef/154.0.34/libcef.dll").is_file(),
+            "and the engine is still where it was"
+        );
+    }
+
+    #[test]
+    fn a_target_holding_only_the_engine_tree_can_receive_a_move() {
+        // Moving back to the default folder is a real path, and that folder holds
+        // the installed engine beside the locator. Refusing it would make the
+        // move one-way.
+        let base = scratch("engine-target");
+        let dir = base.join("root");
+        fs::create_dir_all(dir.join("engines/cef/154.0.34")).unwrap();
+        fs::write(dir.join("engines/cef/154.0.34/libcef.dll"), b"dll").unwrap();
+        fs::write(dir.join(crate::paths::LOCATOR), b"F:\\RustBox").unwrap();
+
+        assert_eq!(
+            free_for_use(&dir),
+            Ok(true),
+            "the engine tree is not someone else's data"
+        );
+
+        fs::write(dir.join("config.json"), b"{}").unwrap();
+        assert_eq!(
+            free_for_use(&dir),
+            Ok(false),
+            "a workspace file still blocks the move"
+        );
+    }
+
+    #[test]
+    fn deleting_the_old_root_keeps_the_engine_tree_and_the_locator() {
+        // A first move deletes the default root, which is where both the locator
+        // and the engine live. Removing the folder wholesale would take the
+        // pointer and the running engine's own files with it.
+        let base = scratch("old-root-engine");
+        let current = base.join("root");
+        fs::create_dir_all(current.join("engines/cef/154.0.34")).unwrap();
+        fs::write(current.join("engines/cef/154.0.34/libcef.dll"), b"dll").unwrap();
+        fs::create_dir_all(current.join("cef/app-a")).unwrap();
+        fs::write(current.join("cef/app-a/Cookies"), b"cookie").unwrap();
+        fs::write(current.join("config.json"), b"{}").unwrap();
+        fs::write(current.join(crate::paths::LOCATOR), b"F:\\RustBox").unwrap();
+
+        remove_old_root(&current, &current).expect("the old root was cleaned");
+
+        assert!(
+            current.join("engines/cef/154.0.34/libcef.dll").is_file(),
+            "the engine stays"
+        );
+        assert!(
+            current.join(crate::paths::LOCATOR).is_file(),
+            "so does the pointer to the new folder"
+        );
+        assert!(!current.join("cef").exists(), "the profiles are gone");
+        assert!(!current.join("config.json").exists(), "and so is the config");
+    }
+
+    #[test]
+    fn a_failed_copy_does_not_take_the_engine_tree_with_it() {
+        // Rolling a half-copied target back has to leave anything that is not
+        // data alone, for the same reason the old root keeps it.
+        let base = scratch("rollback-engine");
+        let dir = base.join("target");
+        fs::create_dir_all(dir.join("engines/cef/154.0.34")).unwrap();
+        fs::write(dir.join("engines/cef/154.0.34/libcef.dll"), b"dll").unwrap();
+        fs::create_dir_all(dir.join("cef/app-a")).unwrap();
+        fs::write(dir.join("cef/app-a/Cookies"), b"cookie").unwrap();
+
+        rollback_result(&dir).expect("the target was cleaned");
+
+        assert!(dir.join("engines/cef/154.0.34/libcef.dll").is_file());
+        assert!(!dir.join("cef").exists());
     }
 }

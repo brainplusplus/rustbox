@@ -67,6 +67,34 @@ pub fn debug_root() -> Option<PathBuf> {
     }
 }
 
+/// Name of the engine tree inside its base folder.
+pub const ENGINES_DIR: &str = "engines";
+
+/// Where the engine tree lives, deliberately *not* under [`root`].
+///
+/// An engine is a program, not data: the same `rustbox-cef.exe` and `libcef`
+/// serve whatever folder the profiles are in, and only one copy is ever
+/// installed. Resolving it from [`root`] made it part of the workspace, and a
+/// move then copied 811 MB of binaries, could never delete the old folder
+/// because the running engine holds its own `.exe` open, and left the app
+/// running from a tree the data root no longer named. Measured on a 9.0 GB
+/// move: `engines` was 811 MB of the copy and 770 MB of the 942 MB that could
+/// not be deleted.
+///
+/// Debug builds keep honouring `RB_DATA_ROOT`, so a fixture root still gets its
+/// own engine tree instead of sharing this machine's real install.
+pub fn engines_dir() -> PathBuf {
+    engines_dir_from(debug_root(), default_root())
+}
+
+/// The decision, without reading the environment, so it can be tested.
+fn engines_dir_from(debug: Option<PathBuf>, default: PathBuf) -> PathBuf {
+    match debug {
+        Some(dir) => dir.join(ENGINES_DIR),
+        None => default.join(ENGINES_DIR),
+    }
+}
+
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 static FALLBACK: OnceLock<Option<String>> = OnceLock::new();
 
@@ -535,6 +563,23 @@ mod tests {
         assert_eq!(sanitize("."), "app");
         assert_eq!(sanitize(""), "app");
         assert_eq!(sanitize("app-mvh086f6"), "app-mvh086f6");
+    }
+
+    #[test]
+    fn the_engine_tree_does_not_follow_the_data_root() {
+        // A move must not take the engine with it: the running engine holds its
+        // own binary open (which is what made the old folder undeletable), and a
+        // copy would be 811 MB of the same bytes. Release builds answer the
+        // default root whatever the locator says; debug builds still follow
+        // RB_DATA_ROOT, so a fixture owns its own tree.
+        assert_eq!(
+            engines_dir_from(None, PathBuf::from("C:\\base")),
+            PathBuf::from("C:\\base").join(ENGINES_DIR)
+        );
+        assert_eq!(
+            engines_dir_from(Some(PathBuf::from("D:\\fixture")), PathBuf::from("C:\\base")),
+            PathBuf::from("D:\\fixture").join(ENGINES_DIR)
+        );
     }
 
     #[test]

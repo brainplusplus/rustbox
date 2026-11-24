@@ -145,6 +145,33 @@ look if they want to retry.
 inside it. Deleting it outright would take the locator with it, and the next
 launch would lose the only pointer to the new folder.
 
+### The engine is a program, so it does not move
+
+The engine tree (`engines\cef\<version>\`) is excluded from the copy, from the
+file count, from the free-space estimate, and from the delete. It is 811 MB of
+`libcef.dll` and `rustbox-cef.exe`, the same bytes on any drive, and only one
+copy is ever installed - so a user who moves 8.1 GB of profiles should not wait
+for a second copy of a program they already have.
+
+Keeping it inside the data root also produced two failures that were measured,
+not imagined:
+
+- the old folder could not be deleted in full. The move runs in a process whose
+  own `.exe` is inside that tree, so the delete failed and reported a 942 MB
+  leftover - 770 MB of it `engines`;
+- "which engine is running" depended on which drive the workspace was on. After
+  moving to `F:` the data root named `F:`, while the live engine still ran from
+  `C:`; the next engine update would have landed in a tree nothing used.
+
+`paths::engines_dir()` therefore answers the *default* root, whatever the locator
+says, and debug builds keep following `RB_DATA_ROOT` so a fixture still owns its
+own engine tree. A first move out of the default root leaves `engines` beside the
+locator, which is why `free_for_use()` ignores it and why the old folder is
+emptied entry by entry instead of removed when the engine lives inside it.
+
+A tree copied into a moved root by an earlier build is now a duplicate. Nothing
+reads it: the canonical tree is the default root.
+
 ### A debugging port, in debug builds only
 
 The move window is the one surface a user cannot click past to reach a console,
@@ -193,12 +220,15 @@ the browser process and can only be set on the runtime
 
 ## Verification
 
-- `cargo test` in `src-tauri`: 313 pass (26 in `data_root`), plus 5 for the MCP
+- `cargo test` in `src-tauri`: 317 pass (30 in `data_root`), plus 5 for the MCP
   shim. The move tests cover the transactional order, cancellation, rollback of
   a failed copy, an interrupted copy being undone instead of blocking the retry,
   a marker from a different move never deleting that folder, a target that is
   inside or above the current root, a target with files, a drive without room,
-  the 2 GiB headroom, and the result record every ending produces.
+  the 2 GiB headroom, and the result record every ending produces. Four of them
+  cover the engine tree: it is not copied, it does not count towards the totals,
+  it survives both the delete of the old root and a rollback, and a target
+  holding nothing but the engine tree still counts as free.
 - `cargo check --offline` clean for both the WebView2 and the CEF build.
 - `node scripts/check-ui.js` asserts the wiring that a screenshot cannot: that
   `move.html` exists, that it is shown before `data_root::startup()`, that every

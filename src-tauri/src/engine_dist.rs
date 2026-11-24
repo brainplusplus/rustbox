@@ -158,8 +158,11 @@ pub fn available() -> Option<&'static Payload> {
 }
 
 /// Root of the engine tree.
+///
+/// Outside the data folder on purpose - see [`crate::paths::engines_dir`], which
+/// says why. A move of the data folder must never copy or delete this tree.
 pub fn engines_root() -> PathBuf {
-    crate::paths::root().join("engines").join("cef")
+    crate::paths::engines_dir().join("cef")
 }
 
 /// Directory an installed engine lives in.
