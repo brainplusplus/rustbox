@@ -22,6 +22,9 @@ problem, no Electron.
   profile, not just the first request. Socks5 included.
 - **Catalog** - ready-made presets for common services, plus add-by-URL with
   favicon discovery.
+- **Your own data folder** - the workspace can live on any drive. Moving it runs
+  in a window you can watch, cancel and retry, and only a verified copy ever
+  replaces the old folder (ADR 0008).
 - **AI router + chat panel** - send a prompt against several providers, record
   latency and token stats, keep the loop out of the UI thread.
 - **Agent access over MCP** - the app exposes a local MCP server so a coding agent
@@ -88,7 +91,7 @@ Two things are checked with an explicit message before anything is built:
 ## Tests and gates
 
 ```powershell
-cd src-tauri; cargo test --release          # Rust: 306 unit tests + 5 for the MCP shim
+cd src-tauri; cargo test --release          # Rust: 313 unit tests + 5 for the MCP shim
 node scripts/check-ui.js                    # UI wiring, without a browser
 powershell -File scripts/probe-all.ps1      # real UI, headless Chrome
 ```
@@ -135,6 +138,7 @@ adjectives:
 | [0005](docs/adr/0005-embedded-chromium-cef.md) | the Chromium engine, start to finish |
 | [0006](docs/adr/0006-webview2-runtime-pinning.md) | pinning the WebView2 runtime |
 | [0007](docs/adr/0007-remember-open-sub-tabs.md) | remembering open sub-tabs |
+| [0008](docs/adr/0008-data-folder-move-window.md) | moving the data folder, with a window that shows it |
 
 ## Status
 

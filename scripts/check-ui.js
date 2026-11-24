@@ -46,10 +46,10 @@ for (const file of ['settings.js', 'chat.js']) {
   }
 }
 
-// ---- the link chooser, which has an inline script of its own -----------
+// ---- the windows with inline scripts of their own ---------------------
 // Missed until now: a syntax error there leaves a dialog that never appears,
 // and nothing else in the build would catch it.
-for (const file of ['link-choice.html']) {
+for (const file of ['link-choice.html', 'move.html']) {
   const full = path.join(ui, file);
   if (!fs.existsSync(full)) fail(`ui/${file} is missing`);
   const source = fs.readFileSync(full, 'utf8');
@@ -252,8 +252,82 @@ if (!/emit\("proxy-changed"/.test(mainRs)) {
   fail('src-tauri/src/main.rs never emits "proxy-changed" after save_settings');
 }
 
+// ---- the data-folder move window ---------------------------------------
+// The move runs in a session of its own, before the app has a window, so its
+// page cannot share any of the checks above. It has its own failure mode
+// instead: a page whose backend commands were renamed keeps building and then
+// shows a window that never moves off 0%.
+const moveHtml = fs.readFileSync(path.join(ui, 'move.html'), 'utf8');
+const moveRs = fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'src', 'move_window.rs'), 'utf8');
+
+if (!/mod move_window;/.test(mainRs)) fail('main.rs has no `mod move_window;`');
+if (!/move_window::take\(\)/.test(mainRs)) {
+  fail('main.rs never asks move_window whether this launch is a move; nothing would ever run the copy');
+}
+if (!/move_window::run\(/.test(mainRs)) {
+  fail('main.rs never hands over to move_window::run, so the window is configured but never built');
+}
+// The move has to come before anything resolves the data root, or the copy
+// would run against a tree the process already holds open.
+const takeAt = mainRs.indexOf('move_window::take()');
+const startupAt = mainRs.indexOf('data_root::startup()');
+if (takeAt < 0 || startupAt < 0) fail('main.rs is missing the move branch or the root startup');
+else if (takeAt > startupAt) {
+  fail('main.rs calls data_root::startup() before the move window; the copy would run with the root already frozen');
+}
+
+// Every command the page invokes must be declared in the move session, and the
+// move session must not ship commands the page never asks for.
+const moveCalls = [...moveHtml.matchAll(/invoke\('(\w+)'\)/g)].map((m) => m[1]);
+if (!moveCalls.length) fail('ui/move.html invokes nothing; the buttons would be dead');
+const moveDeclared = [...moveRs.matchAll(/#\[tauri::command\]\s*\n\s*fn (\w+)/g)].map((m) => m[1]);
+if (!moveDeclared.length) fail('move_window.rs declares no #[tauri::command] functions');
+const handlers = moveRs.match(/generate_handler!\[([\s\S]*?)\]/);
+if (!handlers) fail('move_window.rs has no generate_handler! list');
+const registered = handlers[1].split(',').map((s) => s.trim()).filter(Boolean);
+for (const name of moveCalls) {
+  if (!moveDeclared.includes(name)) fail(`ui/move.html invokes '${name}' but move_window.rs does not declare it`);
+  if (!registered.includes(name)) fail(`move_window.rs declares ${name} but never registers it in generate_handler!`);
+}
+for (const name of registered) {
+  if (!moveCalls.includes(name)) fail(`move_window.rs registers ${name} but ui/move.html never calls it`);
+}
+
+// The session must not keep its profile in the folder it is copying: a webview
+// profile inside the tree holds handles on files the copy is reading.
+if (!/app_directories_override/.test(moveRs)) {
+  fail('move_window.rs does not redirect the webview profile, so the move session writes into the data folder it is copying');
+}
+if (!/scratch_dir\(\)/.test(moveRs) || !/temp_dir\(\)/.test(moveRs)) {
+  fail('move_window.rs keeps no scratch directory under the temp folder');
+}
+// - A window that reports progress but cannot be stopped is a trap on a 12 GB
+//   copy. - A finished move that leaves the app closed looks like a crash.
+if (!/app\.restart\(\)/.test(moveRs)) {
+  fail('move_window.rs never restarts into the app; the user would be left with a closed window after a finished move');
+}
+
+// The outcome has to survive the restart that ends the move, which means both
+// ends exist: the shell asks, and the backend answers.
+for (const needle of ["invoke('data_move_result')", "invoke('dismiss_data_move_result')"]) {
+  if (!html.includes(needle)) fail(`ui/index.html never calls ${needle}`);
+}
+if (!/fn data_move_result\(/.test(mainRs)) fail('main.rs has no data_move_result command');
+if (!/fn dismiss_data_move_result\(/.test(mainRs)) {
+  fail('main.rs has no dismiss_data_move_result; the strip could never be closed');
+}
+if (!/fn restart_for_data_move\(/.test(mainRs)) {
+  fail('main.rs has no restart_for_data_move command');
+}
+// The settings pane is the only place a queued move can be reported: a launch
+// that finds one boots the moving window instead of this page, so a strip here
+// would be a branch nothing can reach.
+if (!settings.includes("invoke('restart_for_data_move')")) {
+  fail('ui/settings.js has no restart button for a queued move');
+}
+
 console.log(
   `OK: inline script parses (${js.length} chars), settings.js and chat.js parse, ` +
     `${tabIds.length} settings tabs all have a pane, ${cssClasses.length} CSS classes exist, ` +
-    `and a proxy edit rebuilds the tab`
+    `and a proxy edit rebuilds the tab, and the move window is wired both ways`
 );

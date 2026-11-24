@@ -631,6 +631,7 @@
         </div>
         <div class="sp-row tight">
           <button class="sp-btn" id="sp-move-apply">Move on next start</button>
+          <button class="sp-btn primary" id="sp-move-restart" hidden>Restart now and move</button>
           <button class="sp-btn ghost" id="sp-move-cancel" hidden>Cancel pending move</button>
         </div>
       </div>
@@ -3145,10 +3146,27 @@
     rows.push(`<p class="sp-note">Data is in <code>${esc(m.root || '')}</code>.</p>`);
     if (m.moved) rows.push(`<p class="sp-note">The default folder <code>${esc(m.defaultRoot || '')}</code> is unused.</p>`);
     if (m.pending) {
-      rows.push(`<p class="sp-note warn">A move to <code>${esc(m.pending)}</code> is queued. It runs the next time RustBox starts and then deletes the old folder — restart to finish it.</p>`);
+      rows.push(`<p class="sp-note warn">A move to <code>${esc(m.pending)}</code> is queued. Restart RustBox to run it: a progress window shows the copy, and the old folder is deleted only after every file has arrived.</p>`);
     }
     if (m.error) {
       rows.push(`<p class="sp-note warn">The last move did not happen: ${esc(m.error)}</p>`);
+    }
+    if (m.last) {
+      // Said in the past tense and with its own numbers: after a restart the
+      // only question the user has is whether the thing they asked for happened,
+      // and "Data is in ..." alone does not answer it.
+      const l = m.last;
+      const size = (n) => (n >= 1024 * 1024 * 1024
+        ? `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`
+        : `${Math.round(n / (1024 * 1024))} MB`);
+      const took = (s) => (s >= 60 ? `${Math.floor(s / 60)} m ${s % 60} s` : `${s} s`);
+      if (l.ok) {
+        rows.push(`<p class="sp-note">Last move: ${Number(l.files || 0).toLocaleString('en-US')} files (${size(Number(l.bytes) || 0)}) in ${took(Number(l.seconds) || 0)}.</p>`);
+      } else if (l.cancelled) {
+        rows.push(`<p class="sp-note">The last move was cancelled. Nothing was copied.</p>`);
+      } else if (l.error) {
+        rows.push(`<p class="sp-note warn">The last move failed: ${esc(l.error)} Your data is still in <code>${esc(l.from || '')}</code>.</p>`);
+      }
     }
     if (m.reverted) {
       rows.push(`<p class="sp-note warn">${esc(m.reverted)}</p>`);
@@ -3164,6 +3182,7 @@
     const defaultDesc = pane.querySelector('#sp-move-default-desc');
     const browse = pane.querySelector('#sp-move-browse');
     const apply = pane.querySelector('#sp-move-apply');
+    const restart = pane.querySelector('#sp-move-restart');
     const cancel = pane.querySelector('#sp-move-cancel');
     if (!apply || !card) return;
 
@@ -3186,6 +3205,10 @@
       const custom = picked() === 'custom';
       if (customBox) customBox.hidden = !custom;
       if (cancel) cancel.hidden = !(current && current.pending);
+      // The restart is the only way to finish a queued move, so it appears
+      // exactly when one is queued and never as a general-purpose button:
+      // restarting the app for no reason is not an action to offer.
+      if (restart) restart.hidden = !(current && current.pending);
 
       // A button that cannot do anything is a question the user has to answer
       // twice, so it says so by being disabled instead of failing on click.
@@ -3277,6 +3300,22 @@
         } catch (e) {
           flash(String(e?.message || e), true);
         }
+      });
+    }
+
+    if (restart) {
+      restart.addEventListener('click', () => {
+        // The move cannot be finished without this, and it is cancelled from the
+        // same row, so a confirmation dialog would only be a second click for
+        // the user who just asked for it. The window that comes up owns the
+        // progress and the error, which is where the answers belong.
+        restart.disabled = true;
+        restart.textContent = 'Restarting…';
+        invoke('restart_for_data_move').catch((e) => {
+          restart.disabled = false;
+          restart.textContent = 'Restart now and move';
+          flash(String(e?.message || e), true);
+        });
       });
     }
   }

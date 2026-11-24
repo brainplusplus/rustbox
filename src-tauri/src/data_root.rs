@@ -78,6 +78,260 @@ pub fn startup() -> Option<String> {
 /// Returns the root this process must use from now on: the target when the move
 /// worked, the original otherwise.
 fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
+    // Nothing queued is the common case and it must not touch the disk, so the
+    // request is looked for before anything else happens.
+    let Some(job) = pending_in(current) else {
+        return (current.to_path_buf(), None);
+    };
+    let (root, end) = run(
+        &job.from,
+        &job.to,
+        locator_dir,
+        &mut |_| {},
+        &|| false,
+    );
+    let note = match end {
+        End::NoRequest => return (root, None),
+        End::Moved { note, .. } => note,
+        End::Cancelled => format!(
+            "the move was cancelled; the data is still in {}",
+            root.display()
+        ),
+        End::Failed(why) => format!("could not move the data folder: {why}"),
+    };
+    (root, Some(note))
+}
+
+/// Where a queued move would come from and go to.
+///
+/// Read without freezing the root, because the window that reports progress has
+/// to name both folders before the move starts - and it must not commit the
+/// process to a folder it is about to replace.
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+/// One reading of the move's progress, for the window that paints it.
+///
+/// Copied by value: the copy loop hands these out thousands of times, and an
+/// allocation per file would cost more than the copy it is reporting.
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub struct Progress {
+    /// `count`, `copy`, `verify` or `finish`.
+    pub phase: &'static str,
+    pub files: u64,
+    pub bytes: u64,
+    pub total_files: u64,
+    pub total_bytes: u64,
+}
+
+/// How a queued move ended.
+pub enum End {
+    /// Nothing was queued. The common case, and it must stay free.
+    NoRequest,
+    Moved {
+        note: String,
+        /// Something that happened anyway, such as an old folder that could not
+        /// be deleted. Kept apart from the success line so the window can paint
+        /// it as a warning instead of a result.
+        warning: Option<String>,
+        files: u64,
+        bytes: u64,
+    },
+    /// The user stopped it. A cancelled move is not a failure: nothing moved.
+    Cancelled,
+    Failed(String),
+}
+
+/// The outcome of the last move, kept where the next launch can read it.
+///
+/// In the locator directory rather than the data root: that folder survives the
+/// move, while the root it describes is the one being replaced.
+pub const RESULT_FILE: &str = "data-move-result.json";
+
+/// Set for as long as a copy is in flight.
+///
+/// A launch that dies mid-copy would otherwise leave a target full of files,
+/// which [`free_for_use`] refuses for ever: the retry would answer "already
+/// contains files" about the app's own leftovers. The marker is what lets the
+/// next launch tell its own half-copy apart from someone else's folder.
+pub const RUNNING_FILE: &str = "data-move-running.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Running {
+    from: String,
+    to: String,
+    /// Diagnostic only: the process that wrote it.
+    #[serde(default)]
+    pid: u32,
+}
+
+fn record_running(dir: &Path, from: &Path, to: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let marker = Running {
+        from: from.display().to_string(),
+        to: to.display().to_string(),
+        pid: std::process::id(),
+    };
+    if let Ok(text) = serde_json::to_string(&marker) {
+        let _ = std::fs::write(dir.join(RUNNING_FILE), text);
+    }
+}
+
+fn clear_running(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(RUNNING_FILE));
+}
+
+/// Undo the leftovers of a copy that was interrupted, before trying again.
+///
+/// Only when the marker names this exact folder pair: a marker from a move that
+/// already completed describes a target that is now the live root, and deleting
+/// it would delete the user's data.
+fn clear_stale_copy(dir: &Path, current: &Path, target: &Path) {
+    let Ok(raw) = std::fs::read_to_string(dir.join(RUNNING_FILE)) else {
+        return;
+    };
+    let Ok(marker) = serde_json::from_str::<Running>(&raw) else {
+        clear_running(dir);
+        return;
+    };
+    if key(Path::new(&marker.from)) == key(current) && key(Path::new(&marker.to)) == key(target) {
+        rollback(target);
+    }
+    clear_running(dir);
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveResult {
+    pub ok: bool,
+    pub cancelled: bool,
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub files: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub seconds: u64,
+    /// Something the user has to know even though the move worked, such as an
+    /// old folder that could not be deleted.
+    #[serde(default)]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The last move's outcome, if the user has not dismissed it.
+pub fn result() -> Option<MoveResult> {
+    let raw = std::fs::read_to_string(crate::paths::locator_dir().join(RESULT_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+pub fn dismiss_result() -> Result<(), String> {
+    let file = crate::paths::locator_dir().join(RESULT_FILE);
+    match std::fs::remove_file(&file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete {}: {e}", file.display())),
+    }
+}
+
+fn record_result(dir: &Path, from: &Path, to: &Path, end: &End, seconds: u64) {
+    let (ok, cancelled, files, bytes, warning, error) = match end {
+        End::NoRequest => return,
+        End::Moved { warning, files, bytes, .. } => {
+            // `note` carries the success line for the log; the window gets the
+            // numbers and, only when there is one, the warning.
+            (true, false, *files, *bytes, warning.clone(), None)
+        }
+        End::Cancelled => (false, true, 0, 0, None, None),
+        End::Failed(why) => (false, false, 0, 0, None, Some(why.clone())),
+    };
+    let record = MoveResult {
+        ok,
+        cancelled,
+        from: from.display().to_string(),
+        to: to.display().to_string(),
+        files,
+        bytes,
+        seconds,
+        warning,
+        error,
+    };
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(text) = serde_json::to_string_pretty(&record) {
+        let _ = std::fs::write(dir.join(RESULT_FILE), text);
+    }
+}
+
+/// The move a launch has to run, if the config asks for one.
+///
+/// Separate from [`startup`] so the moving window can be built before anything
+/// touches the data folder, and so the answer can be *shown* rather than only
+/// logged.
+pub fn pending() -> Option<Job> {
+    let (current, _why) = crate::paths::resolve_root();
+    // Same seam as [`startup`]: a redirected debug root without a redirected
+    // locator must not hijack the developer's real workspace.
+    #[cfg(debug_assertions)]
+    if crate::paths::debug_root().is_some()
+        && std::env::var_os("RB_DATA_ROOT_LOCATOR").is_none()
+    {
+        return None;
+    }
+    pending_in(&current)
+}
+
+fn pending_in(current: &Path) -> Option<Job> {
+    let raw = std::fs::read_to_string(current.join("config.json")).ok()?;
+    let cfg: Config = serde_json::from_str(&raw).ok()?;
+    cfg.pending_data_root
+        .map(|to| Job {
+            from: current.to_path_buf(),
+            to: PathBuf::from(to),
+        })
+}
+
+/// Run a move in the folder pair the caller already resolved.
+///
+/// The pair is a parameter rather than read from the config here, so the window
+/// that shows the copy can run the same move again after a failure: the retry
+/// has to work even though the first attempt deliberately cleared the request
+/// from the config (see [`run_inner`]).
+///
+/// `progress` is called as the copy advances, `cancelled` is asked between
+/// files. Both are trait objects so the headless callers ([`apply`]) pay
+/// nothing for a feature they do not show.
+pub fn run(
+    from: &Path,
+    to: &Path,
+    locator_dir: &Path,
+    progress: &mut dyn FnMut(Progress),
+    cancelled: &dyn Fn() -> bool,
+) -> (PathBuf, End) {
+    let started = std::time::Instant::now();
+    let (root, end) = run_inner(from, to, locator_dir, progress, cancelled);
+    // The marker describes a copy in flight; by here there is either a finished
+    // folder or no copy at all.
+    clear_running(locator_dir);
+    // Recorded against the folder the move was *for*, not the one it ended on:
+    // a failed move keeps `from` as the root, and a record saying "moved from X
+    // to X" would tell the user their data went somewhere it never went.
+    record_result(locator_dir, from, to, &end, started.elapsed().as_secs());
+    (root, end)
+}
+
+/// The move itself, without the bookkeeping of recording how it went.
+fn run_inner(
+    current: &Path,
+    target: &Path,
+    locator_dir: &Path,
+    progress: &mut dyn FnMut(Progress),
+    cancelled: &dyn Fn() -> bool,
+) -> (PathBuf, End) {
     let config_path = current.join("config.json");
     let mut cfg = match Config::load(&config_path) {
         Ok(cfg) => cfg,
@@ -86,16 +340,21 @@ fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
                 "[rustbox] not reading {} for a pending move: {e}",
                 config_path.display()
             );
-            return (current.to_path_buf(), None);
+            return (current.to_path_buf(), End::NoRequest);
         }
     };
-    let Some(pending) = cfg.pending_data_root.take() else {
-        return (current.to_path_buf(), None);
-    };
-    let target = PathBuf::from(pending);
+    // The request is spent: whatever happens below, this move is not retried by
+    // a later launch. A retry is the window's decision, made explicitly.
+    cfg.pending_data_root = None;
+    let target = target.to_path_buf();
 
-    match move_root(current, &target) {
-        Ok(report) => {
+    // Before the copy: undo what a previous, interrupted attempt left in the
+    // target, then say that this one is in flight.
+    clear_stale_copy(locator_dir, current, &target);
+    record_running(locator_dir, current, &target);
+
+    match move_root_tracked(current, &target, progress, cancelled) {
+        Ok(CopyEnd::Done(report)) => {
             // From here the copy is complete, which means any failure below has
             // to undo *it* as well. The source is still untouched and still
             // authoritative, so discarding the copy costs nothing - while
@@ -109,7 +368,7 @@ fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
                 let note = format!("could not save the config in {}: {e}", target.display());
                 rollback(&target);
                 record_error(locator_dir, &note);
-                return (current.to_path_buf(), Some(note));
+                return (current.to_path_buf(), End::Failed(note));
             }
             let locator = if key(&target) == key(&crate::paths::default_root()) {
                 // Moving back to the default location needs no pointer: leaving
@@ -121,19 +380,43 @@ fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
             if let Err(e) = locator {
                 rollback(&target);
                 record_error(locator_dir, &e);
-                return (current.to_path_buf(), Some(e));
+                return (current.to_path_buf(), End::Failed(e));
             }
             // Only now, with the new folder authoritative, may the old copy go.
             // Deleting earlier would turn a failed locator write into lost data.
+            let mut warning = None;
             let mut note = report.describe(&target);
-            if std::fs::remove_dir_all(current).is_err() {
-                note.push_str(&format!(
+            if remove_old_root(current, locator_dir).is_err() {
+                let tail = format!(
                     "; the old folder {} could not be fully deleted and can be removed by hand",
+                    current.display()
+                );
+                note.push_str(&tail);
+                warning = Some(format!(
+                    "The move worked, but the old folder {} could not be deleted in full. \\
+                     You can remove it by hand.",
                     current.display()
                 ));
             }
             clear_error(locator_dir);
-            (target, Some(note))
+            (
+                target,
+                End::Moved {
+                    note,
+                    warning,
+                    files: report.files,
+                    bytes: report.bytes,
+                },
+            )
+        }
+        // Stopped by the user: the partial copy is gone, the request is gone,
+        // and the old root still owns every byte. Deliberately not an error -
+        // nothing failed, and a note saying so would outlive the decision.
+        Ok(CopyEnd::Stopped) => {
+            cfg.pending_data_root = None;
+            let _ = cfg.save(&config_path);
+            clear_error(locator_dir);
+            (current.to_path_buf(), End::Cancelled)
         }
         Err(e) => {
             // Drop the request so the same failure is not retried on every
@@ -141,17 +424,12 @@ fn apply(current: &Path, locator_dir: &Path) -> (PathBuf, Option<String>) {
             cfg.pending_data_root = None;
             let _ = cfg.save(&config_path);
             record_error(locator_dir, &e);
-            (
-                current.to_path_buf(),
-                Some(format!("could not move the data folder: {e}")),
-            )
+            (current.to_path_buf(), End::Failed(e))
         }
     }
 }
 
 /// Record a move for the next launch, after checking it can work.
-///
-/// Work out where a requested move would go, and refuse it now if it cannot work.
 ///
 /// `None` means "back to the default folder", which is why this takes an option
 /// rather than a string: an empty path would have to be special-cased in the UI
@@ -304,7 +582,10 @@ fn free_for_use(dir: &Path) -> Result<bool, String> {
         std::fs::read_dir(dir).map_err(|e| format!("could not list {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("could not list {}: {e}", dir.display()))?;
-        if entry.file_name() == crate::paths::LOCATOR {
+        // The move's own bookkeeping does not count as "someone else's files":
+        // the locator, an error note, and the result of the move that is being
+        // retried all live beside the data they describe.
+        if is_bookkeeping(&entry.file_name()) {
             continue;
         }
         return Ok(false);
@@ -409,19 +690,48 @@ fn gb(bytes: u64) -> String {
 /// locked file left 0.76 GB in 2,570 files behind. Only what this move wrote is
 /// removed - the caller has already established the folder was empty.
 fn rollback(to: &Path) {
-    let Ok(entries) = std::fs::read_dir(to) else {
-        return;
-    };
+    let _ = rollback_result(to);
+}
+
+/// [`rollback`] with the first failure kept.
+///
+/// Used on the old root as well as on a half-copied target, so the difference
+/// between "everything is gone" and "something is still there" has to reach the
+/// caller: the user is told to delete the leftovers by hand.
+fn rollback_result(to: &Path) -> std::io::Result<()> {
+    let entries = std::fs::read_dir(to)?;
+    let mut first: Option<std::io::Error> = None;
     for entry in entries.flatten() {
         if is_bookkeeping(&entry.file_name()) {
             continue;
         }
         let path = entry.path();
-        let _ = if path.is_dir() {
+        let outcome = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
         };
+        if let Err(e) = outcome {
+            first.get_or_insert(e);
+        }
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Delete the old tree, keeping the folder itself when the locator lives there.
+///
+/// In an installed RustBox the locator sits in the default root - which is
+/// exactly the folder a first move deletes. Removing the folder would take the
+/// pointer with it, and the next launch would find no locator and start on an
+/// empty default folder while the user's data sat in the target.
+fn remove_old_root(current: &Path, locator_dir: &Path) -> std::io::Result<()> {
+    if key(locator_dir) == key(current) {
+        rollback_result(current)
+    } else {
+        std::fs::remove_dir_all(current)
     }
 }
 
@@ -486,7 +796,50 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
 /// *Nothing left behind* - every failure path rolls the target back to empty, so
 /// the next attempt is not refused by [`free_for_use`] for "already contains
 /// files".
+#[cfg(test)]
 pub fn move_root(from: &Path, to: &Path) -> Result<MoveReport, String> {
+    match move_root_tracked(from, to, &mut |_| {}, &|| false)? {
+        CopyEnd::Done(report) => Ok(report),
+        // Only reachable with a cancel that never fires. A caller that offers a
+        // Cancel button uses `move_root_tracked` and sees the difference.
+        CopyEnd::Stopped => Err("the move was cancelled".to_string()),
+    }
+}
+
+/// How a copy pass ended, for a caller that can interrupt it.
+pub enum CopyEnd {
+    Done(MoveReport),
+    Stopped,
+}
+
+/// Running totals for one copy pass, plus the two hooks the window needs.
+struct Tally<'a> {
+    files: u64,
+    bytes: u64,
+    total: MoveReport,
+    progress: &'a mut dyn FnMut(Progress),
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl Tally<'_> {
+    fn report(&mut self, phase: &'static str) {
+        (self.progress)(Progress {
+            phase,
+            files: self.files,
+            bytes: self.bytes,
+            total_files: self.total.files,
+            total_bytes: self.total.bytes,
+        });
+    }
+}
+
+/// [`move_root`] with a progress sink and a way to stop between files.
+fn move_root_tracked(
+    from: &Path,
+    to: &Path,
+    progress: &mut dyn FnMut(Progress),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CopyEnd, String> {
     validate_target(from, to)?;
     if !free_for_use(to)? {
         return Err(format!(
@@ -526,10 +879,38 @@ pub fn move_root(from: &Path, to: &Path) -> Result<MoveReport, String> {
             rollback(to);
             return Err(why);
         }
+        // Totals, not an estimate: a percentage is only honest if its
+        // denominator is the tree this pass is about to copy.
+        let mut tally = Tally {
+            files: 0,
+            bytes: 0,
+            total: MoveReport {
+                files: wanted.files,
+                bytes: wanted.bytes,
+            },
+            progress,
+            cancelled,
+        };
+        tally.report("copy");
+        if (cancelled)() {
+            rollback(to);
+            return Ok(CopyEnd::Stopped);
+        }
 
-        let copied = match copy_tree(from, to, true) {
+        let copied = match copy_tree_tracked(from, to, true, &mut tally) {
             Ok(r) => r,
-            Err(e) => {
+            Err(CopyStop::Cancelled) => {
+                rollback(to);
+                (tally.progress)(Progress {
+                    phase: "cancelled",
+                    files: tally.files,
+                    bytes: tally.bytes,
+                    total_files: wanted.files,
+                    total_bytes: wanted.bytes,
+                });
+                return Ok(CopyEnd::Stopped);
+            }
+            Err(CopyStop::Failed(e)) => {
                 rollback(to);
                 last = e;
                 continue;
@@ -554,7 +935,11 @@ pub fn move_root(from: &Path, to: &Path) -> Result<MoveReport, String> {
         // into "the files arrived from a folder that was not moving".
         match manifest(from) {
             Ok(now) if now.files == wanted.files && now.bytes == wanted.bytes => {
-                return Ok(wanted)
+                // Reaching here means the copy is verified; the remaining work
+                // is the locator write and the old folder's deletion, both of
+                // which can take a while on a 12 GB tree.
+                tally.report("finish");
+                return Ok(CopyEnd::Done(wanted));
             }
             Ok(now) => {
                 rollback(to);
@@ -611,18 +996,41 @@ fn manifest(dir: &Path) -> Result<MoveReport, String> {
 /// carrying a stale locator into the new root would point the next start
 /// somewhere else entirely.
 fn is_bookkeeping(name: &std::ffi::OsStr) -> bool {
-    name == crate::paths::LOCATOR || name == ERROR_FILE
+    name == crate::paths::LOCATOR
+        || name == ERROR_FILE
+        || name == RESULT_FILE
+        || name == RUNNING_FILE
 }
 
-fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<MoveReport, String> {
+/// Why a copy pass ended early.
+enum CopyStop {
+    /// The user asked to stop; nothing failed.
+    Cancelled,
+    Failed(String),
+}
+
+fn copy_tree_tracked(
+    from: &Path,
+    to: &Path,
+    top: bool,
+    tally: &mut Tally,
+) -> Result<MoveReport, CopyStop> {
     let mut report = MoveReport {
         files: 0,
         bytes: 0,
     };
-    for entry in
-        std::fs::read_dir(from).map_err(|e| format!("could not read {}: {e}", from.display()))?
+    for entry in std::fs::read_dir(from)
+        .map_err(|e| CopyStop::Failed(format!("could not read {}: {e}", from.display())))?
     {
-        let entry = entry.map_err(|e| format!("could not read {}: {e}", from.display()))?;
+        // Asked between files rather than mid-copy: the answer only has to be
+        // timely, and a partially written file is exactly what `rollback`
+        // exists to remove. Checking a folder entry at a time also keeps the
+        // cancel path off the hot path of a 110k-file copy.
+        if (tally.cancelled)() {
+            return Err(CopyStop::Cancelled);
+        }
+        let entry =
+            entry.map_err(|e| CopyStop::Failed(format!("could not read {}: {e}", from.display())))?;
         let name = entry.file_name();
         if top && is_bookkeeping(&name) {
             continue;
@@ -631,17 +1039,21 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<MoveReport, String> {
         let dst = to.join(&name);
         let kind = entry
             .file_type()
-            .map_err(|e| format!("could not inspect {}: {e}", src.display()))?;
+            .map_err(|e| CopyStop::Failed(format!("could not inspect {}: {e}", src.display())))?;
         if kind.is_dir() {
-            std::fs::create_dir_all(&dst)
-                .map_err(|e| format!("could not create {}: {e}", dst.display()))?;
-            let inner = copy_tree(&src, &dst, false)?;
+            std::fs::create_dir_all(&dst).map_err(|e| {
+                CopyStop::Failed(format!("could not create {}: {e}", dst.display()))
+            })?;
+            let inner = copy_tree_tracked(&src, &dst, false, tally)?;
             report.files += inner.files;
             report.bytes += inner.bytes;
         } else if kind.is_file() {
-            let n = copy_file(&src, &dst)?;
+            let n = copy_file(&src, &dst).map_err(CopyStop::Failed)?;
             report.files += 1;
             report.bytes += n;
+            tally.files += 1;
+            tally.bytes += n;
+            tally.report("copy");
         }
         // Symlinks and junctions are skipped rather than followed: a profile
         // tree has no business leaving the data folder, and following one could
@@ -689,6 +1101,128 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A root with two files and a request to move it to `to`.
+    fn queued(base: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let from = base.join("from");
+        let to = base.join("to");
+        let locator = base.join("locator");
+        fs::create_dir_all(from.join("profiles/app-a")).unwrap();
+        fs::write(from.join("profiles/app-a/Cookies"), b"cookie").unwrap();
+        let cfg = format!(
+            r#"{{"version":5,"apps":[],"pending_data_root":"{}"}}"#,
+            to.display().to_string().replace('\\', "\\\\")
+        );
+        fs::write(from.join("config.json"), cfg).unwrap();
+        (from, to, locator, base.to_path_buf())
+    }
+
+    #[test]
+    fn progress_ends_on_the_total_and_never_goes_backwards() {
+        // The bar is only honest if its last reading is the whole tree, and a
+        // reading that dips would make the window look like it restarted.
+        let base = scratch("progress");
+        let (from, to, locator, _) = queued(&base);
+        let mut seen: Vec<Progress> = Vec::new();
+        let (root, end) = run(&from, &to, &locator, &mut |p| seen.push(p), &|| false);
+        assert!(matches!(end, End::Moved { .. }), "the move ran");
+        assert_eq!(root, to);
+
+        let last = seen.last().copied().expect("progress was reported");
+        assert_eq!(last.total_files, 2, "the cookie plus the config");
+        assert_eq!(last.files, 2, "every counted file landed");
+        assert!(last.bytes > 0);
+
+        let copying: Vec<Progress> = seen.iter().copied().filter(|p| p.phase == "copy").collect();
+        assert!(copying.windows(2).all(|w| w[0].files <= w[1].files));
+        assert!(
+            seen.iter().any(|p| p.phase == "finish"),
+            "the window is told the copy is done before the old folder is deleted"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_move_keeps_the_old_folder_and_leaves_nothing_behind() {
+        // Cancel is not a failure: the source is intact, the target is empty
+        // again, and the request is gone so the next launch does not retry a
+        // move the user just stopped.
+        let base = scratch("cancel-run");
+        let (from, to, locator, _) = queued(&base);
+        let (root, end) = run(&from, &to, &locator, &mut |_| {}, &|| true);
+        assert!(matches!(end, End::Cancelled), "the stop was honoured");
+        assert_eq!(root, from, "the old root stays authoritative");
+        assert_eq!(fs::read(from.join("profiles/app-a/Cookies")).unwrap(), b"cookie");
+        let left = fs::read_dir(&to).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "a partial copy would block the next attempt");
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(from.join("config.json")).unwrap()).unwrap();
+        assert!(saved["pending_data_root"].is_null(), "{saved}");
+        assert_eq!(crate::paths::read_locator_in(&locator), None);
+        assert_eq!(error_note_in(&locator), None, "a cancel is not an error");
+    }
+
+    #[test]
+    fn a_finished_move_leaves_a_record_the_next_launch_can_report() {
+        // The move happens before any window, so the report has to survive the
+        // process that did it. The locator directory is the one place that
+        // exists before *and* after the move.
+        let base = scratch("result");
+        let (from, to, locator, _) = queued(&base);
+        let (root, end) = run(&from, &to, &locator, &mut |_| {}, &|| false);
+        assert!(matches!(end, End::Moved { .. }));
+        assert_eq!(root, to);
+
+        let raw = fs::read_to_string(locator.join(RESULT_FILE)).expect("a result was recorded");
+        let record: MoveResult = serde_json::from_str(&raw).unwrap();
+        assert!(record.ok);
+        assert!(!record.cancelled);
+        assert_eq!(record.files, 2);
+        assert!(record.bytes > 0);
+        assert_eq!(record.from, from.display().to_string());
+        assert_eq!(record.to, to.display().to_string());
+        assert!(record.error.is_none());
+        assert!(record.warning.is_none(), "nothing to warn about in a clean move");
+    }
+
+    #[test]
+    fn a_move_out_of_the_default_folder_keeps_the_locator_beside_it() {
+        // In a real installation the locator sits in the default root, which is
+        // exactly the folder a first move deletes. Taking the folder with it
+        // would take the pointer too, and the next launch would find no locator
+        // and start on an empty default folder while the data sat in the target.
+        let base = scratch("locator-in-root");
+        let (from, to, _separate, _) = queued(&base);
+        let (root, end) = run(&from, &to, &from, &mut |_| {}, &|| false);
+        assert!(matches!(end, End::Moved { .. }));
+        assert_eq!(root, to);
+        assert_eq!(
+            crate::paths::read_locator_in(&from),
+            Some(to.clone()),
+            "the pointer has to outlive the folder it was written into"
+        );
+        assert!(
+            !from.join("profiles").exists(),
+            "the data itself is gone from the old folder"
+        );
+    }
+
+    #[test]
+    fn a_failed_move_records_why_so_the_window_can_retry() {
+        let base = scratch("result-fail");
+        let (from, to, locator, _) = queued(&base);
+        // A target that holds someone else's file is refused before the copy.
+        fs::create_dir_all(&to).unwrap();
+        fs::write(to.join("not-mine.txt"), b"x").unwrap();
+
+        let (root, end) = run(&from, &to, &locator, &mut |_| {}, &|| false);
+        assert!(matches!(end, End::Failed(_)), "the refusal is reported");
+        assert_eq!(root, from);
+        let record: MoveResult =
+            serde_json::from_str(&fs::read_to_string(locator.join(RESULT_FILE)).unwrap()).unwrap();
+        assert!(!record.ok);
+        assert!(!record.cancelled);
+        assert!(record.error.as_deref().unwrap_or("").contains("already contains files"));
     }
 
     #[test]
@@ -1072,5 +1606,47 @@ mod tests {
         assert!(left.is_empty(), "target should be empty, holds {left:?}");
         // And the source is untouched, so the user lost nothing.
         assert_eq!(fs::read(from.join("cef/app/Network/Cookies")).unwrap(), b"cookie");
+    }
+
+    #[test]
+    fn an_interrupted_copy_is_undone_instead_of_blocking_the_retry() {
+        // Why the marker exists: a launch that dies mid-copy leaves the target
+        // full of files, and `free_for_use` would then refuse the retry with
+        // "already contains files" about the app's own leftovers - a dead end
+        // the user can only escape by deleting a folder by hand.
+        let base = scratch("resume");
+        let (from, to, locator, _) = queued(&base);
+        fs::create_dir_all(to.join("profiles/app-a")).unwrap();
+        fs::write(to.join("profiles/app-a/Cookies"), b"half").unwrap();
+        record_running(&locator, &from, &to);
+
+        let (root, end) = run(&from, &to, &locator, &mut |_| {}, &|| false);
+        assert!(matches!(end, End::Moved { .. }), "the retry went through");
+        assert_eq!(root, to);
+        // "cookie", not "half": the partial file was discarded, not kept.
+        assert_eq!(fs::read(to.join("profiles/app-a/Cookies")).unwrap(), b"cookie");
+        assert!(!locator.join(RUNNING_FILE).exists(), "the marker is spent");
+    }
+
+    #[test]
+    fn a_marker_from_another_move_never_deletes_that_folder() {
+        // The guard that makes the marker safe: it only trusts a marker that
+        // names this exact pair. A stale one from a finished move names a
+        // folder that is now the live root, and deleting it would lose data.
+        let base = scratch("marker-guard");
+        let from = base.join("from");
+        let target = base.join("live");
+        let locator = base.join("locator");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("config.json"), b"{}").unwrap();
+        // Written for a *different* source, so it cannot describe this attempt.
+        record_running(&locator, Path::new("C:\\somewhere\\else"), &target);
+
+        clear_stale_copy(&locator, &from, &target);
+        assert!(
+            target.join("config.json").exists(),
+            "an unrelated marker must not delete a folder"
+        );
+        assert!(!locator.join(RUNNING_FILE).exists(), "the marker is dropped");
     }
 }

@@ -20,6 +20,7 @@ mod favicon;
 mod folder_picker;
 mod handoff;
 mod mcp;
+mod move_window;
 mod paths;
 mod proxy_auth;
 mod session;
@@ -378,7 +379,37 @@ fn data_move_state(state: tauri::State<AppState>) -> Result<serde_json::Value, S
         "root": paths::root().display().to_string(),
         "defaultRoot": paths::default_root().display().to_string(),
         "moved": paths::root() != paths::default_root(),
+        // The last move, recorded where both folders could read it. Kept
+        // separate from `error`: a move can finish and still leave something
+        // worth saying, and a summary of a successful move is not an error.
+        "last": data_root::result(),
     }))
+}
+
+/// The last move's outcome, for the shell to report once on the way up.
+#[tauri::command]
+fn data_move_result() -> Option<data_root::MoveResult> {
+    data_root::result()
+}
+
+/// Forget the last outcome, so it is not reported again.
+#[tauri::command]
+fn dismiss_data_move_result() -> Result<(), String> {
+    data_root::dismiss_result()
+}
+
+/// Restart so a queued data-folder move can run.
+///
+/// Offered by the settings pane and by the shell strip, never done on its own: a
+/// window that vanishes mid-task reads as a crash, and the move deletes the old
+/// folder, so the user should be the one to say when.
+#[tauri::command]
+fn restart_for_data_move(handle: tauri::AppHandle) {
+    // Same reason as any quit: the restart destroys the tab windows, and their
+    // teardown must not overwrite the remembered layout with the empty registry.
+    tabs::begin_quit();
+    session::flush();
+    handle.restart();
 }
 
 /// The settings block, with every provider key masked.
@@ -863,10 +894,26 @@ fn human_size(bytes: u64) -> String {
 /// only in the Chromium build; the default build has no helper processes.
 #[cfg_attr(feature = "cef", tauri_runtime_cef::cef_entry_point)]
 fn main() {
-    // A data-folder move requested from the settings page is applied here, before
-    // `paths::root()` is asked for anything: this is the only moment no profile,
-    // cookie database or engine DLL is open, which is what makes copying the tree
-    // safe. It also freezes the root for the rest of the process.
+    // A data-folder move requested from the settings page runs in its own
+    // window, and it has to be the first thing that happens: this is the only
+    // moment no profile, cookie database or engine DLL is open, which is what
+    // makes copying the tree safe. The window exists because the copy takes
+    // minutes on a real profile, and a launch that shows nothing for minutes is
+    // indistinguishable from a crash. It never returns: the session ends by
+    // restarting into the normal app.
+    if let Some(job) = move_window::take() {
+        let mut context = tauri::generate_context!();
+        move_window::configure(&mut context);
+        move_window::run(context, job);
+    }
+    // The move session keeps its webview profile in the temp folder, and it ends
+    // by restarting rather than by tidying up.
+    move_window::cleanup();
+
+    // Resolve and freeze the root for this process. With the move handled
+    // above this normally only records the reason when a saved folder is gone;
+    // it stays here because it is also the path a debug build takes when the
+    // move is deliberately skipped.
     if let Some(note) = data_root::startup() {
         eprintln!("[rustbox] {note}");
     }
@@ -939,7 +986,7 @@ fn main() {
         ),
     );
 
-    engine::apply(tauri::Builder::default())
+    engine::apply(tauri::Builder::default(), None)
         .manage(AppState::new(config_path))
         .invoke_handler(tauri::generate_handler![
             list_apps,
@@ -952,6 +999,9 @@ fn main() {
             move_data_folder,
             cancel_data_move,
             data_move_state,
+            data_move_result,
+            dismiss_data_move_result,
+            restart_for_data_move,
             platform_info,
             reset_app_profile,
             purge_app_data,

@@ -3066,6 +3066,48 @@ function hideStrip() {
   refreshContentRect();
 }
 
+// The last data-folder move, said once on the way up.
+//
+// Reporting the outcome matters: the move deletes the old folder, so "did it
+// work" is the difference between the app running on the user's data and running
+// on an empty profile. A move that is merely *queued* never reaches this page -
+// the next launch shows the moving window instead - so there is nothing to say
+// about one here.
+async function reportDataMove() {
+  const size = (n) => {
+    const b = Number(n) || 0;
+    if (b >= 1024 * 1024 * 1024) return `${(b / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    return `${Math.max(1, Math.round(b / (1024 * 1024)))} MB`;
+  };
+  const took = (s) => {
+    const n = Number(s) || 0;
+    return n >= 60 ? `${Math.floor(n / 60)} m ${n % 60} s` : `${n} s`;
+  };
+
+  const last = await invoke('data_move_result').catch(() => null);
+  if (!last) return;
+
+  // Dismissing is part of the report: a strip that has to be closed every launch
+  // turns a one-time answer into a recurring nag.
+  const dismiss = {
+    label: 'Dismiss',
+    run: () => invoke('dismiss_data_move_result').catch(() => {}),
+  };
+  if (last.ok) {
+    showStrip(
+      `Data folder moved: ${Number(last.files || 0).toLocaleString('en-US')} files ` +
+        `(${size(last.bytes)}) in ${took(last.seconds)}, from ${last.from} to ${last.to}. ` +
+        (last.warning || 'Everything that was open has been reopened.'),
+      last.warning ? 'warn' : 'info',
+      [dismiss]
+    );
+  } else if (last.cancelled) {
+    showStrip(`The move to ${last.to} was cancelled. Nothing was copied; the data is still in ${last.from}.`, 'info', [dismiss]);
+  } else {
+    showStrip(`The move to ${last.to} did not happen: ${last.error || 'unknown error'} Nothing was copied, so the data is still in ${last.from}.`, 'error', [dismiss]);
+  }
+}
+
 $('#tab-error-close').addEventListener('click', () => {
   hideStrip();
 });
@@ -3235,6 +3277,12 @@ document.addEventListener('keydown', (e) => { if (e.key === 'F12') invoke('open_
       ],
     );
   });
+  // A data-folder move happens in its own window, before this one exists, so it
+  // cannot report anything to a page that is not there yet. It leaves a record
+  // instead, and this is the only place it is read: without it a finished move
+  // and a move that silently failed look identical from here, and the user is
+  // left to check a folder by hand to find out which happened.
+  await reportDataMove();
   // Deliberately not awaited: icons are a background detail and the window is
   // already interactive. Firing this after the first paint keeps startup snappy.
   backfillMissingIcons();

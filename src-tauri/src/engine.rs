@@ -51,8 +51,11 @@ pub const IS_CEF: bool = cfg!(feature = "cef");
 ///
 /// Tauri 3's `Builder::default()` is parameterised on the type-erased
 /// `DynRuntime`, so the concrete runtime is supplied here and nowhere else.
+/// `debug_port` is the moving session's opt-in debugging seam. WebView2 takes it
+/// per window (`move_window` writes `--remote-debugging-port` into that window's
+/// `additional_browser_args`), so this build ignores it here.
 #[cfg(feature = "wry")]
-pub fn apply(builder: tauri::Builder) -> tauri::Builder {
+pub fn apply(builder: tauri::Builder, _debug_port: Option<u16>) -> tauri::Builder {
     builder.runtime(tauri_runtime_wry::Wry::default())
 }
 
@@ -69,8 +72,17 @@ pub fn apply(builder: tauri::Builder) -> tauri::Builder {
 /// per-app proxy still rides on the webview, because `proxy_url` is a request
 /// context of its own in Chromium rather than a process switch.
 #[cfg(feature = "cef")]
-pub fn apply(builder: tauri::Builder) -> tauri::Builder {
+pub fn apply(builder: tauri::Builder, debug_port: Option<u16>) -> tauri::Builder {
     let mut cef = tauri_runtime_cef::Cef::default().root_cache_path(crate::paths::cef_root());
+    // The moving session is the one window nobody can reach a console from, so
+    // it may ask for a DevTools port. It has to be configured here rather than
+    // per webview: Chromium's debugging server belongs to the browser process.
+    if let Some(port) = debug_port {
+        cef = cef.remote_debugging(tauri_runtime_cef::RemoteDebugging::Port {
+            port,
+            allowed_origins: Vec::new(),
+        });
+    }
     for (key, value) in crate::webview_args::switches() {
         // `--disable-features` must not go through the command line: Chromium stores a
         // switch by name and the last value *replaces* the previous one, so a raw
